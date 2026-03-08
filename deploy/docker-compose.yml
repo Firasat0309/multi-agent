@@ -1,0 +1,52 @@
+version: "3.9"
+
+services:
+  codegen:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - WORKSPACE_DIR=/data/workspace
+      - SANDBOX_TYPE=docker
+      - MAX_CONCURRENT_AGENTS=4
+    volumes:
+      - workspace_data:/data/workspace
+      - /var/run/docker.sock:/var/run/docker.sock  # For Docker sandbox
+    depends_on:
+      - redis
+      - prometheus
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  workspace_data:
+  redis_data:
+  prometheus_data:
+  grafana_data:

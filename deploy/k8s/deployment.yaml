@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: codegen
+  labels:
+    app: codegen
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: codegen
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: codegen
+    spec:
+      serviceAccountName: codegen
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: codegen
+          image: codegen:latest
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: codegen-secrets
+                  key: anthropic-api-key
+            - name: WORKSPACE_DIR
+              value: /data/workspace
+            - name: MAX_CONCURRENT_AGENTS
+              valueFrom:
+                configMapKeyRef:
+                  name: codegen-config
+                  key: max-concurrent-agents
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: 2000m
+              memory: 2Gi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: workspace
+              mountPath: /data/workspace
+      volumes:
+        - name: workspace
+          persistentVolumeClaim:
+            claimName: codegen-workspace-pvc

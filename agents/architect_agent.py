@@ -1,0 +1,93 @@
+"""Architect agent - creates the repository blueprint from a user prompt."""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+from agents.base_agent import BaseAgent
+from core.llm_client import LLMClient
+from core.models import (
+    AgentContext,
+    AgentRole,
+    FileBlueprint,
+    RepositoryBlueprint,
+    Task,
+    TaskResult,
+)
+from core.repository_manager import RepositoryManager
+
+logger = logging.getLogger(__name__)
+
+
+class ArchitectAgent(BaseAgent):
+    role = AgentRole.ARCHITECT
+
+    @property
+    def system_prompt(self) -> str:
+        return (
+            "You are a senior software architect agent. Your job is to design a complete "
+            "backend system architecture from a user's requirements.\n\n"
+            "You must produce a JSON response with this exact structure:\n"
+            "{\n"
+            '  "name": "project-name",\n'
+            '  "description": "what this project does",\n'
+            '  "architecture_style": "REST|GraphQL|gRPC",\n'
+            '  "tech_stack": {"language": "python", "framework": "fastapi", "db": "postgresql", ...},\n'
+            '  "folder_structure": ["controllers", "services", "repositories", "models", "config"],\n'
+            '  "file_blueprints": [\n'
+            "    {\n"
+            '      "path": "models/user.py",\n'
+            '      "purpose": "User database model",\n'
+            '      "depends_on": [],\n'
+            '      "exports": ["User", "UserCreate", "UserUpdate"],\n'
+            '      "language": "python",\n'
+            '      "layer": "model"\n'
+            "    }\n"
+            "  ],\n"
+            '  "architecture_doc": "# Architecture\\n..."\n'
+            "}\n\n"
+            "Rules:\n"
+            "- Design clean layered architecture (models -> repositories -> services -> controllers)\n"
+            "- Include config files (database config, app config, main entrypoint)\n"
+            "- Every file must have a clear purpose and explicit dependencies\n"
+            "- Use dependency injection patterns\n"
+            "- Follow SOLID principles\n"
+            "- Include proper error handling and validation layers\n"
+            "- The architecture_doc should be a comprehensive markdown document"
+        )
+
+    async def execute(self, context: AgentContext) -> TaskResult:
+        """Not used directly - use design_architecture instead."""
+        return TaskResult(success=False, errors=["Use design_architecture() method"])
+
+    async def design_architecture(self, user_prompt: str) -> RepositoryBlueprint:
+        """Design a complete repository blueprint from user requirements."""
+        logger.info("Designing architecture from user prompt")
+
+        result = await self._call_llm_json(user_prompt)
+        return self._parse_blueprint(result)
+
+    def _parse_blueprint(self, data: dict[str, Any]) -> RepositoryBlueprint:
+        file_blueprints = [
+            FileBlueprint(
+                path=fb["path"],
+                purpose=fb["purpose"],
+                depends_on=fb.get("depends_on", []),
+                exports=fb.get("exports", []),
+                language=fb.get("language", "python"),
+                layer=fb.get("layer", ""),
+            )
+            for fb in data.get("file_blueprints", [])
+        ]
+
+        return RepositoryBlueprint(
+            name=data.get("name", "generated-project"),
+            description=data.get("description", ""),
+            architecture_style=data.get("architecture_style", "REST"),
+            tech_stack=data.get("tech_stack", {}),
+            folder_structure=data.get("folder_structure", []),
+            file_blueprints=file_blueprints,
+            architecture_doc=data.get("architecture_doc", ""),
+        )

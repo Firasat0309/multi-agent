@@ -1,0 +1,211 @@
+"""Repository manager handling workspace files and structure."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+from pathlib import Path
+from typing import Any
+
+from core.models import FileIndex, RepositoryBlueprint, RepositoryIndex
+
+logger = logging.getLogger(__name__)
+
+
+class RepositoryManager:
+    """Manages the generated repository workspace."""
+
+    def __init__(self, workspace_dir: Path) -> None:
+        self.workspace = workspace_dir
+        self.src_dir = workspace_dir / "src"
+        self.test_dir = workspace_dir / "tests"
+        self.deploy_dir = workspace_dir / "deploy"
+        self.docs_dir = workspace_dir / "docs"
+        self._repo_index = RepositoryIndex()
+
+    def initialize(self, blueprint: RepositoryBlueprint) -> None:
+        """Create workspace directory structure from blueprint."""
+        self.workspace.mkdir(parents=True, exist_ok=True)
+        self.src_dir.mkdir(exist_ok=True)
+        self.test_dir.mkdir(exist_ok=True)
+        self.deploy_dir.mkdir(exist_ok=True)
+        self.docs_dir.mkdir(exist_ok=True)
+
+        # Create subdirectories from blueprint
+        for folder in blueprint.folder_structure:
+            (self.src_dir / folder).mkdir(parents=True, exist_ok=True)
+
+        # Write architecture doc
+        arch_path = self.workspace / "architecture.md"
+        arch_path.write_text(blueprint.architecture_doc, encoding="utf-8")
+
+        # Write blueprint files
+        bp_data = {
+            "name": blueprint.name,
+            "architecture_style": blueprint.architecture_style,
+            "tech_stack": blueprint.tech_stack,
+            "files": [
+                {
+                    "path": fb.path,
+                    "purpose": fb.purpose,
+                    "depends_on": fb.depends_on,
+                    "exports": fb.exports,
+                    "language": fb.language,
+                    "layer": fb.layer,
+                }
+                for fb in blueprint.file_blueprints
+            ],
+        }
+        bp_path = self.workspace / "file_blueprints.json"
+        bp_path.write_text(json.dumps(bp_data, indent=2), encoding="utf-8")
+
+        # Write dependency graph
+        dep_graph = self._build_dep_graph(blueprint)
+        dep_path = self.workspace / "dependency_graph.json"
+        dep_path.write_text(json.dumps(dep_graph, indent=2), encoding="utf-8")
+
+        logger.info(f"Initialized workspace at {self.workspace}")
+
+    def write_file(self, rel_path: str, content: str) -> Path:
+        """Write a file to the src directory and update index."""
+        file_path = self.src_dir / rel_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+
+        # Ensure __init__.py exists in all parent packages
+        self._ensure_init_files(file_path)
+
+        # Update repo index
+        self._index_file(rel_path, content)
+
+        logger.info(f"Wrote {rel_path} ({len(content)} bytes)")
+        return file_path
+
+    def write_test_file(self, rel_path: str, content: str) -> Path:
+        """Write a test file."""
+        file_path = self.test_dir / rel_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+        self._ensure_init_files(file_path)
+        logger.info(f"Wrote test {rel_path}")
+        return file_path
+
+    def write_deploy_file(self, rel_path: str, content: str) -> Path:
+        """Write a deployment file."""
+        file_path = self.deploy_dir / rel_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+        logger.info(f"Wrote deploy artifact {rel_path}")
+        return file_path
+
+    def write_doc_file(self, rel_path: str, content: str) -> Path:
+        """Write a documentation file."""
+        file_path = self.docs_dir / rel_path
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+        logger.info(f"Wrote doc {rel_path}")
+        return file_path
+
+    def read_file(self, rel_path: str) -> str | None:
+        """Read a file from the src directory."""
+        file_path = self.src_dir / rel_path
+        if not file_path.exists():
+            return None
+        return file_path.read_text(encoding="utf-8")
+
+    def list_files(self, directory: str = "") -> list[str]:
+        """List files in a subdirectory of src."""
+        target = self.src_dir / directory
+        if not target.exists():
+            return []
+        return [
+            str(p.relative_to(self.src_dir)).replace("\\", "/")
+            for p in target.rglob("*.py")
+            if p.is_file()
+        ]
+
+    def search_code(self, keyword: str) -> list[dict[str, Any]]:
+        """Search for a keyword across all source files."""
+        results: list[dict[str, Any]] = []
+        for py_file in self.src_dir.rglob("*.py"):
+            try:
+                content = py_file.read_text(encoding="utf-8")
+                for i, line in enumerate(content.splitlines(), 1):
+                    if keyword in line:
+                        results.append({
+                            "file": str(py_file.relative_to(self.src_dir)).replace("\\", "/"),
+                            "line": i,
+                            "content": line.strip(),
+                        })
+            except Exception:
+                continue
+        return results
+
+    def get_repo_index(self) -> RepositoryIndex:
+        return self._repo_index
+
+    def save_repo_index(self) -> None:
+        """Persist the repo index to disk."""
+        index_data = {
+            "files": [
+                {
+                    "path": f.path,
+                    "exports": f.exports,
+                    "imports": f.imports,
+                    "classes": f.classes,
+                    "functions": f.functions,
+                    "checksum": f.checksum,
+                }
+                for f in self._repo_index.files
+            ]
+        }
+        index_path = self.workspace / "repo_index.json"
+        index_path.write_text(json.dumps(index_data, indent=2), encoding="utf-8")
+
+    def _index_file(self, rel_path: str, content: str) -> None:
+        """Parse and index a Python file using simple heuristics."""
+        exports: list[str] = []
+        imports: list[str] = []
+        classes: list[str] = []
+        functions: list[str] = []
+
+        for line in content.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("import ") or stripped.startswith("from "):
+                imports.append(stripped)
+            elif stripped.startswith("class "):
+                name = stripped.split("(")[0].split(":")[0].replace("class ", "").strip()
+                classes.append(name)
+                exports.append(name)
+            elif stripped.startswith("def ") and not line.startswith(" "):
+                name = stripped.split("(")[0].replace("def ", "").strip()
+                functions.append(name)
+                exports.append(name)
+
+        checksum = hashlib.md5(content.encode()).hexdigest()
+        file_index = FileIndex(
+            path=rel_path,
+            exports=exports,
+            imports=imports,
+            classes=classes,
+            functions=functions,
+            checksum=checksum,
+        )
+        self._repo_index.add_or_update(file_index)
+
+    def _ensure_init_files(self, file_path: Path) -> None:
+        """Create __init__.py in all parent directories up to src/test root."""
+        current = file_path.parent
+        roots = {self.src_dir, self.test_dir}
+        while current not in roots and current != current.parent:
+            init_file = current / "__init__.py"
+            if not init_file.exists():
+                init_file.write_text("", encoding="utf-8")
+            current = current.parent
+
+    def _build_dep_graph(self, blueprint: RepositoryBlueprint) -> dict[str, list[str]]:
+        graph: dict[str, list[str]] = {}
+        for fb in blueprint.file_blueprints:
+            graph[fb.path] = fb.depends_on
+        return graph

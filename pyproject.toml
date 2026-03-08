@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "multi-agent-codegen"
+version = "0.1.0"
+description = "Production-grade multi-agent backend code generation platform"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "google-generativeai>=0.8.0",
+    "pydantic>=2.5.0",
+    "networkx>=3.2",
+    "chromadb>=0.4.0",
+    "docker>=7.0.0",
+    "kubernetes>=28.0.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.27.0",
+    "redis>=5.0.0",
+    "prometheus-client>=0.20.0",
+    "opentelemetry-api>=1.22.0",
+    "opentelemetry-sdk>=1.22.0",
+    "opentelemetry-exporter-otlp>=1.22.0",
+    "pyyaml>=6.0",
+    "jinja2>=3.1.0",
+    "rich>=13.7.0",
+    "click>=8.1.0",
+    "asyncio-pool>=0.7.0",
+    "aiofiles>=23.2.0",
+    "bandit>=1.7.0",
+    "tree-sitter>=0.21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.2.0",
+    "mypy>=1.8.0",
+]
+
+[project.scripts]
+codegen = "core.cli:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

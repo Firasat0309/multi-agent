@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: codegen-config
+data:
+  max-concurrent-agents: "4"
+  sandbox-type: "docker"
+  llm-model: "claude-sonnet-4-20250514"
+  llm-provider: "anthropic"
