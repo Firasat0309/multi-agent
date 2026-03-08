@@ -23,10 +23,9 @@ class EmbeddingStore:
             return
         try:
             import chromadb
-            self._client = chromadb.Client(chromadb.Settings(
-                persist_directory=self._persist_dir,
-                anonymized_telemetry=False,
-            ))
+            # chromadb >= 0.4 uses PersistentClient; the old Settings-based
+            # constructor was removed.
+            self._client = chromadb.PersistentClient(path=self._persist_dir)
             self._collection = self._client.get_or_create_collection(
                 name=self._collection_name,
                 metadata={"hnsw:space": "cosine"},

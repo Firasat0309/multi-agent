@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -180,23 +181,27 @@ class LLMClient:
         self, client: Any, system: str, user: str, temperature: float, max_tokens: int
     ) -> LLMResponse:
         import anthropic
-        try:
-            response = client.messages.create(
-                model=self.config.model,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system,
-                messages=[{"role": "user", "content": user}],
-            )
-        except TypeError as e:
-            if "authentication" in str(e).lower() or "api_key" in str(e).lower():
-                raise LLMConfigError(
-                    f"❌ Anthropic authentication failed\n\n"
-                    f"Your API key is missing or invalid.\n"
-                    f"Set: export ANTHROPIC_API_KEY=\"sk-ant-your-key\"\n"
-                    f"Get key at: https://console.anthropic.com"
-                ) from e
-            raise
+
+        def _sync() -> Any:
+            try:
+                return client.messages.create(
+                    model=self.config.model,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    system=system,
+                    messages=[{"role": "user", "content": user}],
+                )
+            except TypeError as e:
+                if "authentication" in str(e).lower() or "api_key" in str(e).lower():
+                    raise LLMConfigError(
+                        f"❌ Anthropic authentication failed\n\n"
+                        f"Your API key is missing or invalid.\n"
+                        f"Set: export ANTHROPIC_API_KEY=\"sk-ant-your-key\"\n"
+                        f"Get key at: https://console.anthropic.com"
+                    ) from e
+                raise
+
+        response = await asyncio.to_thread(_sync)
         return LLMResponse(
             content=response.content[0].text,
             usage={
@@ -210,15 +215,18 @@ class LLMClient:
     async def _openai_generate(
         self, client: Any, system: str, user: str, temperature: float, max_tokens: int
     ) -> LLMResponse:
-        response = client.chat.completions.create(
-            model=self.config.model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
+        def _sync() -> Any:
+            return client.chat.completions.create(
+                model=self.config.model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+
+        response = await asyncio.to_thread(_sync)
         choice = response.choices[0]
         return LLMResponse(
             content=choice.message.content or "",
@@ -233,7 +241,7 @@ class LLMClient:
     async def _gemini_generate(
         self, client: Any, system: str, user: str, temperature: float, max_tokens: int
     ) -> LLMResponse:
-        try:
+        def _sync() -> Any:
             model = client.GenerativeModel(
                 model_name=self.config.model,
                 system_instruction=system,
@@ -242,11 +250,14 @@ class LLMClient:
                     "max_output_tokens": max_tokens,
                 },
             )
-            response = model.generate_content(user)
+            return model.generate_content(user)
+
+        try:
+            response = await asyncio.to_thread(_sync)
         except Exception as e:
             error_str = str(e).lower()
             error_type = type(e).__name__
-            
+
             # Check for NotFound errors (model doesn't exist or is deprecated)
             if "notfound" in error_type.lower() or "404" in str(e) or "not found" in error_str:
                 if "deprecated" in error_str or "no longer available" in error_str:
@@ -274,7 +285,6 @@ class LLMClient:
                     f"Set: export GEMINI_API_KEY=\"your-api-key\"\n"
                     f"Get key at: https://aistudio.google.com/app/apikey"
                 ) from e
-            # If it's any other Google API error, provide helpful message
             elif "google" in error_type.lower() or "grpc" in error_type.lower():
                 raise LLMConfigError(
                     f"❌ Google Gemini API error: {str(e)}\n\n"

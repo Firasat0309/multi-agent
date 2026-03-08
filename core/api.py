@@ -93,10 +93,18 @@ async def _run_pipeline(job_id: str, request: GenerateRequest) -> None:
     """Background task to run the pipeline."""
     _jobs[job_id]["status"] = "running"
 
-    settings = get_settings()
-    settings.workspace_dir = Path(request.workspace) / job_id
+    base = get_settings()
+    # Build a fresh Settings per job — never mutate the singleton.
+    settings = Settings(
+        workspace_dir=Path(request.workspace) / job_id,
+        llm=base.llm,
+        sandbox=base.sandbox,
+        memory=base.memory,
+        observability=base.observability,
+        max_concurrent_agents=request.max_agents,
+    )
 
-    pipeline = Pipeline(settings)
+    pipeline = Pipeline(settings, interactive=False)
 
     try:
         result = await pipeline.run(request.prompt)

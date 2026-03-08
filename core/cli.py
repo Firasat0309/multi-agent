@@ -44,6 +44,7 @@ def cli(verbose: bool) -> None:
 @click.option("--provider", "-p", default="anthropic", help="LLM provider")
 @click.option("--sandbox", "-s", default="local", help="Sandbox type (docker/local)")
 @click.option("--max-agents", default=4, help="Max concurrent agents")
+@click.option("--no-interactive", is_flag=True, default=False, help="Disable live display (plain logs)")
 def generate(
     prompt: str,
     workspace: str,
@@ -51,16 +52,9 @@ def generate(
     provider: str,
     sandbox: str,
     max_agents: int,
+    no_interactive: bool,
 ) -> None:
     """Generate a backend project from a natural language prompt."""
-    console.print(Panel.fit(
-        f"[bold blue]Multi-Agent Code Generator[/bold blue]\n"
-        f"Prompt: {prompt[:80]}...\n"
-        f"Workspace: {workspace}\n"
-        f"Model: {model}",
-        title="Starting",
-    ))
-
     try:
         settings = Settings(
             workspace_dir=Path(workspace),
@@ -72,7 +66,7 @@ def generate(
             max_concurrent_agents=max_agents,
         )
 
-        pipeline = Pipeline(settings)
+        pipeline = Pipeline(settings, interactive=not no_interactive)
     except LLMConfigError as e:
         # Display configuration error with better formatting
         console.print(Panel(

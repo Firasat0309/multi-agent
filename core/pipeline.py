@@ -185,6 +185,22 @@ class Pipeline:
         if self._live:
             self._live.set_phase("Code Generation & Review", "running")
         logger.info("[Phase 3] Executing tasks...")
+
+        # Spin up sandbox when Docker mode is requested
+        from config.settings import SandboxType
+        sandbox_manager: SandboxManager | None = None
+        if self.settings.sandbox.sandbox_type == SandboxType.DOCKER:
+            try:
+                sandbox_manager = SandboxManager(self.settings.sandbox)
+                sandbox_info = await sandbox_manager.create_sandbox(
+                    self.settings.workspace_dir,
+                    language_name=lang_profile.name,
+                )
+                logger.info(f"Docker sandbox created: {sandbox_info.sandbox_id}")
+            except Exception as e:
+                logger.warning(f"Docker sandbox unavailable ({e}), falling back to local")
+                sandbox_manager = None
+
         agent_manager = AgentManager(
             settings=self.settings,
             llm_client=self.llm,
@@ -206,6 +222,14 @@ class Pipeline:
                 errors=[f"Task execution failed: {e}"],
                 elapsed_seconds=time.monotonic() - start_time,
             )
+        finally:
+            # Always destroy the sandbox to free resources
+            if sandbox_manager:
+                try:
+                    await sandbox_manager.destroy_all()
+                    logger.info("Sandbox destroyed")
+                except Exception:
+                    logger.warning("Sandbox teardown failed (non-critical)")
 
         if self._live:
             self._live.complete_phase("Code Generation & Review")

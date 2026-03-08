@@ -29,7 +29,7 @@ class SandboxBase(ABC):
     """Abstract sandbox interface."""
 
     @abstractmethod
-    async def create(self, workspace_path: Path) -> SandboxInfo:
+    async def create(self, workspace_path: Path, language_name: str = "python") -> SandboxInfo:
         ...
 
     @abstractmethod
@@ -56,12 +56,18 @@ class DockerSandbox(SandboxBase):
         self.config = config
         self._containers: dict[str, Any] = {}
 
-    async def create(self, workspace_path: Path) -> SandboxInfo:
+    async def create(self, workspace_path: Path, language_name: str = "python") -> SandboxInfo:
         import docker
         client = docker.from_env()
 
+        # Auto-detect image from language profile when not explicitly configured
+        image = self.config.image
+        if not image:
+            from core.language import get_language_profile
+            image = get_language_profile(language_name).docker_image
+
         container = client.containers.run(
-            self.config.image,
+            image,
             command="sleep infinity",
             detach=True,
             mem_limit=self.config.memory_limit,
@@ -145,7 +151,7 @@ class LocalSandbox(SandboxBase):
         self._workspaces: dict[str, Path] = {}
         self._counter = 0
 
-    async def create(self, workspace_path: Path) -> SandboxInfo:
+    async def create(self, workspace_path: Path, language_name: str = "python") -> SandboxInfo:
         self._counter += 1
         sandbox_id = f"local-{self._counter}"
         self._workspaces[sandbox_id] = workspace_path
@@ -205,9 +211,11 @@ class SandboxManager:
             return DockerSandbox(self.config)
         return LocalSandbox()
 
-    async def create_sandbox(self, workspace_path: Path) -> SandboxInfo:
+    async def create_sandbox(
+        self, workspace_path: Path, language_name: str = "python"
+    ) -> SandboxInfo:
         backend = self._create_sandbox_backend()
-        info = await backend.create(workspace_path)
+        info = await backend.create(workspace_path, language_name=language_name)
         self._active[info.sandbox_id] = (backend, info)
         return info
 

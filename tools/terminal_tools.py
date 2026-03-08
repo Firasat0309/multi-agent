@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,9 +35,21 @@ class TerminalTools:
         self._allowed_commands = set(self._lang.allowed_commands)
 
     async def run_command(self, command: str) -> CommandResult:
-        """Execute a command in the working directory."""
-        # Basic command validation
-        base_cmd = command.split()[0] if command.split() else ""
+        """Execute a command in the working directory.
+
+        Uses execvp-style execution (no shell) to prevent command injection.
+        The command string is split via shlex so options and quoted args work,
+        but shell metacharacters (;, &&, |, >, ` etc.) are never interpreted.
+        """
+        try:
+            parts = shlex.split(command)
+        except ValueError as e:
+            return CommandResult(exit_code=1, stdout="", stderr=f"Invalid command: {e}")
+
+        if not parts:
+            return CommandResult(exit_code=1, stdout="", stderr="Empty command")
+
+        base_cmd = parts[0]
         if base_cmd not in self._allowed_commands:
             logger.warning(f"Blocked command: {base_cmd}")
             return CommandResult(
@@ -46,8 +59,8 @@ class TerminalTools:
             )
 
         try:
-            proc = await asyncio.create_subprocess_shell(
-                command,
+            proc = await asyncio.create_subprocess_exec(
+                *parts,
                 cwd=str(self.working_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -71,11 +84,7 @@ class TerminalTools:
                     timed_out=True,
                 )
         except Exception as e:
-            return CommandResult(
-                exit_code=-1,
-                stdout="",
-                stderr=str(e),
-            )
+            return CommandResult(exit_code=-1, stdout="", stderr=str(e))
 
     async def run_tests(self, test_path: str = "") -> CommandResult:
         """Run tests using the language-appropriate test runner."""

@@ -18,12 +18,10 @@ from config.settings import Settings
 from core.context_builder import ContextBuilder
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient
+from core.observability import record_agent_end, record_agent_start, record_task_completion
 from core.models import (
-    AgentContext,
     RepositoryBlueprint,
-    RepositoryIndex,
     Task,
-    TaskResult,
     TaskStatus,
     TaskType,
 )
@@ -135,6 +133,7 @@ class AgentManager:
         """Execute a single task with retry logic."""
         task.status = TaskStatus.IN_PROGRESS
         agent_name = ""
+        task_start = time.monotonic()
 
         if self._live:
             self._live.update_task(task.task_id, task.description, "in_progress")
@@ -158,7 +157,12 @@ class AgentManager:
                         task.task_id, task.description, "in_progress", agent_name,
                     )
 
-                result = await agent.execute(context)
+                record_agent_start()
+                try:
+                    result = await agent.execute(context)
+                finally:
+                    record_agent_end()
+
                 task.result = result
 
                 # Track agent metrics
@@ -167,8 +171,10 @@ class AgentManager:
                 self._metrics["agent_metrics"][agent_name].append(agent.get_metrics())
 
                 if result.success:
+                    elapsed = time.monotonic() - task_start
                     task_graph.mark_completed(task.task_id)
                     self._metrics["tasks_completed"] += 1
+                    record_task_completion(task.task_type.value, "completed", elapsed)
                     logger.info(f"Task {task.task_id} completed: {result.output}")
                     if self._live:
                         self._live.update_task(
@@ -191,8 +197,10 @@ class AgentManager:
                 task.retry_count += 1
 
         # All retries exhausted
+        elapsed = time.monotonic() - task_start
         task_graph.mark_failed(task.task_id)
         self._metrics["tasks_failed"] += 1
+        record_task_completion(task.task_type.value, "failed", elapsed)
         logger.error(f"Task {task.task_id} failed after {task.max_retries} attempts")
         if self._live:
             self._live.update_task(task.task_id, task.description, "failed", agent_name)

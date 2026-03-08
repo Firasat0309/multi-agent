@@ -18,6 +18,11 @@ from core.models import (
 
 logger = logging.getLogger(__name__)
 
+# Hard cap on files included in wide-scope reviews to avoid context overflow.
+_MAX_REVIEW_FILES = 20
+# Hard cap on total characters across all related files sent to the LLM.
+_MAX_CONTEXT_CHARS = 120_000
+
 
 class ContextBuilder:
     """Builds focused context for agents, avoiding full-repo dumps."""
@@ -56,7 +61,7 @@ class ContextBuilder:
     def _collect_related_files(
         self, task: Task, file_bp: FileBlueprint | None
     ) -> dict[str, str]:
-        """Read only the files this task depends on."""
+        """Read only the files this task depends on, respecting token budget."""
         related: dict[str, str] = {}
         paths_to_read: set[str] = set()
 
@@ -67,15 +72,26 @@ class ContextBuilder:
         if task.task_type in (TaskType.REVIEW_FILE, TaskType.GENERATE_TEST):
             paths_to_read.add(task.file)
 
-        # For module/architecture review, read all files
+        # For module/architecture review, read files up to the cap to avoid
+        # overflowing the LLM context window on large repositories.
         if task.task_type in (TaskType.REVIEW_MODULE, TaskType.REVIEW_ARCHITECTURE):
-            for fb in self.blueprint.file_blueprints:
+            for fb in self.blueprint.file_blueprints[:_MAX_REVIEW_FILES]:
                 paths_to_read.add(fb.path)
 
+        total_chars = 0
         for p in paths_to_read:
+            if total_chars >= _MAX_CONTEXT_CHARS:
+                logger.debug(
+                    "Context budget reached (%d chars), skipping remaining files", total_chars
+                )
+                break
             content = self._read_file(p)
             if content is not None:
+                # Truncate individual files that are excessively large
+                if len(content) > 8_000:
+                    content = content[:8_000] + "\n# ... (truncated)"
                 related[p] = content
+                total_chars += len(content)
 
         return related
 
