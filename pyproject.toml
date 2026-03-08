@@ -45,6 +45,9 @@ dev = [
 [project.scripts]
 codegen = "core.cli:main"
 
+[tool.hatch.build.targets.wheel]
+packages = ["agents", "core", "memory", "tools", "sandbox", "config"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
