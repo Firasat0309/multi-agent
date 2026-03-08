@@ -27,10 +27,8 @@ dependencies = [
     "jinja2>=3.1.0",
     "rich>=13.7.0",
     "click>=8.1.0",
-    "asyncio-pool>=0.7.0",
     "aiofiles>=23.2.0",
     "bandit>=1.7.0",
-    "tree-sitter>=0.21.0",
 ]
 
 [project.optional-dependencies]
