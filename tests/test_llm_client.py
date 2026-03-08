@@ -13,6 +13,7 @@ def make_client(provider: str, model: str = "test-model") -> LLMClient:
         provider=LLMProvider(provider),
         model=model,
         api_key="test-key",
+        openai_api_key="test-openai-key",
         gemini_api_key="test-gemini-key",
     ))
 

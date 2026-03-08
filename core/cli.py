@@ -15,6 +15,7 @@ from rich.table import Table
 
 from config.settings import Settings, LLMConfig, LLMProvider, SandboxConfig, SandboxType
 from core.pipeline import Pipeline, PipelineResult
+from core.llm_client import LLMConfigError
 
 console = Console()
 
@@ -60,17 +61,37 @@ def generate(
         title="Starting",
     ))
 
-    settings = Settings(
-        workspace_dir=Path(workspace),
-        llm=LLMConfig(
-            provider=LLMProvider(provider),
-            model=model,
-        ),
-        sandbox=SandboxConfig(sandbox_type=SandboxType(sandbox)),
-        max_concurrent_agents=max_agents,
-    )
+    try:
+        settings = Settings(
+            workspace_dir=Path(workspace),
+            llm=LLMConfig(
+                provider=LLMProvider(provider),
+                model=model,
+            ),
+            sandbox=SandboxConfig(sandbox_type=SandboxType(sandbox)),
+            max_concurrent_agents=max_agents,
+        )
 
-    pipeline = Pipeline(settings)
+        pipeline = Pipeline(settings)
+    except LLMConfigError as e:
+        # Display configuration error with better formatting
+        console.print(Panel(
+            f"[bold red]{str(e)}[/bold red]",
+            title="❌ Configuration Error",
+            border_style="red",
+        ))
+        sys.exit(1)
+    except ValueError as e:
+        # Handle invalid provider or sandbox type
+        console.print(Panel(
+            f"[bold red]Invalid configuration: {e}[/bold red]\n\n"
+            f"Valid providers: anthropic, openai, gemini\n"
+            f"Valid sandbox types: docker, local",
+            title="❌ Configuration Error",
+            border_style="red",
+        ))
+        sys.exit(1)
+
     result = asyncio.run(pipeline.run(prompt))
     _display_result(result)
 
@@ -111,32 +132,54 @@ def _display_result(result: PipelineResult) -> None:
     if result.success:
         console.print(Panel.fit(
             "[bold green]Pipeline completed successfully![/bold green]",
-            title="Success",
+            title="✅ Success",
         ))
     else:
         console.print(Panel.fit(
             "[bold red]Pipeline completed with issues[/bold red]",
-            title="Warning",
+            title="⚠️  Warning",
         ))
 
-    table = Table(title="Results")
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="white")
+    # Check if error is a config error (contains ❌ or specific keywords)
+    is_config_error = result.errors and any(
+        error.startswith("❌") or "missing api key" in error.lower() or 
+        "not found" in error.lower() or "authentication" in error.lower() or 
+        "no longer available" in error.lower()
+        for error in result.errors
+    )
 
-    table.add_row("Workspace", str(result.workspace_path))
-    table.add_row("Elapsed", f"{result.elapsed_seconds:.1f}s")
+    if is_config_error and result.errors:
+        # Display config error with full message (rich formatting preserved)
+        error_msg = result.errors[0]
+        console.print(Panel(
+            error_msg,
+            title="Configuration Error",
+            border_style="red" if not result.success else "yellow",
+        ))
+    else:
+        # Display standard results table
+        table = Table(title="Results")
+        table.add_column("Metric", style="cyan")
+        table.add_column("Value", style="white")
 
-    if result.blueprint:
-        table.add_row("Project", result.blueprint.name)
-        table.add_row("Files", str(len(result.blueprint.file_blueprints)))
+        table.add_row("Workspace", str(result.workspace_path))
+        table.add_row("Elapsed", f"{result.elapsed_seconds:.1f}s")
 
-    for status_name, count in result.task_stats.items():
-        table.add_row(f"Tasks ({status_name})", str(count))
+        if result.blueprint:
+            table.add_row("Project", result.blueprint.name)
+            table.add_row("Files", str(len(result.blueprint.file_blueprints)))
 
-    if result.errors:
-        table.add_row("Errors", "\n".join(result.errors[:5]))
+        for status_name, count in result.task_stats.items():
+            table.add_row(f"Tasks ({status_name})", str(count))
 
-    console.print(table)
+        if result.errors:
+            # Show first few errors
+            error_text = "\n".join(result.errors[:3])
+            if len(result.errors) > 3:
+                error_text += f"\n... and {len(result.errors) - 3} more"
+            table.add_row("Errors", error_text)
+
+        console.print(table)
 
 
 def main() -> None:

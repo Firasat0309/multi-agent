@@ -13,7 +13,7 @@ from agents.architect_agent import ArchitectAgent
 from agents.planner_agent import PlannerAgent
 from config.settings import Settings
 from core.agent_manager import AgentManager
-from core.llm_client import LLMClient
+from core.llm_client import LLMClient, LLMConfigError
 from core.models import RepositoryBlueprint
 from core.observability import record_task_completion, start_metrics_server, setup_tracing
 from core.repository_manager import RepositoryManager
@@ -43,7 +43,11 @@ class Pipeline:
     def __init__(self, settings: Settings | None = None) -> None:
         from config.settings import get_settings
         self.settings = settings or get_settings()
-        self.llm = LLMClient(self.settings.llm)
+        try:
+            self.llm = LLMClient(self.settings.llm)
+        except LLMConfigError as e:
+            # Re-raise with full context - will be caught in run()
+            raise
 
     async def run(self, user_prompt: str) -> PipelineResult:
         """Execute the full generation pipeline."""
@@ -69,6 +73,15 @@ class Pipeline:
 
         try:
             blueprint = await architect.design_architecture(user_prompt)
+        except LLMConfigError as e:
+            # Configuration errors should be displayed to user, not logged as exceptions
+            logger.error(str(e))
+            return PipelineResult(
+                success=False,
+                workspace_path=self.settings.workspace_dir,
+                errors=[str(e)],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
         except Exception as e:
             logger.exception("Architecture design failed")
             return PipelineResult(
@@ -91,6 +104,15 @@ class Pipeline:
 
         try:
             task_graph = await planner.create_task_graph(blueprint)
+        except LLMConfigError as e:
+            logger.error(str(e))
+            return PipelineResult(
+                success=False,
+                workspace_path=self.settings.workspace_dir,
+                blueprint=blueprint,
+                errors=[str(e)],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
         except Exception as e:
             logger.exception("Task planning failed")
             return PipelineResult(
