@@ -16,7 +16,7 @@ class FileBlueprint:
     purpose: str
     depends_on: list[str] = field(default_factory=list)
     exports: list[str] = field(default_factory=list)
-    language: str = "python"
+    language: str = ""  # Resolved from tech_stack at blueprint parse time
     layer: str = ""  # controller, service, repository, model, test, config
 
 

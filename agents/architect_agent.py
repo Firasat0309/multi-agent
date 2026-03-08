@@ -76,13 +76,18 @@ class ArchitectAgent(BaseAgent):
         return self._parse_blueprint(result)
 
     def _parse_blueprint(self, data: dict[str, Any]) -> RepositoryBlueprint:
+        from core.language import detect_language_from_blueprint, get_language_profile
+        tech_stack = data.get("tech_stack", {})
+        # Derive the project-level language once so it can fill in any missing per-file fields
+        project_lang = detect_language_from_blueprint(tech_stack).name
+
         file_blueprints = [
             FileBlueprint(
                 path=fb["path"],
                 purpose=fb["purpose"],
                 depends_on=fb.get("depends_on", []),
                 exports=fb.get("exports", []),
-                language=fb.get("language", "python"),
+                language=self._resolve_file_language(fb.get("language", ""), fb["path"], project_lang),
                 layer=fb.get("layer", ""),
             )
             for fb in data.get("file_blueprints", [])
@@ -97,3 +102,30 @@ class ArchitectAgent(BaseAgent):
             file_blueprints=file_blueprints,
             architecture_doc=data.get("architecture_doc", ""),
         )
+
+    def _resolve_file_language(self, llm_lang: str, path: str, project_lang: str) -> str:
+        """Return the correct language tag for a file.
+
+        Priority:
+        1. Extension-based override — .java/.go/.ts/.rs/.cs/.py files are unambiguous.
+        2. LLM-provided language tag (if non-empty and not the wrong default).
+        3. Project-level language derived from tech_stack.
+        """
+        ext_map = {
+            ".py": "python", ".java": "java", ".go": "go",
+            ".ts": "typescript", ".rs": "rust", ".cs": "csharp",
+            ".kt": "java", ".scala": "java",
+        }
+        for ext, lang in ext_map.items():
+            if path.endswith(ext):
+                return lang
+
+        # Non-source files (.properties, .yaml, .xml, .json, pom.xml, Dockerfile …)
+        # Tag them with the project language so the coder knows the ecosystem,
+        # but the coder agent will detect them as config files from the extension.
+        if llm_lang and llm_lang != "python":
+            return llm_lang
+
+        return project_lang
+
+
