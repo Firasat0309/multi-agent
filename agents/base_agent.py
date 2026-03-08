@@ -6,6 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 from typing import Any
 
+from core.language import get_language_profile
 from core.llm_client import LLMClient, LLMResponse
 from core.models import AgentContext, AgentRole, Task, TaskResult
 from core.repository_manager import RepositoryManager
@@ -95,7 +96,17 @@ class BaseAgent(ABC):
             for path, content in context.related_files.items():
                 # Truncate large files
                 truncated = content[:4000] if len(content) > 4000 else content
-                parts.append(f"### {path}\n```python\n{truncated}\n```")
+                # Detect language from file extension for correct code fencing
+                lang_name = ""
+                if context.file_blueprint:
+                    lang_name = get_language_profile(context.file_blueprint.language).code_fence_name
+                if not lang_name:
+                    for ext, fence in {".py": "python", ".java": "java", ".go": "go",
+                                       ".ts": "typescript", ".rs": "rust", ".cs": "csharp"}.items():
+                        if path.endswith(ext):
+                            lang_name = fence
+                            break
+                parts.append(f"### {path}\n```{lang_name}\n{truncated}\n```")
 
         if context.dependency_info:
             deps = context.dependency_info

@@ -8,6 +8,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from core.language import LanguageProfile, detect_language_from_blueprint, PYTHON
 from core.models import FileIndex, RepositoryBlueprint, RepositoryIndex
 
 logger = logging.getLogger(__name__)
@@ -23,9 +24,11 @@ class RepositoryManager:
         self.deploy_dir = workspace_dir / "deploy"
         self.docs_dir = workspace_dir / "docs"
         self._repo_index = RepositoryIndex()
+        self._lang_profile: LanguageProfile = PYTHON
 
     def initialize(self, blueprint: RepositoryBlueprint) -> None:
         """Create workspace directory structure from blueprint."""
+        self._lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
         self.workspace.mkdir(parents=True, exist_ok=True)
         self.src_dir.mkdir(exist_ok=True)
         self.test_dir.mkdir(exist_ok=True)
@@ -115,31 +118,33 @@ class RepositoryManager:
         return file_path.read_text(encoding="utf-8")
 
     def list_files(self, directory: str = "") -> list[str]:
-        """List files in a subdirectory of src."""
+        """List source files in a subdirectory of src."""
         target = self.src_dir / directory
         if not target.exists():
             return []
-        return [
-            str(p.relative_to(self.src_dir)).replace("\\", "/")
-            for p in target.rglob("*.py")
-            if p.is_file()
-        ]
+        results: list[str] = []
+        for ext in self._lang_profile.file_extensions:
+            for p in target.rglob(f"*{ext}"):
+                if p.is_file():
+                    results.append(str(p.relative_to(self.src_dir)).replace("\\", "/"))
+        return results
 
     def search_code(self, keyword: str) -> list[dict[str, Any]]:
         """Search for a keyword across all source files."""
         results: list[dict[str, Any]] = []
-        for py_file in self.src_dir.rglob("*.py"):
-            try:
-                content = py_file.read_text(encoding="utf-8")
-                for i, line in enumerate(content.splitlines(), 1):
-                    if keyword in line:
-                        results.append({
-                            "file": str(py_file.relative_to(self.src_dir)).replace("\\", "/"),
-                            "line": i,
-                            "content": line.strip(),
-                        })
-            except Exception:
-                continue
+        for ext in self._lang_profile.file_extensions:
+            for src_file in self.src_dir.rglob(f"*{ext}"):
+                try:
+                    content = src_file.read_text(encoding="utf-8")
+                    for i, line in enumerate(content.splitlines(), 1):
+                        if keyword in line:
+                            results.append({
+                                "file": str(src_file.relative_to(self.src_dir)).replace("\\", "/"),
+                                "line": i,
+                                "content": line.strip(),
+                            })
+                except Exception:
+                    continue
         return results
 
     def get_repo_index(self) -> RepositoryIndex:
@@ -164,7 +169,8 @@ class RepositoryManager:
         index_path.write_text(json.dumps(index_data, indent=2), encoding="utf-8")
 
     def _index_file(self, rel_path: str, content: str) -> None:
-        """Parse and index a Python file using simple heuristics."""
+        """Parse and index a source file using language-aware heuristics."""
+        import re
         exports: list[str] = []
         imports: list[str] = []
         classes: list[str] = []
@@ -172,16 +178,23 @@ class RepositoryManager:
 
         for line in content.splitlines():
             stripped = line.strip()
-            if stripped.startswith("import ") or stripped.startswith("from "):
-                imports.append(stripped)
-            elif stripped.startswith("class "):
-                name = stripped.split("(")[0].split(":")[0].replace("class ", "").strip()
-                classes.append(name)
-                exports.append(name)
-            elif stripped.startswith("def ") and not line.startswith(" "):
-                name = stripped.split("(")[0].replace("def ", "").strip()
-                functions.append(name)
-                exports.append(name)
+            # Detect imports using language profile patterns
+            for pattern in self._lang_profile.import_patterns:
+                if re.match(pattern, stripped):
+                    imports.append(stripped)
+                    break
+            # Detect definitions using language profile patterns
+            for pattern in self._lang_profile.definition_patterns:
+                m = re.match(pattern, stripped)
+                if m:
+                    name = m.group(1)
+                    # Heuristic: class-like names are uppercase-start
+                    if name[0].isupper():
+                        classes.append(name)
+                    else:
+                        functions.append(name)
+                    exports.append(name)
+                    break
 
         checksum = hashlib.md5(content.encode()).hexdigest()
         file_index = FileIndex(
@@ -195,11 +208,13 @@ class RepositoryManager:
         self._repo_index.add_or_update(file_index)
 
     def _ensure_init_files(self, file_path: Path) -> None:
-        """Create __init__.py in all parent directories up to src/test root."""
+        """Create package init files if required by the language (Python only)."""
+        if not self._lang_profile.package_init_file:
+            return
         current = file_path.parent
         roots = {self.src_dir, self.test_dir}
         while current not in roots and current != current.parent:
-            init_file = current / "__init__.py"
+            init_file = current / self._lang_profile.package_init_file
             if not init_file.exists():
                 init_file.write_text("", encoding="utf-8")
             current = current.parent

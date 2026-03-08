@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from agents.base_agent import BaseAgent
+from core.language import get_language_profile, LanguageProfile
 from core.models import AgentContext, AgentRole, TaskResult
 from tools.terminal_tools import TerminalTools
 
@@ -19,22 +20,25 @@ class TestAgent(BaseAgent):
         super().__init__(*args, **kwargs)
         self.terminal = terminal
 
-    @property
-    def system_prompt(self) -> str:
+    def _get_system_prompt(self, language: str) -> str:
+        profile = get_language_profile(language)
         return (
-            "You are a test engineering agent. You generate comprehensive test suites.\n\n"
+            f"You are a test engineering agent for {profile.display_name} projects.\n\n"
             "Rules:\n"
-            "- Generate ONLY the Python test file content, no markdown fences\n"
-            "- Use pytest as the test framework\n"
-            "- Use pytest-asyncio for async tests\n"
+            f"- Generate ONLY the {profile.display_name} test file content, no markdown fences\n"
+            f"- Use the standard test framework for {profile.display_name}\n"
             "- Mock external dependencies (database, HTTP, etc.)\n"
             "- Test both happy paths and error cases\n"
             "- Test edge cases and boundary conditions\n"
             "- Use descriptive test names\n"
-            "- Use fixtures for common setup\n"
-            "- Include type hints\n"
+            "- Use fixtures/setup for common setup\n"
+            f"- Follow idiomatic {profile.display_name} testing conventions\n"
             "- Generate both unit tests and integration tests where appropriate"
         )
+
+    @property
+    def system_prompt(self) -> str:
+        return self._get_system_prompt("python")
 
     async def execute(self, context: AgentContext) -> TaskResult:
         """Generate tests for a file and optionally run them."""
@@ -45,31 +49,29 @@ class TestAgent(BaseAgent):
             )
 
         fb = context.file_blueprint
-        logger.info(f"Generating tests for {fb.path}")
+        lang = fb.language or "python"
+        profile = get_language_profile(lang)
+        logger.info(f"Generating {profile.display_name} tests for {fb.path}")
 
         formatted = self._format_context(context)
         prompt = (
             f"{formatted}\n\n"
-            f"Generate comprehensive pytest tests for: {fb.path}\n"
+            f"Generate comprehensive {profile.display_name} tests for: {fb.path}\n"
             f"The file's purpose: {fb.purpose}\n"
             f"The file exports: {', '.join(fb.exports)}\n\n"
-            "Generate complete, working pytest test code. Output only the code."
+            f"Generate complete, working test code. Output only the code."
         )
 
-        test_code = await self._call_llm(prompt)
-        test_code = self._clean_code(test_code)
+        test_code = await self._call_llm(prompt, system_override=self._get_system_prompt(lang))
+        test_code = self._clean_code(test_code, profile)
 
-        # Compute test file path
-        test_path = f"test_{fb.path.split('/')[-1]}"
-        if "/" in fb.path:
-            test_dir = fb.path.rsplit("/", 1)[0]
-            test_path = f"{test_dir}/{test_path}"
-
+        # Compute test file path based on language conventions
+        test_path = self._compute_test_path(fb.path, profile)
         self.repo.write_test_file(test_path, test_code)
 
         # Run tests if terminal available (autonomous debug loop)
         if self.terminal:
-            result = await self._run_and_fix(test_path, test_code, context)
+            result = await self._run_and_fix(test_path, test_code, context, profile)
             return result
 
         return TaskResult(
@@ -79,12 +81,37 @@ class TestAgent(BaseAgent):
             metrics=self.get_metrics(),
         )
 
+    def _compute_test_path(self, source_path: str, profile: LanguageProfile) -> str:
+        """Compute test file path following language conventions."""
+        filename = source_path.split("/")[-1]
+        directory = source_path.rsplit("/", 1)[0] if "/" in source_path else ""
+
+        name, ext = filename.rsplit(".", 1) if "." in filename else (filename, "")
+
+        if profile.name == "python":
+            test_name = f"test_{name}.{ext}"
+        elif profile.name == "java":
+            test_name = f"{name}Test.{ext}"
+        elif profile.name == "go":
+            test_name = f"{name}_test.{ext}"
+        elif profile.name in ("typescript", "ts"):
+            test_name = f"{name}.test.{ext}"
+        elif profile.name == "rust":
+            test_name = f"{name}_test.{ext}"
+        elif profile.name in ("csharp", "c#"):
+            test_name = f"{name}Tests.{ext}"
+        else:
+            test_name = f"test_{name}.{ext}"
+
+        return f"{directory}/{test_name}" if directory else test_name
+
     async def _run_and_fix(
-        self, test_path: str, test_code: str, context: AgentContext, max_attempts: int = 3
+        self, test_path: str, test_code: str, context: AgentContext,
+        profile: LanguageProfile, max_attempts: int = 3,
     ) -> TaskResult:
         """Autonomous debug loop: run tests, inspect errors, fix, rerun."""
         for attempt in range(max_attempts):
-            result = await self.terminal.run_tests(test_path)
+            result = await self.terminal.run_command(profile.test_command)
 
             if result.exit_code == 0:
                 return TaskResult(
@@ -94,16 +121,16 @@ class TestAgent(BaseAgent):
                     metrics={**self.get_metrics(), "fix_attempts": attempt},
                 )
 
-            # Ask LLM to fix the test
             logger.info(f"Test failed (attempt {attempt + 1}), asking LLM to fix")
             fix_prompt = (
                 f"The following test file failed:\n\n"
-                f"```python\n{test_code}\n```\n\n"
+                f"```{profile.code_fence_name}\n{test_code}\n```\n\n"
                 f"Error output:\n```\n{result.stdout}\n{result.stderr}\n```\n\n"
                 f"Fix the test code. Output only the complete corrected test file."
             )
-            test_code = await self._call_llm(fix_prompt)
-            test_code = self._clean_code(test_code)
+            lang = context.file_blueprint.language if context.file_blueprint else "python"
+            test_code = await self._call_llm(fix_prompt, system_override=self._get_system_prompt(lang))
+            test_code = self._clean_code(test_code, profile)
             self.repo.write_test_file(test_path, test_code)
 
         return TaskResult(
@@ -114,10 +141,11 @@ class TestAgent(BaseAgent):
             metrics={**self.get_metrics(), "fix_attempts": max_attempts},
         )
 
-    def _clean_code(self, code: str) -> str:
+    def _clean_code(self, code: str, profile: LanguageProfile) -> str:
         code = code.strip()
-        if code.startswith("```python"):
-            code = code[len("```python"):]
+        fence = f"```{profile.code_fence_name}"
+        if code.startswith(fence):
+            code = code[len(fence):]
         elif code.startswith("```"):
             code = code[3:]
         if code.endswith("```"):

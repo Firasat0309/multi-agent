@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from agents.base_agent import BaseAgent
+from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient
 from core.models import (
     AgentContext,
@@ -29,30 +30,35 @@ class ArchitectAgent(BaseAgent):
         return (
             "You are a senior software architect agent. Your job is to design a complete "
             "backend system architecture from a user's requirements.\n\n"
+            "IMPORTANT: Detect the programming language from the user's prompt. If they say "
+            "'Java', 'Spring Boot', 'Go', 'Gin', 'TypeScript', 'Express', 'Rust', 'C#', "
+            "'.NET' etc., use THAT language. If unspecified, use Python.\n\n"
             "You must produce a JSON response with this exact structure:\n"
             "{\n"
             '  "name": "project-name",\n'
             '  "description": "what this project does",\n'
             '  "architecture_style": "REST|GraphQL|gRPC",\n'
-            '  "tech_stack": {"language": "python", "framework": "fastapi", "db": "postgresql", ...},\n'
+            '  "tech_stack": {"language": "<detected-language>", "framework": "<framework>", "db": "postgresql", ...},\n'
             '  "folder_structure": ["controllers", "services", "repositories", "models", "config"],\n'
             '  "file_blueprints": [\n'
             "    {\n"
-            '      "path": "models/user.py",\n'
+            '      "path": "models/User.java",\n'
             '      "purpose": "User database model",\n'
             '      "depends_on": [],\n'
             '      "exports": ["User", "UserCreate", "UserUpdate"],\n'
-            '      "language": "python",\n'
+            '      "language": "<detected-language>",\n'
             '      "layer": "model"\n'
             "    }\n"
             "  ],\n"
             '  "architecture_doc": "# Architecture\\n..."\n'
             "}\n\n"
             "Rules:\n"
+            "- Use the correct file extensions for the chosen language (.py, .java, .go, .ts, .rs, .cs)\n"
+            "- Use the idiomatic framework and folder conventions for that language\n"
             "- Design clean layered architecture (models -> repositories -> services -> controllers)\n"
             "- Include config files (database config, app config, main entrypoint)\n"
             "- Every file must have a clear purpose and explicit dependencies\n"
-            "- Use dependency injection patterns\n"
+            "- Use dependency injection patterns idiomatic to the language\n"
             "- Follow SOLID principles\n"
             "- Include proper error handling and validation layers\n"
             "- The architecture_doc should be a comprehensive markdown document"

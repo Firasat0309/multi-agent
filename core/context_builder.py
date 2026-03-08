@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from core.language import detect_language_from_blueprint
 from core.models import (
     AgentContext,
     FileBlueprint,
@@ -89,6 +90,7 @@ class ContextBuilder:
 
     def _build_dependency_info(self, file_path: str) -> dict[str, Any]:
         """Get dependency information from the repo index."""
+        lang = detect_language_from_blueprint(self.blueprint.tech_stack)
         info: dict[str, Any] = {"upstream": [], "downstream": []}
         target = self.repo_index.get_file(file_path)
         if not target:
@@ -99,12 +101,12 @@ class ContextBuilder:
                 continue
             # Check if this file imports from our target
             for imp in f.imports:
-                module = file_path.replace("/", ".").removesuffix(".py")
+                module = lang.to_module_path(file_path)
                 if module in imp or file_path in imp:
                     info["downstream"].append(f.path)
             # Check if our target imports from this file
             for imp in target.imports:
-                module = f.path.replace("/", ".").removesuffix(".py")
+                module = lang.to_module_path(f.path)
                 if module in imp or f.path in imp:
                     info["upstream"].append(f.path)
 

@@ -13,6 +13,8 @@ from agents.architect_agent import ArchitectAgent
 from agents.planner_agent import PlannerAgent
 from config.settings import Settings
 from core.agent_manager import AgentManager
+from core.language import detect_language_from_blueprint
+from core.live_console import LiveConsole, LiveConsoleHandler
 from core.llm_client import LLMClient, LLMConfigError
 from core.models import RepositoryBlueprint
 from core.observability import record_task_completion, start_metrics_server, setup_tracing
@@ -40,24 +42,49 @@ class PipelineResult:
 class Pipeline:
     """End-to-end pipeline: prompt -> architecture -> tasks -> agents -> repository."""
 
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, interactive: bool = True) -> None:
         from config.settings import get_settings
         self.settings = settings or get_settings()
+        self.interactive = interactive
+        self._live: LiveConsole | None = None
         try:
             self.llm = LLMClient(self.settings.llm)
         except LLMConfigError as e:
             # Re-raise with full context - will be caught in run()
             raise
 
+    def _start_live(self) -> None:
+        if not self.interactive:
+            return
+        self._live = LiveConsole()
+        # Route all logging to the live console
+        handler = LiveConsoleHandler(self._live)
+        handler.setLevel(logging.INFO)
+        logging.getLogger().addHandler(handler)
+        self._live.start()
+
+    def _stop_live(self) -> None:
+        if self._live:
+            self._live.stop()
+            self._live = None
+
     async def run(self, user_prompt: str) -> PipelineResult:
         """Execute the full generation pipeline."""
         start_time = time.monotonic()
         errors: list[str] = []
 
-        logger.info("=" * 60)
+        self._start_live()
+
+        try:
+            return await self._run_inner(user_prompt, start_time, errors)
+        finally:
+            self._stop_live()
+
+    async def _run_inner(
+        self, user_prompt: str, start_time: float, errors: list[str]
+    ) -> PipelineResult:
         logger.info("Starting code generation pipeline")
         logger.info(f"Prompt: {user_prompt[:100]}...")
-        logger.info("=" * 60)
 
         # Initialize observability (non-blocking)
         try:
@@ -67,6 +94,8 @@ class Pipeline:
             logger.warning("Failed to initialize observability, continuing without it")
 
         # ── Phase 1: Architecture ─────────────────────────────────────────
+        if self._live:
+            self._live.set_phase("Architecture Design", "running")
         logger.info("[Phase 1] Designing architecture...")
         repo_manager = RepositoryManager(self.settings.workspace_dir)
         architect = ArchitectAgent(llm_client=self.llm, repo_manager=repo_manager)
@@ -74,8 +103,9 @@ class Pipeline:
         try:
             blueprint = await architect.design_architecture(user_prompt)
         except LLMConfigError as e:
-            # Configuration errors should be displayed to user, not logged as exceptions
             logger.error(str(e))
+            if self._live:
+                self._live.fail_phase("Architecture Design", str(e))
             return PipelineResult(
                 success=False,
                 workspace_path=self.settings.workspace_dir,
@@ -84,6 +114,8 @@ class Pipeline:
             )
         except Exception as e:
             logger.exception("Architecture design failed")
+            if self._live:
+                self._live.fail_phase("Architecture Design", str(e))
             return PipelineResult(
                 success=False,
                 workspace_path=self.settings.workspace_dir,
@@ -91,14 +123,28 @@ class Pipeline:
                 elapsed_seconds=time.monotonic() - start_time,
             )
 
+        # Detect language from the generated blueprint
+        lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
         logger.info(
-            f"Blueprint: {blueprint.name} with {len(blueprint.file_blueprints)} files"
+            f"Blueprint: {blueprint.name} | Language: {lang_profile.display_name} | "
+            f"{len(blueprint.file_blueprints)} files"
         )
+
+        if self._live:
+            self._live.set_blueprint(
+                name=blueprint.name,
+                language=lang_profile.display_name,
+                files=len(blueprint.file_blueprints),
+                style=blueprint.architecture_style,
+            )
+            self._live.complete_phase("Architecture Design")
 
         # Initialize workspace
         repo_manager.initialize(blueprint)
 
         # ── Phase 2: Planning ─────────────────────────────────────────────
+        if self._live:
+            self._live.set_phase("Task Planning", "running")
         logger.info("[Phase 2] Building task graph...")
         planner = PlannerAgent(llm_client=self.llm, repo_manager=repo_manager)
 
@@ -106,6 +152,8 @@ class Pipeline:
             task_graph = await planner.create_task_graph(blueprint)
         except LLMConfigError as e:
             logger.error(str(e))
+            if self._live:
+                self._live.fail_phase("Task Planning", str(e))
             return PipelineResult(
                 success=False,
                 workspace_path=self.settings.workspace_dir,
@@ -115,6 +163,8 @@ class Pipeline:
             )
         except Exception as e:
             logger.exception("Task planning failed")
+            if self._live:
+                self._live.fail_phase("Task Planning", str(e))
             return PipelineResult(
                 success=False,
                 workspace_path=self.settings.workspace_dir,
@@ -125,19 +175,30 @@ class Pipeline:
 
         logger.info(f"Task graph: {len(task_graph.tasks)} tasks")
 
+        if self._live:
+            self._live.complete_phase("Task Planning")
+            # Register all tasks in the live display
+            for task in task_graph.tasks.values():
+                self._live.update_task(task.task_id, task.description, task.status.value)
+
         # ── Phase 3: Execution ────────────────────────────────────────────
+        if self._live:
+            self._live.set_phase("Code Generation & Review", "running")
         logger.info("[Phase 3] Executing tasks...")
         agent_manager = AgentManager(
             settings=self.settings,
             llm_client=self.llm,
             repo_manager=repo_manager,
             blueprint=blueprint,
+            live_console=self._live,
         )
 
         try:
             exec_result = await agent_manager.execute_graph(task_graph)
         except Exception as e:
             logger.exception("Task execution failed")
+            if self._live:
+                self._live.fail_phase("Code Generation & Review", str(e))
             return PipelineResult(
                 success=False,
                 workspace_path=self.settings.workspace_dir,
@@ -146,7 +207,12 @@ class Pipeline:
                 elapsed_seconds=time.monotonic() - start_time,
             )
 
+        if self._live:
+            self._live.complete_phase("Code Generation & Review")
+
         # ── Phase 4: Finalize ─────────────────────────────────────────────
+        if self._live:
+            self._live.set_phase("Finalize", "running")
         logger.info("[Phase 4] Finalizing repository...")
 
         # Index all generated files into memory stores
@@ -159,12 +225,12 @@ class Pipeline:
         stats = exec_result.get("stats", {})
         success = stats.get("failed", 0) == 0 and stats.get("blocked", 0) == 0
 
-        logger.info("=" * 60)
+        if self._live:
+            self._live.complete_phase("Finalize")
+
         logger.info(f"Pipeline {'SUCCEEDED' if success else 'COMPLETED WITH ISSUES'}")
         logger.info(f"Stats: {stats}")
-        logger.info(f"Elapsed: {elapsed:.1f}s")
-        logger.info(f"Workspace: {self.settings.workspace_dir}")
-        logger.info("=" * 60)
+        logger.info(f"Elapsed: {elapsed:.1f}s | Workspace: {self.settings.workspace_dir}")
 
         return PipelineResult(
             success=success,

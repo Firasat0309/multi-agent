@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from agents.base_agent import BaseAgent
 from agents.coder_agent import CoderAgent
@@ -16,6 +16,7 @@ from agents.test_agent import TestAgent
 from agents.writer_agent import WriterAgent
 from config.settings import Settings
 from core.context_builder import ContextBuilder
+from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient
 from core.models import (
     AgentContext,
@@ -29,6 +30,9 @@ from core.models import (
 from core.repository_manager import RepositoryManager
 from core.task_engine import TaskGraph
 from tools.terminal_tools import TerminalTools
+
+if TYPE_CHECKING:
+    from core.live_console import LiveConsole
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +59,17 @@ class AgentManager:
         llm_client: LLMClient,
         repo_manager: RepositoryManager,
         blueprint: RepositoryBlueprint,
+        live_console: LiveConsole | None = None,
     ) -> None:
         self.settings = settings
         self.llm = llm_client
         self.repo = repo_manager
         self.blueprint = blueprint
-        self.terminal = TerminalTools(repo_manager.workspace)
+        self._live = live_console
+        self._lang = detect_language_from_blueprint(blueprint.tech_stack)
+        self.terminal = TerminalTools(
+            repo_manager.workspace, language=self._lang,
+        )
         self._metrics: dict[str, Any] = {
             "tasks_completed": 0,
             "tasks_failed": 0,
@@ -98,7 +107,7 @@ class AgentManager:
                 await asyncio.sleep(0.5)
                 continue
 
-            logger.info(f"Executing {len(ready_tasks)} ready tasks")
+            logger.info(f"Dispatching {len(ready_tasks)} task(s)")
 
             # Execute ready tasks concurrently (up to limit)
             async def run_task(task: Task) -> None:
@@ -125,7 +134,11 @@ class AgentManager:
     async def _execute_task(self, task: Task, task_graph: TaskGraph) -> None:
         """Execute a single task with retry logic."""
         task.status = TaskStatus.IN_PROGRESS
-        logger.info(f"Starting task {task.task_id}: {task.description}")
+        agent_name = ""
+
+        if self._live:
+            self._live.update_task(task.task_id, task.description, "in_progress")
+            self._live.log(f"[cyan]Starting:[/cyan] {task.description}")
 
         context_builder = ContextBuilder(
             workspace_dir=self.repo.workspace,
@@ -137,26 +150,40 @@ class AgentManager:
         for attempt in range(task.max_retries):
             try:
                 agent = self._create_agent(task.task_type)
-                task.assigned_agent = f"{agent.role.value}-{id(agent)}"
+                agent_name = agent.role.value
+                task.assigned_agent = f"{agent_name}-{id(agent)}"
+
+                if self._live:
+                    self._live.update_task(
+                        task.task_id, task.description, "in_progress", agent_name,
+                    )
 
                 result = await agent.execute(context)
                 task.result = result
 
                 # Track agent metrics
-                agent_key = agent.role.value
-                if agent_key not in self._metrics["agent_metrics"]:
-                    self._metrics["agent_metrics"][agent_key] = []
-                self._metrics["agent_metrics"][agent_key].append(agent.get_metrics())
+                if agent_name not in self._metrics["agent_metrics"]:
+                    self._metrics["agent_metrics"][agent_name] = []
+                self._metrics["agent_metrics"][agent_name].append(agent.get_metrics())
 
                 if result.success:
                     task_graph.mark_completed(task.task_id)
                     self._metrics["tasks_completed"] += 1
                     logger.info(f"Task {task.task_id} completed: {result.output}")
+                    if self._live:
+                        self._live.update_task(
+                            task.task_id, task.description, "completed", agent_name,
+                        )
+                        self._live.log(f"[green]Done:[/green] {task.description}")
                     return
                 else:
                     logger.warning(
                         f"Task {task.task_id} attempt {attempt + 1} failed: {result.errors}"
                     )
+                    if self._live:
+                        self._live.log(
+                            f"[yellow]Retry {attempt + 1}:[/yellow] {task.description}"
+                        )
                     task.retry_count += 1
 
             except Exception as e:
@@ -167,3 +194,6 @@ class AgentManager:
         task_graph.mark_failed(task.task_id)
         self._metrics["tasks_failed"] += 1
         logger.error(f"Task {task.task_id} failed after {task.max_retries} attempts")
+        if self._live:
+            self._live.update_task(task.task_id, task.description, "failed", agent_name)
+            self._live.log(f"[red]Failed:[/red] {task.description}")

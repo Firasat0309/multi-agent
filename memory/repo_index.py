@@ -66,7 +66,10 @@ class RepoIndexStore:
 
     def query_importers(self, module_path: str) -> list[str]:
         """Find which files import from a given module."""
-        module = module_path.replace("/", ".").removesuffix(".py")
+        # Strip known extensions and convert path separators
+        module = module_path.replace("/", ".")
+        for ext in (".py", ".java", ".go", ".ts", ".rs", ".cs"):
+            module = module.removesuffix(ext)
         return [
             f.path for f in self._index.files
             if any(module in imp for imp in f.imports)

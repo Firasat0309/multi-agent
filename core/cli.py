@@ -116,8 +116,8 @@ def status(workspace: str) -> None:
         exists = (ws / name).exists()
         table.add_row(name, "Yes" if exists else "[red]No[/red]")
 
-    src_files = list((ws / "src").rglob("*.py")) if (ws / "src").exists() else []
-    test_files = list((ws / "tests").rglob("*.py")) if (ws / "tests").exists() else []
+    src_files = list(p for p in (ws / "src").rglob("*") if p.is_file() and p.suffix in {".py", ".java", ".go", ".ts", ".rs", ".cs"}) if (ws / "src").exists() else []
+    test_files = list(p for p in (ws / "tests").rglob("*") if p.is_file() and p.suffix in {".py", ".java", ".go", ".ts", ".rs", ".cs"}) if (ws / "tests").exists() else []
     deploy_files = list((ws / "deploy").rglob("*")) if (ws / "deploy").exists() else []
 
     table.add_row("Source files", str(len(src_files)))

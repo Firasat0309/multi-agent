@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from agents.base_agent import BaseAgent
+from core.language import get_language_profile, LanguageProfile
 from core.models import AgentContext, AgentRole, TaskResult
 
 logger = logging.getLogger(__name__)
@@ -14,23 +15,26 @@ logger = logging.getLogger(__name__)
 class CoderAgent(BaseAgent):
     role = AgentRole.CODER
 
-    @property
-    def system_prompt(self) -> str:
+    def _get_system_prompt(self, language: str) -> str:
+        profile = get_language_profile(language)
         return (
-            "You are an expert Python developer agent. You generate production-quality code.\n\n"
+            f"You are an expert {profile.display_name} developer agent. "
+            f"You generate production-quality {profile.display_name} code.\n\n"
             "Rules:\n"
-            "- Generate ONLY the Python file content, no markdown fences or explanations\n"
+            f"- Generate ONLY the {profile.display_name} file content, no markdown fences or explanations\n"
             "- Follow the file blueprint exactly (purpose, exports, dependencies)\n"
             "- Import from the correct modules as specified in the dependency graph\n"
-            "- Use type hints throughout\n"
-            "- Use async/await where appropriate (FastAPI endpoints, DB operations)\n"
+            f"- Follow idiomatic {profile.display_name} conventions and best practices\n"
+            "- Use proper type annotations/generics\n"
             "- Include proper error handling\n"
-            "- Follow PEP 8 and clean code principles\n"
-            "- Use Pydantic for data validation\n"
             "- Use dependency injection patterns\n"
             "- Do NOT add placeholder or TODO comments - write complete implementations\n"
             "- Do NOT import modules that aren't in the dependency graph"
         )
+
+    @property
+    def system_prompt(self) -> str:
+        return self._get_system_prompt("python")
 
     async def execute(self, context: AgentContext) -> TaskResult:
         """Generate code for the assigned file."""
@@ -41,37 +45,39 @@ class CoderAgent(BaseAgent):
             )
 
         fb = context.file_blueprint
-        logger.info(f"Generating code for {fb.path}")
+        lang = fb.language or "python"
+        profile = get_language_profile(lang)
+        logger.info(f"Generating {profile.display_name} code for {fb.path}")
 
         formatted_context = self._format_context(context)
 
         prompt = (
             f"{formatted_context}\n\n"
-            f"Generate the complete Python file for: {fb.path}\n"
+            f"Generate the complete {profile.display_name} file for: {fb.path}\n"
             f"Purpose: {fb.purpose}\n"
             f"This file must export: {', '.join(fb.exports) if fb.exports else 'appropriate classes/functions'}\n"
             f"Layer: {fb.layer}\n\n"
-            "Generate the complete, working Python code. Output only the code, nothing else."
+            f"Generate the complete, working {profile.display_name} code. Output only the code, nothing else."
         )
 
-        code = await self._call_llm(prompt)
-        code = self._clean_code(code)
+        code = await self._call_llm(prompt, system_override=self._get_system_prompt(lang))
+        code = self._clean_code(code, profile)
 
-        # Write the file
         self.repo.write_file(fb.path, code)
 
         return TaskResult(
             success=True,
-            output=f"Generated {fb.path} ({len(code)} bytes)",
+            output=f"Generated {fb.path} ({len(code)} bytes, {profile.display_name})",
             files_modified=[fb.path],
             metrics=self.get_metrics(),
         )
 
-    def _clean_code(self, code: str) -> str:
+    def _clean_code(self, code: str, profile: LanguageProfile) -> str:
         """Strip markdown fences and leading/trailing whitespace."""
         code = code.strip()
-        if code.startswith("```python"):
-            code = code[len("```python"):]
+        fence = f"```{profile.code_fence_name}"
+        if code.startswith(fence):
+            code = code[len(fence):]
         elif code.startswith("```"):
             code = code[3:]
         if code.endswith("```"):

@@ -89,7 +89,14 @@ class WriterAgent(BaseAgent):
         if controller_files:
             controllers_section = "\n\nController files:\n"
             for path, content in controller_files.items():
-                controllers_section += f"\n### {path}\n```python\n{content[:3000]}\n```\n"
+                # Detect fence language from file extension
+            fence = "python"
+            for ext, name in {".java": "java", ".go": "go", ".ts": "typescript",
+                              ".rs": "rust", ".cs": "csharp"}.items():
+                if path.endswith(ext):
+                    fence = name
+                    break
+            controllers_section += f"\n### {path}\n```{fence}\n{content[:3000]}\n```\n"
 
         prompt = (
             f"Project: {blueprint.name}\n"

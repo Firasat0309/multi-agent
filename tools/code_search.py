@@ -28,7 +28,7 @@ class CodeSearch:
     def search(
         self,
         query: str,
-        file_pattern: str = "**/*.py",
+        file_pattern: str = "**/*",
         max_results: int = 50,
         context_lines: int = 2,
     ) -> list[SearchResult]:
@@ -63,8 +63,11 @@ class CodeSearch:
         return results
 
     def find_definition(self, symbol: str) -> list[SearchResult]:
-        """Find class or function definitions."""
-        return self.search(rf"(class|def)\s+{re.escape(symbol)}\b")
+        """Find class, function, type, or struct definitions across languages."""
+        # Covers Python (class/def), Java/C# (class/interface/enum),
+        # Go (func/type), TypeScript (class/function/const), Rust (fn/struct/enum)
+        pattern = rf"(?:class|def|func|function|type|struct|enum|interface|const|let|pub\s+fn)\s+{re.escape(symbol)}\b"
+        return self.search(pattern)
 
     def find_usages(self, symbol: str) -> list[SearchResult]:
         """Find all usages of a symbol."""

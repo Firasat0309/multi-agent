@@ -33,7 +33,7 @@ class LLMConfig:
 @dataclass(frozen=True)
 class SandboxConfig:
     sandbox_type: SandboxType = SandboxType.DOCKER
-    image: str = "python:3.11-slim"
+    image: str = ""  # Auto-detected from language profile if empty
     memory_limit: str = "512m"
     cpu_limit: float = 1.0
     timeout_seconds: int = 300
