@@ -80,3 +80,61 @@ class DependencyGraphStore:
 
     def get_graph(self) -> nx.DiGraph:
         return self._graph
+
+    # ── Impact analysis for modification workflows ───────────────────
+
+    def get_impact_analysis(self, file_path: str) -> dict[str, list[str]]:
+        """Analyze the impact of modifying a file.
+
+        Returns a dict with:
+        - direct_dependents: files that directly import from this file
+        - transitive_dependents: all files transitively affected
+        - direct_dependencies: files this file directly imports
+        - test_files: test files that may need updating (heuristic)
+        """
+        result: dict[str, list[str]] = {
+            "direct_dependents": self.get_dependents(file_path),
+            "transitive_dependents": [],
+            "direct_dependencies": self.get_dependencies(file_path),
+            "test_files": [],
+        }
+
+        # Transitive dependents — all files that transitively import from this file
+        if file_path in self._graph:
+            result["transitive_dependents"] = sorted(
+                nx.ancestors(self._graph, file_path) - {file_path}
+            )
+
+        # Heuristic: find test files (files with "test" in the name that are
+        # direct or transitive dependents, or that share a module name)
+        target_stem = Path(file_path).stem
+        all_affected = set(result["direct_dependents"]) | set(result["transitive_dependents"])
+        for node in self._graph.nodes():
+            node_lower = node.lower()
+            if "test" in node_lower and (
+                node in all_affected
+                or target_stem in node_lower
+            ):
+                result["test_files"].append(node)
+
+        return result
+
+    def get_modification_order(self, files: list[str]) -> list[str]:
+        """Given a set of files to modify, return them in safe modification order.
+
+        Files with no dependencies on other files in the set come first.
+        This ensures that when a file is modified, all files it depends on
+        have already been modified.
+        """
+        # Build a subgraph of only the files we're modifying
+        subgraph = self._graph.subgraph(
+            [f for f in files if f in self._graph]
+        )
+        try:
+            ordered = list(nx.topological_sort(subgraph))
+            # Add files not in the graph at the end
+            remaining = [f for f in files if f not in self._graph]
+            return ordered + remaining
+        except nx.NetworkXUnfeasible:
+            logger.warning("Cycle detected among modification targets — returning original order")
+            return files

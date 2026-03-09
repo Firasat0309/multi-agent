@@ -443,3 +443,73 @@ class RepositoryManager:
         for fb in blueprint.file_blueprints:
             graph[fb.path] = fb.depends_on
         return graph
+
+    # ── Existing-repo scanning ───────────────────────────────────────
+
+    def scan_existing_repo(self) -> RepositoryIndex:
+        """Scan an existing workspace and build the repo index from actual files.
+
+        Unlike ``initialize()`` which creates a workspace from a blueprint,
+        this reads whatever is already on disk — for modification workflows
+        where the repo already exists.
+        """
+        logger.info("Scanning existing repository at %s", self.workspace)
+
+        # Auto-detect language from file extensions in the workspace
+        ext_counts: dict[str, int] = {}
+        skip_dirs = {
+            ".git", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+            "target", "build", "dist", ".idea", ".vscode", ".gradle",
+            ".mypy_cache", ".pytest_cache",
+        }
+        for f in self.workspace.rglob("*"):
+            if f.is_file() and not any(p in skip_dirs for p in f.parts):
+                ext_counts[f.suffix.lower()] = ext_counts.get(f.suffix.lower(), 0) + 1
+
+        from core.language import detect_language_from_extensions
+        self._lang_profile = detect_language_from_extensions(ext_counts)
+        logger.info("Detected language: %s", self._lang_profile.display_name)
+
+        # Index all source files
+        file_count = 0
+        for ext in self._lang_profile.file_extensions:
+            for src_file in self.workspace.rglob(f"*{ext}"):
+                if not src_file.is_file():
+                    continue
+                if any(p in skip_dirs for p in src_file.parts):
+                    continue
+                try:
+                    content = src_file.read_text(encoding="utf-8")
+                    rel_path = str(src_file.relative_to(self.workspace)).replace("\\", "/")
+                    self._index_file(rel_path, content)
+                    file_count += 1
+                except Exception as e:
+                    logger.warning("Failed to index %s: %s", src_file, e)
+
+        logger.info("Indexed %d files into repo index", file_count)
+        return self._repo_index
+
+    def read_all_source_files(self) -> dict[str, str]:
+        """Read all source files in the workspace into a dict of path → content.
+
+        Useful for the repository analyzer agent which needs file contents
+        to produce module summaries.
+        """
+        skip_dirs = {
+            ".git", "node_modules", "__pycache__", ".venv", "venv",
+            "target", "build", "dist", ".idea", ".vscode",
+        }
+        result: dict[str, str] = {}
+        for ext in self._lang_profile.file_extensions:
+            for src_file in self.workspace.rglob(f"*{ext}"):
+                if not src_file.is_file():
+                    continue
+                if any(p in skip_dirs for p in src_file.parts):
+                    continue
+                try:
+                    content = src_file.read_text(encoding="utf-8")
+                    rel_path = str(src_file.relative_to(self.workspace)).replace("\\", "/")
+                    result[rel_path] = content
+                except Exception:
+                    pass
+        return result

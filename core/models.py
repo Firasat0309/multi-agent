@@ -44,6 +44,10 @@ class TaskType(str, Enum):
     GENERATE_DEPLOY = "generate_deploy"
     GENERATE_DOCS = "generate_docs"
     FIX_CODE = "fix_code"
+    # ── Modification workflow task types ──
+    ANALYZE_REPO = "analyze_repo"
+    PLAN_CHANGES = "plan_changes"
+    MODIFY_FILE = "modify_file"
 
 
 class TaskStatus(str, Enum):
@@ -91,6 +95,8 @@ class AgentRole(str, Enum):
     SECURITY = "security"
     DEPLOYER = "deployer"
     WRITER = "writer"
+    REPO_ANALYZER = "repo_analyzer"
+    CHANGE_PLANNER = "change_planner"
 
 
 @dataclass
@@ -141,6 +147,66 @@ class RepositoryIndex:
         else:
             self._path_index[file_index.path] = len(self.files)
             self.files.append(file_index)
+
+
+# ── Review Models ─────────────────────────────────────────────────────────────
+
+
+# ── Modification Workflow Models ──────────────────────────────────────────────
+
+
+@dataclass
+class ModuleInfo:
+    """Summary of a module/file discovered during repository analysis."""
+    name: str
+    file: str
+    classes: list[str] = field(default_factory=list)
+    functions: list[str] = field(default_factory=list)
+    imports: list[str] = field(default_factory=list)
+    layer: str = ""  # controller, service, repository, model, etc.
+
+
+@dataclass
+class RepoAnalysis:
+    """Complete analysis of an existing repository."""
+    modules: list[ModuleInfo] = field(default_factory=list)
+    tech_stack: dict[str, str] = field(default_factory=dict)
+    architecture_style: str = ""
+    entry_points: list[str] = field(default_factory=list)
+    summary: str = ""
+
+
+class ChangeActionType(str, Enum):
+    ADD_FUNCTION = "add_function"
+    ADD_METHOD = "add_method"
+    ADD_ENDPOINT = "add_endpoint"
+    ADD_CLASS = "add_class"
+    ADD_IMPORT = "add_import"
+    MODIFY_FUNCTION = "modify_function"
+    ADD_FIELD = "add_field"
+    CREATE_FILE = "create_file"
+
+
+@dataclass
+class ChangeAction:
+    """A single planned change to the repository."""
+    type: ChangeActionType
+    file: str
+    description: str
+    function: str = ""  # target function/method name
+    class_name: str = ""  # target class (for method additions)
+    depends_on: list[str] = field(default_factory=list)  # file paths this change depends on
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ChangePlan:
+    """Complete plan for modifying an existing repository."""
+    summary: str
+    changes: list[ChangeAction] = field(default_factory=list)
+    new_files: list[FileBlueprint] = field(default_factory=list)
+    affected_tests: list[str] = field(default_factory=list)
+    risk_notes: list[str] = field(default_factory=list)
 
 
 # ── Review Models ─────────────────────────────────────────────────────────────

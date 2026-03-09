@@ -18,7 +18,7 @@ from typing import Any, Iterator
 
 import networkx as nx
 
-from core.models import Task, TaskStatus, TaskType, RepositoryBlueprint, FileBlueprint
+from core.models import Task, TaskStatus, TaskType, RepositoryBlueprint, FileBlueprint, ChangePlan, ChangeAction
 from core.state_machine import LifecycleEngine
 
 logger = logging.getLogger(__name__)
@@ -422,3 +422,140 @@ class LifecyclePlanBuilder:
             len(file_paths), len(global_graph.tasks),
         )
         return engine, global_graph
+
+
+class ModificationTaskGraphBuilder:
+    """Builds a task DAG for modifying an existing repository.
+
+    The modification flow is:
+      1. MODIFY_FILE tasks for each change in the plan (respecting dependencies)
+      2. GENERATE_FILE tasks for brand-new files in the plan
+      3. REVIEW_FILE for each modified/new file
+      4. FIX_CODE for each review
+      5. GENERATE_TEST for affected test files
+      6. REVIEW_MODULE for cross-file consistency
+    """
+
+    def __init__(self) -> None:
+        self._next_id = 1
+
+    def _alloc_id(self) -> int:
+        tid = self._next_id
+        self._next_id += 1
+        return tid
+
+    def build_from_change_plan(
+        self,
+        change_plan: ChangePlan,
+        blueprint: RepositoryBlueprint,
+    ) -> TaskGraph:
+        """Build a task graph from a ChangePlan.
+
+        Each ChangeAction becomes a MODIFY_FILE task; each new_file becomes
+        a GENERATE_FILE task.  Reviews and tests follow.
+        """
+        graph = TaskGraph()
+        file_task_map: dict[str, int] = {}  # file_path → last task_id for that file
+
+        # ── Phase 1: Modification tasks (ordered by depends_on) ───────
+        for change in change_plan.changes:
+            deps = [
+                file_task_map[d]
+                for d in change.depends_on
+                if d in file_task_map
+            ]
+            task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.MODIFY_FILE,
+                file=change.file,
+                description=f"Modify {change.file}: {change.description}",
+                dependencies=deps,
+                metadata={
+                    "change_type": change.type.value,
+                    "change_description": change.description,
+                    "target_function": change.function,
+                    "target_class": change.class_name,
+                },
+            )
+            graph.add_task(task)
+            file_task_map[change.file] = task.task_id
+
+        # ── Phase 1b: Generate brand-new files ────────────────────────
+        for nf in change_plan.new_files:
+            deps = [
+                file_task_map[d]
+                for d in nf.depends_on
+                if d in file_task_map
+            ]
+            task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.GENERATE_FILE,
+                file=nf.path,
+                description=f"Create new file {nf.path}: {nf.purpose}",
+                dependencies=deps,
+            )
+            graph.add_task(task)
+            file_task_map[nf.path] = task.task_id
+
+        # ── Phase 2: Review each modified/new file ────────────────────
+        review_task_map: dict[str, int] = {}
+        for file_path, gen_task_id in file_task_map.items():
+            task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.REVIEW_FILE,
+                file=file_path,
+                description=f"Review changes in {file_path}",
+                dependencies=[gen_task_id],
+            )
+            graph.add_task(task)
+            review_task_map[file_path] = task.task_id
+
+        # ── Phase 2.5: Fix based on review ────────────────────────────
+        fix_task_ids: list[int] = []
+        for file_path, review_id in review_task_map.items():
+            fix_task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.FIX_CODE,
+                file=file_path,
+                description=f"Fix {file_path} based on review",
+                dependencies=[review_id],
+                metadata={"review_task_id": review_id},
+            )
+            graph.add_task(fix_task)
+            fix_task_ids.append(fix_task.task_id)
+
+        # ── Phase 3: Tests for affected files ─────────────────────────
+        test_targets = set(change_plan.affected_tests) | set(file_task_map.keys())
+        for file_path in test_targets:
+            task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.GENERATE_TEST,
+                file=file_path,
+                description=f"Generate/update tests for {file_path}",
+                dependencies=fix_task_ids,
+            )
+            graph.add_task(task)
+
+        # ── Phase 4: Module-level review ──────────────────────────────
+        mod_review = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.REVIEW_MODULE,
+            file="*",
+            description="Module consistency review of modifications",
+            dependencies=fix_task_ids,
+        )
+        graph.add_task(mod_review)
+
+        errors = graph.validate()
+        if errors:
+            raise ValueError(f"Modification task graph validation failed: {errors}")
+
+        logger.info(
+            "Built modification task graph: %d tasks (%d modify, %d new, %d review, %d test)",
+            len(graph.tasks),
+            sum(1 for c in change_plan.changes),
+            len(change_plan.new_files),
+            len(review_task_map),
+            len(test_targets),
+        )
+        return graph

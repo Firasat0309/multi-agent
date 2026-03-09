@@ -231,3 +231,23 @@ def detect_language_from_blueprint(tech_stack: dict[str, str]) -> LanguageProfil
         return get_language_profile(framework)
 
     return PYTHON
+
+
+def detect_language_from_extensions(ext_counts: dict[str, int]) -> LanguageProfile:
+    """Detect the primary language from a map of file-extension counts.
+
+    Picks the language whose extensions have the highest total file count.
+    Falls back to Python when no recognisable extensions are found.
+    """
+    # Map each profile's extensions to accumulated counts
+    lang_scores: dict[str, int] = {}
+    for profile in (PYTHON, JAVA, GO, TYPESCRIPT, RUST, CSHARP):
+        score = sum(ext_counts.get(ext, 0) for ext in profile.file_extensions)
+        if score > 0:
+            lang_scores[profile.name] = score
+
+    if not lang_scores:
+        return PYTHON
+
+    best = max(lang_scores, key=lambda k: lang_scores[k])
+    return LANGUAGE_PROFILES[best]

@@ -15,6 +15,7 @@ from core.models import (
     RepositoryIndex,
     Task,
     TaskType,
+    ChangePlan,
 )
 
 logger = logging.getLogger(__name__)
@@ -186,3 +187,138 @@ class ContextBuilder:
                     info["upstream"].append(f.path)
 
         return info
+
+    # ── Modification-aware context building ───────────────────────────
+
+    def build_modification_context(
+        self,
+        task: Task,
+        change_plan: ChangePlan | None = None,
+    ) -> AgentContext:
+        """Build context specifically for file modification tasks.
+
+        Unlike ``build()``, this includes:
+        - The FULL content of the target file (not truncated)
+        - Related files that will be affected by the change
+        - Dependency info so the agent knows what depends on the target
+        - The change plan summary in architecture_summary for reference
+        """
+        file_bp = self._find_blueprint(task.file)
+        related = self._collect_modification_context(task, change_plan)
+        dep_info = self._build_dependency_info(task.file)
+
+        # Include the change plan summary so the agent understands the bigger picture
+        arch_summary = self.blueprint.architecture_doc
+        if change_plan:
+            arch_summary = (
+                f"MODIFICATION CONTEXT\n"
+                f"Change plan: {change_plan.summary}\n"
+                f"Total changes: {len(change_plan.changes)}\n"
+                f"Risk notes: {'; '.join(change_plan.risk_notes)}\n\n"
+                f"{arch_summary}"
+            )
+
+        return AgentContext(
+            task=task,
+            blueprint=self.blueprint,
+            file_blueprint=file_bp,
+            related_files=related,
+            architecture_summary=arch_summary,
+            dependency_info=dep_info,
+        )
+
+    def _collect_modification_context(
+        self,
+        task: Task,
+        change_plan: ChangePlan | None,
+    ) -> dict[str, str]:
+        """Collect context files for a modification task.
+
+        Prioritizes:
+        1. The target file (full content, not truncated)
+        2. Files the target depends on (AST stubs where possible)
+        3. Files that depend on the target (they may need updates)
+        4. Other files being changed in the same plan
+        """
+        related: dict[str, str] = {}
+        total_chars = 0
+        lang = detect_language_from_blueprint(self.blueprint.tech_stack)
+
+        # 1. Target file — always in full, never truncated
+        target_content = self._read_file(task.file)
+        if target_content is not None:
+            related[task.file] = target_content
+            total_chars += len(target_content)
+
+        # 2. Upstream dependencies (files the target imports from)
+        dep_info = self._build_dependency_info(task.file)
+        for up_path in dep_info.get("upstream", []):
+            if total_chars >= _MAX_CONTEXT_CHARS:
+                break
+            if up_path in related:
+                continue
+            content = self._read_file(up_path)
+            if content is None:
+                continue
+            # Use AST stub for dependencies
+            file_index = self.repo_index.get_file(up_path)
+            checksum = file_index.checksum if file_index else ""
+            stub = _ast_extractor.extract_stub(up_path, content, lang.name, checksum=checksum)
+            if stub is not None:
+                related[up_path] = f"// AST stub (signatures only)\n{stub}"
+                total_chars += len(stub)
+            else:
+                truncated = content[:6_000]
+                if len(content) > 6_000:
+                    truncated += "\n# ... (truncated)"
+                related[up_path] = truncated
+                total_chars += len(truncated)
+
+        # 3. Downstream dependents (files that import from the target)
+        for down_path in dep_info.get("downstream", [])[:5]:
+            if total_chars >= _MAX_CONTEXT_CHARS:
+                break
+            if down_path in related:
+                continue
+            content = self._read_file(down_path)
+            if content is None:
+                continue
+            file_index = self.repo_index.get_file(down_path)
+            checksum = file_index.checksum if file_index else ""
+            stub = _ast_extractor.extract_stub(down_path, content, lang.name, checksum=checksum)
+            if stub is not None:
+                related[down_path] = f"// AST stub (dependents)\n{stub}"
+                total_chars += len(stub)
+            else:
+                truncated = content[:4_000]
+                if len(content) > 4_000:
+                    truncated += "\n# ... (truncated)"
+                related[down_path] = truncated
+                total_chars += len(truncated)
+
+        # 4. Other files in the change plan (so the agent sees the full picture)
+        if change_plan:
+            for change in change_plan.changes:
+                if change.file == task.file or change.file in related:
+                    continue
+                if total_chars >= _MAX_CONTEXT_CHARS:
+                    break
+                content = self._read_file(change.file)
+                if content is None:
+                    continue
+                file_index = self.repo_index.get_file(change.file)
+                checksum = file_index.checksum if file_index else ""
+                stub = _ast_extractor.extract_stub(
+                    change.file, content, lang.name, checksum=checksum,
+                )
+                if stub is not None:
+                    related[change.file] = f"// AST stub (related change)\n{stub}"
+                    total_chars += len(stub)
+                else:
+                    truncated = content[:4_000]
+                    if len(content) > 4_000:
+                        truncated += "\n# ... (truncated)"
+                    related[change.file] = truncated
+                    total_chars += len(truncated)
+
+        return related

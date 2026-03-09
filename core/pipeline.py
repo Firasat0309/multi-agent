@@ -11,16 +11,18 @@ from typing import Any
 
 from agents.architect_agent import ArchitectAgent
 from agents.planner_agent import PlannerAgent
+from agents.repository_analyzer_agent import RepositoryAnalyzerAgent
+from agents.change_planner_agent import ChangePlannerAgent
 from config.settings import Settings
 from core.agent_manager import AgentManager
 from core.language import detect_language_from_blueprint
 from core.live_console import LiveConsole, LiveConsoleHandler
 from core.llm_client import LLMClient, LLMConfigError
-from core.models import RepositoryBlueprint
+from core.models import RepositoryBlueprint, ChangePlan, RepoAnalysis
 from core.observability import record_task_completion, start_metrics_server, setup_tracing
 from core.repository_manager import RepositoryManager
 from core.state_machine import LifecycleEngine
-from core.task_engine import TaskGraph
+from core.task_engine import TaskGraph, ModificationTaskGraphBuilder
 from memory.dependency_graph import DependencyGraphStore
 from memory.embedding_store import EmbeddingStore
 from memory.repo_index import RepoIndexStore
@@ -34,6 +36,8 @@ class PipelineResult:
     success: bool
     workspace_path: Path
     blueprint: RepositoryBlueprint | None = None
+    change_plan: ChangePlan | None = None
+    repo_analysis: RepoAnalysis | None = None
     task_stats: dict[str, int] = field(default_factory=dict)
     metrics: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
@@ -448,3 +452,346 @@ class Pipeline:
 
         dep_store.save()
         index_store.save()
+
+    # ── Modification pipeline ─────────────────────────────────────────
+
+    async def enhance(self, user_prompt: str) -> PipelineResult:
+        """Modify an existing repository based on a user request.
+
+        Unlike ``run()`` which creates a new project from scratch, this
+        method follows the modification workflow:
+
+        1. Repository Analysis — scan existing files, build index & deps
+        2. Change Planning — LLM plans targeted modifications
+        3. Task DAG — build modification task graph from the plan
+        4. Execution — agents perform targeted edits, reviews, tests
+        5. Finalization — re-index and report
+        """
+        start_time = time.monotonic()
+        errors: list[str] = []
+        self._file_handler: logging.FileHandler | None = None
+
+        self._start_live()
+
+        try:
+            return await self._enhance_inner(user_prompt, start_time, errors)
+        finally:
+            self._stop_live()
+            if self._file_handler:
+                self._stop_file_logging(self._file_handler)
+                self._file_handler = None
+
+    async def _enhance_inner(
+        self, user_prompt: str, start_time: float, errors: list[str],
+    ) -> PipelineResult:
+        file_handler = self._start_file_logging(self.settings.workspace_dir)
+        self._file_handler = file_handler
+        logger.info("Starting repository modification pipeline")
+        logger.info(f"Prompt: {user_prompt[:100]}...")
+
+        repo_manager = RepositoryManager(self.settings.workspace_dir)
+
+        # ── Phase 1: Repository Analysis ──────────────────────────────
+        if self._live:
+            self._live.set_phase("Repository Analysis", "running")
+        logger.info("[Phase 1] Analyzing existing repository...")
+
+        analyzer = RepositoryAnalyzerAgent(
+            llm_client=self.llm, repo_manager=repo_manager,
+        )
+
+        try:
+            repo_analysis = await analyzer.analyze_repository(self.settings.workspace_dir)
+        except Exception as e:
+            logger.exception("Repository analysis failed")
+            if self._live:
+                self._live.fail_phase("Repository Analysis", str(e))
+            return PipelineResult(
+                success=False,
+                workspace_path=self.settings.workspace_dir,
+                errors=[f"Repository analysis failed: {e}"],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+
+        lang_profile = detect_language_from_blueprint(repo_analysis.tech_stack)
+        logger.info(
+            "Analysis: %d modules | Language: %s | Arch: %s",
+            len(repo_analysis.modules), lang_profile.display_name,
+            repo_analysis.architecture_style,
+        )
+
+        if self._live:
+            self._live.set_blueprint(
+                name=f"(modify) {self.settings.workspace_dir.name}",
+                language=lang_profile.display_name,
+                files=len(repo_analysis.modules),
+                style=repo_analysis.architecture_style,
+            )
+            self._live.complete_phase("Repository Analysis")
+
+        # Scan existing files into the repo index
+        repo_manager.scan_existing_repo()
+
+        # Build a minimal blueprint from the analysis (for context builder compat)
+        from core.models import FileBlueprint
+        blueprint = RepositoryBlueprint(
+            name=self.settings.workspace_dir.name,
+            description=repo_analysis.summary,
+            architecture_style=repo_analysis.architecture_style,
+            tech_stack=repo_analysis.tech_stack,
+            file_blueprints=[
+                FileBlueprint(
+                    path=m.file,
+                    purpose=f"Module: {m.name}",
+                    exports=m.functions + m.classes,
+                    language=repo_analysis.tech_stack.get("language", "python"),
+                    layer=m.layer,
+                )
+                for m in repo_analysis.modules
+            ],
+        )
+
+        # ── Phase 2: Change Planning ─────────────────────────────────
+        if self._live:
+            self._live.set_phase("Change Planning", "running")
+        logger.info("[Phase 2] Planning targeted changes...")
+
+        planner = ChangePlannerAgent(
+            llm_client=self.llm, repo_manager=repo_manager,
+        )
+
+        # Provide key file contents to the planner for precision
+        file_contents = repo_manager.read_all_source_files()
+
+        try:
+            change_plan = await planner.plan_changes(
+                user_request=user_prompt,
+                repo_analysis=repo_analysis,
+                file_contents=file_contents,
+            )
+        except Exception as e:
+            logger.exception("Change planning failed")
+            if self._live:
+                self._live.fail_phase("Change Planning", str(e))
+            return PipelineResult(
+                success=False,
+                workspace_path=self.settings.workspace_dir,
+                repo_analysis=repo_analysis,
+                errors=[f"Change planning failed: {e}"],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+
+        logger.info(
+            "Change plan: %s | %d modifications, %d new files",
+            change_plan.summary, len(change_plan.changes), len(change_plan.new_files),
+        )
+        for c in change_plan.changes:
+            logger.info("  → %s %s: %s", c.type.value, c.file, c.description)
+        for nf in change_plan.new_files:
+            logger.info("  + NEW %s: %s", nf.path, nf.purpose)
+
+        if self._live:
+            self._live.complete_phase("Change Planning")
+
+        # ── Phase 3: Build modification task DAG ──────────────────────
+        if self._live:
+            self._live.set_phase("Task Planning", "running")
+        logger.info("[Phase 3] Building modification task graph...")
+
+        mod_builder = ModificationTaskGraphBuilder()
+        task_graph = mod_builder.build_from_change_plan(change_plan, blueprint)
+
+        logger.info("Modification task graph: %d tasks", len(task_graph.tasks))
+
+        if self._live:
+            self._live.complete_phase("Task Planning")
+            for task in task_graph.tasks.values():
+                self._live.update_task(task.task_id, task.description, task.status.value)
+
+        # ── Phase 4: Execute modifications ────────────────────────────
+        if self._live:
+            self._live.set_phase("Code Modification & Review", "running")
+        logger.info("[Phase 4] Executing targeted modifications...")
+
+        # No sandbox needed for modification — edits are targeted, not full builds
+        # (Sandboxes are still used for test execution if Docker is available)
+        from config.settings import SandboxTier, SandboxType
+        sandbox_manager = None
+        build_sandbox_id = None
+        test_sandbox_id = None
+
+        if self.settings.sandbox.sandbox_type == SandboxType.DOCKER:
+            try:
+                sandbox_manager = SandboxManager(self.settings.sandbox)
+                build_info = await sandbox_manager.create_sandbox(
+                    self.settings.workspace_dir,
+                    language_name=lang_profile.name,
+                    tier=SandboxTier.BUILD,
+                )
+                build_sandbox_id = build_info.sandbox_id
+                test_info = await sandbox_manager.create_sandbox(
+                    self.settings.workspace_dir,
+                    language_name=lang_profile.name,
+                    tier=SandboxTier.TEST,
+                )
+                test_sandbox_id = test_info.sandbox_id
+            except Exception as e:
+                if self.settings.allow_host_execution:
+                    logger.warning("Docker sandbox unavailable (%s), using host execution", e)
+                    sandbox_manager = None
+                else:
+                    msg = f"Docker sandbox unavailable: {e}. Pass --allow-host-execution to run without isolation."
+                    logger.error(msg)
+                    if self._live:
+                        self._live.fail_phase("Code Modification & Review", msg)
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=self.settings.workspace_dir,
+                        change_plan=change_plan,
+                        repo_analysis=repo_analysis,
+                        errors=[msg],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+
+        agent_manager = AgentManager(
+            settings=self.settings,
+            llm_client=self.llm,
+            repo_manager=repo_manager,
+            blueprint=blueprint,
+            live_console=self._live,
+            sandbox_manager=sandbox_manager,
+            build_sandbox_id=build_sandbox_id,
+            test_sandbox_id=test_sandbox_id,
+        )
+
+        try:
+            exec_result = await agent_manager.execute_graph(task_graph)
+        except Exception as e:
+            logger.exception("Modification execution failed")
+            if self._live:
+                self._live.fail_phase("Code Modification & Review", str(e))
+            return PipelineResult(
+                success=False,
+                workspace_path=self.settings.workspace_dir,
+                blueprint=blueprint,
+                change_plan=change_plan,
+                repo_analysis=repo_analysis,
+                errors=[f"Modification execution failed: {e}"],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+        finally:
+            if sandbox_manager:
+                try:
+                    await sandbox_manager.destroy_all()
+                except Exception:
+                    logger.warning("Sandbox teardown failed (non-critical)")
+
+        if self._live:
+            self._live.complete_phase("Code Modification & Review")
+
+        # ── Phase 5: Finalize ─────────────────────────────────────────
+        if self._live:
+            self._live.set_phase("Finalize", "running")
+        logger.info("[Phase 5] Finalizing modifications...")
+
+        try:
+            self._index_workspace(repo_manager)
+        except Exception as e:
+            logger.warning(f"Re-indexing failed (non-critical): {e}")
+
+        elapsed = time.monotonic() - start_time
+        stats = exec_result.get("stats", {})
+        success = stats.get("failed", 0) == 0 and stats.get("blocked", 0) == 0
+
+        if self._live:
+            self._live.complete_phase("Finalize")
+
+        logger.info(f"Modification pipeline {'SUCCEEDED' if success else 'COMPLETED WITH ISSUES'}")
+        logger.info(f"Stats: {stats}")
+        logger.info(f"Elapsed: {elapsed:.1f}s | Workspace: {self.settings.workspace_dir}")
+
+        # Write modification report
+        self._write_modify_report(
+            workspace=self.settings.workspace_dir,
+            prompt=user_prompt,
+            change_plan=change_plan,
+            task_graph=task_graph,
+            stats=stats,
+            elapsed=elapsed,
+            success=success,
+        )
+
+        self._stop_file_logging(file_handler)
+        self._file_handler = None
+
+        return PipelineResult(
+            success=success,
+            workspace_path=self.settings.workspace_dir,
+            blueprint=blueprint,
+            change_plan=change_plan,
+            repo_analysis=repo_analysis,
+            task_stats=stats,
+            metrics=exec_result.get("metrics", {}),
+            errors=errors,
+            elapsed_seconds=elapsed,
+        )
+
+    def _write_modify_report(
+        self,
+        workspace: Path,
+        prompt: str,
+        change_plan: ChangePlan,
+        task_graph: TaskGraph,
+        stats: dict[str, int],
+        elapsed: float,
+        success: bool,
+    ) -> None:
+        """Write a structured JSON report for a modification run."""
+        import json
+        from datetime import datetime, timezone
+
+        task_entries = []
+        for task in task_graph.tasks.values():
+            entry: dict[str, Any] = {
+                "id": task.task_id,
+                "type": task.task_type.value,
+                "file": task.file,
+                "description": task.description,
+                "status": task.status.value,
+            }
+            if task.result:
+                entry["output"] = task.result.output
+                entry["errors"] = task.result.errors
+                entry["files_modified"] = task.result.files_modified
+            task_entries.append(entry)
+
+        change_entries = [
+            {
+                "type": c.type.value,
+                "file": c.file,
+                "description": c.description,
+                "function": c.function,
+                "class_name": c.class_name,
+            }
+            for c in change_plan.changes
+        ]
+
+        report: dict[str, Any] = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "mode": "enhance",
+            "success": success,
+            "elapsed_seconds": round(elapsed, 2),
+            "prompt": prompt,
+            "change_plan": {
+                "summary": change_plan.summary,
+                "changes": change_entries,
+                "new_files": [nf.path for nf in change_plan.new_files],
+                "risk_notes": change_plan.risk_notes,
+            },
+            "task_stats": stats,
+            "tasks": task_entries,
+        }
+
+        report_path = workspace / "modify_report.json"
+        report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        logger.info(f"Modification report written to {report_path}")

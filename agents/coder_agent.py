@@ -8,7 +8,7 @@ from typing import Any
 
 from agents.base_agent import BaseAgent
 from core.language import get_language_profile, LanguageProfile
-from core.models import AgentContext, AgentRole, TaskResult, TaskType
+from core.models import AgentContext, AgentRole, ChangeAction, ChangeActionType, TaskResult, TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -97,9 +97,12 @@ class CoderAgent(BaseAgent):
         return self._get_source_system_prompt("python")
 
     async def execute(self, context: AgentContext) -> TaskResult:
-        """Generate or fix code for the assigned file."""
+        """Generate, fix, or modify code for the assigned file."""
         if context.task.task_type == TaskType.FIX_CODE:
             return await self._fix_code(context)
+
+        if context.task.task_type == TaskType.MODIFY_FILE:
+            return await self._modify_file(context)
 
         if not context.file_blueprint:
             return TaskResult(
@@ -228,6 +231,91 @@ class CoderAgent(BaseAgent):
         return TaskResult(
             success=True,
             output=f"Fixed {file_path} ({len(review_errors)} issue(s) addressed)",
+            files_modified=[file_path],
+            metrics=self.get_metrics(),
+        )
+
+    # ── Modification workflow ──────────────────────────────────────────
+
+    def _get_modify_system_prompt(self, language: str) -> str:
+        """System prompt for targeted file modification (patch editing)."""
+        profile = get_language_profile(language)
+        return (
+            f"You are an expert {profile.display_name} developer agent specializing in "
+            f"modifying existing code. You make targeted, surgical edits to existing files.\n\n"
+            "Rules:\n"
+            "- You will receive the CURRENT file content and a specific modification request\n"
+            "- Output the COMPLETE modified file — not just the patch\n"
+            "- Preserve ALL existing code that is not being changed\n"
+            "- Preserve existing imports, formatting, and style conventions\n"
+            "- Add new imports only if the modification requires them\n"
+            "- Place new functions/methods in the appropriate location:\n"
+            "  * New methods go inside their target class\n"
+            "  * New functions go after related existing functions\n"
+            "  * New imports go with existing import blocks\n"
+            f"- Follow the existing code's style and {profile.display_name} conventions\n"
+            "- Do NOT remove or rewrite code that isn't part of the requested change\n"
+            "- Do NOT add placeholder or TODO comments — write complete implementations\n"
+            "- Output only the code, no markdown fences or explanations"
+        )
+
+    async def _modify_file(self, context: AgentContext) -> TaskResult:
+        """Modify an existing file based on a change action (patch editing).
+
+        Instead of regenerating the entire file from scratch, this reads the
+        current file content, sends it to the LLM with the specific change
+        request, and writes back the modified version — preserving all
+        existing code that isn't being changed.
+        """
+        file_path = context.task.file
+        change_desc: str = context.task.metadata.get("change_description", "")
+        change_type: str = context.task.metadata.get("change_type", "")
+        target_function: str = context.task.metadata.get("target_function", "")
+        target_class: str = context.task.metadata.get("target_class", "")
+
+        # Read the current file content
+        current_content = await self.repo.async_read_file(file_path)
+        if current_content is None:
+            # File doesn't exist yet — fall back to full generation if we have a blueprint
+            if context.file_blueprint:
+                return await self._generate_source(context)
+            return TaskResult(
+                success=False,
+                errors=[f"File not found: {file_path} and no blueprint to generate from"],
+            )
+
+        fb = context.file_blueprint
+        lang = (fb.language if fb else None) or context.blueprint.tech_stack.get("language", "python")
+        profile = get_language_profile(lang)
+        logger.info(f"Modifying {file_path}: {change_desc[:80]}")
+
+        # Build a targeted modification prompt
+        target_hint = ""
+        if target_class:
+            target_hint += f"Target class: {target_class}\n"
+        if target_function:
+            target_hint += f"Target function/method: {target_function}\n"
+
+        prompt = (
+            f"{self._format_context(context)}\n\n"
+            f"MODIFICATION REQUEST for: {file_path}\n"
+            f"Change type: {change_type}\n"
+            f"{target_hint}"
+            f"Description: {change_desc}\n\n"
+            f"Current file content:\n```{profile.code_fence_name}\n{current_content}\n```\n\n"
+            f"Apply the modification to the file. Output the COMPLETE modified file "
+            f"preserving all existing code. Output only the code, nothing else."
+        )
+
+        modified_code = await self._call_llm(
+            prompt, system_override=self._get_modify_system_prompt(lang),
+        )
+        modified_code = self._clean_fences(modified_code, profile.code_fence_name)
+        await self.repo.async_write_file(file_path, modified_code)
+
+        return TaskResult(
+            success=True,
+            output=f"Modified {file_path}: {change_desc[:80]} ({len(modified_code)} bytes)",
             files_modified=[file_path],
             metrics=self.get_metrics(),
         )

@@ -47,6 +47,7 @@ TASK_AGENT_MAP: dict[TaskType, type[BaseAgent]] = {
     TaskType.GENERATE_DEPLOY: DeployAgent,
     TaskType.GENERATE_DOCS: WriterAgent,
     TaskType.FIX_CODE: CoderAgent,
+    TaskType.MODIFY_FILE: CoderAgent,
 }
 
 
