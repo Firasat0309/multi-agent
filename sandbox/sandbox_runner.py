@@ -102,18 +102,18 @@ class DockerSandbox(SandboxBase):
         }
 
         # Mount the shared cache directory for every cache_path the
-        # language profile declares.  BUILD gets rw, TEST gets ro so
-        # Maven / pip / cargo etc. can resolve pre-fetched deps without
-        # needing network access.
+        # language profile declares.  Both tiers get rw — tools like Maven
+        # need write access for lock files, logs, and plugin metadata even
+        # during test execution.  Isolation is enforced by network_disabled
+        # and read_only rootfs, not by the cache mount mode.
         if cache_dir and profile.cache_paths:
-            mode = "rw" if tier == SandboxTier.BUILD else "ro"
             for container_path in profile.cache_paths:
                 # One host sub-directory per container-path to avoid collisions
                 host_subdir = cache_dir / container_path.strip("/").replace("/", "_")
                 host_subdir.mkdir(parents=True, exist_ok=True)
                 volumes[str(host_subdir)] = {
                     "bind": container_path,
-                    "mode": mode,
+                    "mode": "rw",
                 }
 
         # ── Tier-specific container configuration ─────────────────────

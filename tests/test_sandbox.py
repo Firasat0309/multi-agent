@@ -156,7 +156,8 @@ class TestDockerSandboxTiers:
             assert len(m2_mount) == 1
             assert m2_mount[0]["mode"] == "rw"
 
-    def test_test_tier_mounts_cache_ro(self, tmp_path):
+    def test_test_tier_mounts_cache_rw(self, tmp_path):
+        """Cache is rw in both tiers — Maven/pip need write access for logs and locks."""
         sandbox = self._make_sandbox(image="maven:3.9-eclipse-temurin-21-alpine")
         mock_docker = self._mock_docker_module()
         cache_dir = tmp_path / "cache"
@@ -172,7 +173,7 @@ class TestDockerSandboxTiers:
             volumes = call_kwargs.kwargs["volumes"]
             m2_mount = [v for k, v in volumes.items() if v["bind"] == "/root/.m2"]
             assert len(m2_mount) == 1
-            assert m2_mount[0]["mode"] == "ro"
+            assert m2_mount[0]["mode"] == "rw"
 
     def test_no_cache_mount_without_cache_dir(self, tmp_path):
         sandbox = self._make_sandbox(image="maven:3.9-eclipse-temurin-21-alpine")
