@@ -50,7 +50,7 @@ class BaseAgent(ABC):
         system_override: str | None = None,
         temperature: float | None = None,
     ) -> str:
-        """Call LLM and track metrics."""
+        """Call LLM and track metrics. Auto-continues if output is truncated."""
         response = await self.llm.generate(
             system_prompt=system_override or self.system_prompt,
             user_prompt=user_prompt,
@@ -58,7 +58,32 @@ class BaseAgent(ABC):
         )
         self._metrics["llm_calls"] += 1
         self._metrics["tokens_used"] += sum(response.usage.values())
-        return response.content
+        content = response.content
+
+        # If the model hit the token limit, request one continuation to complete the file
+        if response.stop_reason in ("max_tokens", "length", "MAX_TOKENS"):
+            logger.warning(
+                f"LLM output truncated (stop_reason={response.stop_reason!r}), "
+                "requesting continuation"
+            )
+            continuation_prompt = (
+                f"{user_prompt}\n\n"
+                f"IMPORTANT: Your previous response was cut off mid-way. "
+                f"Here is the end of what you wrote:\n"
+                f"```\n{content[-300:]}\n```\n"
+                f"Continue EXACTLY from where the output was cut off. "
+                f"Output only the continuation — no preamble, no repetition."
+            )
+            cont_response = await self.llm.generate(
+                system_prompt=system_override or self.system_prompt,
+                user_prompt=continuation_prompt,
+                temperature=temperature,
+            )
+            self._metrics["llm_calls"] += 1
+            self._metrics["tokens_used"] += sum(cont_response.usage.values())
+            content = content + cont_response.content
+
+        return content
 
     async def _call_llm_json(
         self,

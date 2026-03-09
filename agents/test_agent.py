@@ -170,6 +170,8 @@ class TestAgent(BaseAgent):
 
             error_output = f"{cmd_result.stdout}\n{cmd_result.stderr}".strip()
             last_error = error_output[:500]
+            # Truncate to prevent token explosion in fix prompts (Maven logs can be huge)
+            error_for_prompt = error_output[:2000]
             logger.info(f"Test failed (attempt {attempt + 1}/{max_attempts})")
 
             # If the error is a build/config issue (no pom.xml etc.),
@@ -188,7 +190,7 @@ class TestAgent(BaseAgent):
                 fix_prompt = (
                     f"The following test file failed:\n\n"
                     f"```{profile.code_fence_name}\n{test_code}\n```\n\n"
-                    f"Error output:\n```\n{error_output}\n```\n\n"
+                    f"Error output:\n```\n{error_for_prompt}\n```\n\n"
                     f"Fix the test code so it compiles and passes. "
                     f"Output only the complete corrected test file."
                 )
@@ -206,7 +208,7 @@ class TestAgent(BaseAgent):
                     f"The following source file has a bug exposed by failing tests:\n\n"
                     f"Source file ({source_path}):\n"
                     f"```{profile.code_fence_name}\n{source_content}\n```\n\n"
-                    f"Test error output:\n```\n{error_output}\n```\n\n"
+                    f"Test error output:\n```\n{error_for_prompt}\n```\n\n"
                     f"Fix ONLY the specific bug(s) — do NOT simplify, remove methods, "
                     f"or reduce functionality. Keep the file structure and size intact. "
                     f"Output only the complete corrected source file."

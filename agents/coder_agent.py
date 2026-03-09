@@ -148,13 +148,30 @@ class CoderAgent(BaseAgent):
         tech = context.blueprint.tech_stack
         logger.info(f"Generating config file ({fmt}): {fb.path}")
 
+        # For pom.xml, enforce correct Java 17 configuration with up-to-date Maven fields
+        pom_hint = ""
+        if Path(fb.path).name.lower() == "pom.xml":
+            pom_hint = (
+                "\nIMPORTANT Java 17 requirements for pom.xml:\n"
+                "- Use Spring Boot parent 3.x (e.g. 3.2.x) which targets Java 17 by default\n"
+                "- Set <java.version>17</java.version> in <properties>\n"
+                "- Set <maven.compiler.source>17</maven.compiler.source> and "
+                "<maven.compiler.target>17</maven.compiler.target> in <properties>\n"
+                "- In the maven-compiler-plugin configuration use <release>17</release> "
+                "(NOT <source>/<target> inside the plugin — use the properties instead)\n"
+                "- Use <maven.compiler.release>17</maven.compiler.release> as the canonical property\n"
+                "- Include all required Spring Boot starter dependencies (web, data-jpa, validation, test)\n"
+                "- The pom.xml must be complete and valid — do not truncate it"
+            )
+
         prompt = (
             f"Project: {context.blueprint.name}\n"
             f"Tech stack: {tech}\n"
             f"Architecture: {context.blueprint.architecture_style}\n\n"
             f"Generate the file: {fb.path}\n"
             f"Purpose: {fb.purpose}\n"
-            f"Format: {fmt}\n\n"
+            f"Format: {fmt}\n"
+            f"{pom_hint}\n"
             f"Output only the {fmt} content. No code, no markdown, no explanations."
         )
 
