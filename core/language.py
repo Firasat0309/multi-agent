@@ -28,6 +28,7 @@ class LanguageProfile:
     code_fence_name: str = ""           # "python", "java", "go", "typescript"
     source_root: str = ""               # subdirectory under workspace where source files live
     test_root: str = ""                 # subdirectory under workspace where test files live
+    cache_paths: list[str] = field(default_factory=list)  # container paths for dependency caches
 
     def matches_extension(self, path: str) -> bool:
         return any(path.endswith(ext) for ext in self.file_extensions)
@@ -67,6 +68,7 @@ PYTHON = LanguageProfile(
     code_fence_name="python",
     source_root="src",
     test_root="tests",
+    cache_paths=["/root/.cache/pip"],
 )
 
 JAVA = LanguageProfile(
@@ -90,6 +92,7 @@ JAVA = LanguageProfile(
     code_fence_name="java",
     source_root="src/main",
     test_root="src/test",
+    cache_paths=["/root/.m2"],
 )
 
 GO = LanguageProfile(
@@ -111,6 +114,7 @@ GO = LanguageProfile(
                          r"^type\s+(\w+)\s+interface"],
     module_separator="/",
     code_fence_name="go",
+    cache_paths=["/go/pkg/mod", "/root/.cache/go-build"],
 )
 
 TYPESCRIPT = LanguageProfile(
@@ -132,6 +136,7 @@ TYPESCRIPT = LanguageProfile(
                          r"(?:export\s+)?(?:function|const|let)\s+(\w+)"],
     module_separator="/",
     code_fence_name="typescript",
+    cache_paths=["/root/.npm"],
 )
 
 RUST = LanguageProfile(
@@ -153,6 +158,7 @@ RUST = LanguageProfile(
                          r"^fn\s+(\w+)", r"^struct\s+(\w+)", r"^enum\s+(\w+)"],
     module_separator="::",
     code_fence_name="rust",
+    cache_paths=["/usr/local/cargo/registry"],
 )
 
 CSHARP = LanguageProfile(
@@ -174,6 +180,7 @@ CSHARP = LanguageProfile(
                          r"(?:public|private|internal|protected)\s+(?:static\s+)?\S+\s+(\w+)\s*\("],
     module_separator=".",
     code_fence_name="csharp",
+    cache_paths=["/root/.nuget"],
 )
 
 

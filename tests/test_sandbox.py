@@ -137,6 +137,56 @@ class TestDockerSandboxTiers:
             call_kwargs = mock_docker.from_env.return_value.containers.run.call_args
             assert "/tmp" in call_kwargs.kwargs["tmpfs"]
 
+    def test_build_tier_mounts_cache_rw(self, tmp_path):
+        sandbox = self._make_sandbox(image="maven:3.9-eclipse-temurin-21-alpine")
+        mock_docker = self._mock_docker_module()
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+
+        with patch.dict("sys.modules", {"docker": mock_docker}):
+            _run(sandbox.create(
+                tmp_path, language_name="java",
+                tier=SandboxTier.BUILD, cache_dir=cache_dir,
+            ))
+
+            call_kwargs = mock_docker.from_env.return_value.containers.run.call_args
+            volumes = call_kwargs.kwargs["volumes"]
+            # /root/.m2 should get a rw mount
+            m2_mount = [v for k, v in volumes.items() if v["bind"] == "/root/.m2"]
+            assert len(m2_mount) == 1
+            assert m2_mount[0]["mode"] == "rw"
+
+    def test_test_tier_mounts_cache_ro(self, tmp_path):
+        sandbox = self._make_sandbox(image="maven:3.9-eclipse-temurin-21-alpine")
+        mock_docker = self._mock_docker_module()
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir()
+
+        with patch.dict("sys.modules", {"docker": mock_docker}):
+            _run(sandbox.create(
+                tmp_path, language_name="java",
+                tier=SandboxTier.TEST, cache_dir=cache_dir,
+            ))
+
+            call_kwargs = mock_docker.from_env.return_value.containers.run.call_args
+            volumes = call_kwargs.kwargs["volumes"]
+            m2_mount = [v for k, v in volumes.items() if v["bind"] == "/root/.m2"]
+            assert len(m2_mount) == 1
+            assert m2_mount[0]["mode"] == "ro"
+
+    def test_no_cache_mount_without_cache_dir(self, tmp_path):
+        sandbox = self._make_sandbox(image="maven:3.9-eclipse-temurin-21-alpine")
+        mock_docker = self._mock_docker_module()
+
+        with patch.dict("sys.modules", {"docker": mock_docker}):
+            _run(sandbox.create(tmp_path, language_name="java", tier=SandboxTier.BUILD))
+
+            call_kwargs = mock_docker.from_env.return_value.containers.run.call_args
+            volumes = call_kwargs.kwargs["volumes"]
+            # Only the workspace mount should be present
+            binds = [v["bind"] for v in volumes.values()]
+            assert "/root/.m2" not in binds
+
 
 # ── SandboxManager ───────────────────────────────────────────────────────────
 
@@ -167,6 +217,28 @@ class TestSandboxManager:
 
         _run(manager.destroy_all())
         assert len(manager._active) == 0
+
+    def test_docker_manager_creates_cache_dir(self, tmp_path):
+        config = SandboxConfig(sandbox_type=SandboxType.DOCKER)
+        manager = SandboxManager(config)
+
+        cache = manager._ensure_cache_dir()
+        assert cache.exists()
+        assert cache.is_dir()
+
+        # Idempotent
+        assert manager._ensure_cache_dir() is cache
+
+        # Cleanup on destroy_all
+        _run(manager.destroy_all())
+        assert manager._cache_dir is None
+
+    def test_local_manager_no_cache_dir(self, tmp_path):
+        config = SandboxConfig(sandbox_type=SandboxType.LOCAL)
+        manager = SandboxManager(config)
+
+        _run(manager.create_sandbox(tmp_path, tier=SandboxTier.BUILD))
+        assert manager._cache_dir is None
 
 
 # ── Settings ─────────────────────────────────────────────────────────────────
