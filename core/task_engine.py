@@ -182,23 +182,41 @@ class TaskGraphBuilder:
         )
         graph.add_task(sec_task)
 
-        # Phase 5: Module-level review (after file reviews)
+        # Phase 5: Module-level review (after all per-file fixes)
+        all_fix_ids = list(fix_task_map.values())
         mod_review = Task(
             task_id=self._alloc_id(),
             task_type=TaskType.REVIEW_MODULE,
             file="*",
             description="Module consistency review",
-            dependencies=review_tasks,
+            dependencies=all_fix_ids,
         )
         graph.add_task(mod_review)
 
-        # Phase 6: Architecture review
+        # Phase 5.5: Module-level fix — fix cross-file consistency issues
+        # Each source file gets a fix task that sees the module review findings
+        mod_fix_ids: list[int] = []
+        for fb in blueprint.file_blueprints:
+            if fb.layer in ("config", "deploy"):
+                continue
+            mod_fix = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.FIX_CODE,
+                file=fb.path,
+                description=f"Fix {fb.path} based on module review",
+                dependencies=[mod_review.task_id],
+                metadata={"review_task_id": mod_review.task_id},
+            )
+            graph.add_task(mod_fix)
+            mod_fix_ids.append(mod_fix.task_id)
+
+        # Phase 6: Architecture review (after module fixes + security)
         arch_review = Task(
             task_id=self._alloc_id(),
             task_type=TaskType.REVIEW_ARCHITECTURE,
             file="*",
             description="Architecture review for dependency cycles and layer violations",
-            dependencies=[mod_review.task_id, sec_task.task_id],
+            dependencies=mod_fix_ids + [sec_task.task_id],
         )
         graph.add_task(arch_review)
 

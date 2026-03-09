@@ -29,13 +29,36 @@ _CONFIG_FILE_FORMATS: dict[str, str] = {
 }
 _DOCKERFILE_NAMES = {"dockerfile", "dockerfile.dev", "dockerfile.prod"}
 
+# Build/project config files identified by exact filename (case-insensitive)
+_BUILD_CONFIG_NAMES: dict[str, str] = {
+    "pom.xml": "Maven POM XML (project build configuration with dependencies, plugins, and properties)",
+    "build.gradle": "Gradle build script (Groovy DSL)",
+    "build.gradle.kts": "Gradle build script (Kotlin DSL)",
+    "settings.gradle": "Gradle settings",
+    "settings.gradle.kts": "Gradle settings (Kotlin DSL)",
+    "go.mod": "Go module file",
+    "go.sum": "Go module checksums",
+    "cargo.toml": "Rust Cargo manifest",
+    "package.json": "Node.js/TypeScript package.json",
+    "tsconfig.json": "TypeScript compiler configuration",
+    "requirements.txt": "Python pip requirements (one package per line)",
+    "pyproject.toml": "Python project configuration (TOML format)",
+    ".csproj": "C# project file (MSBuild XML)",
+}
+
 
 def _config_format(path: str) -> str | None:
     """Return the expected content format for non-source files, or None for source files."""
     name = Path(path).name.lower()
     if name in _DOCKERFILE_NAMES:
         return "Dockerfile"
+    # Check build config files by exact name
+    if name in _BUILD_CONFIG_NAMES:
+        return _BUILD_CONFIG_NAMES[name]
+    # Check by file extension for .csproj etc.
     suffix = Path(path).suffix.lower()
+    if suffix == ".csproj":
+        return _BUILD_CONFIG_NAMES[".csproj"]
     return _CONFIG_FILE_FORMATS.get(suffix)
 
 

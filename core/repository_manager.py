@@ -14,6 +14,20 @@ from core.models import FileIndex, RepositoryBlueprint, RepositoryIndex
 logger = logging.getLogger(__name__)
 
 
+# Files that must always live at the workspace root, never under src_dir
+_ROOT_LEVEL_FILES = {
+    "pom.xml", "build.gradle", "build.gradle.kts",
+    "settings.gradle", "settings.gradle.kts",
+    "go.mod", "go.sum",
+    "cargo.toml", "cargo.lock",
+    "package.json", "package-lock.json", "tsconfig.json",
+    "requirements.txt", "pyproject.toml", "setup.py", "setup.cfg",
+    "makefile", "rakefile", "gemfile",
+    "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    ".gitignore", ".editorconfig",
+}
+
+
 class RepositoryManager:
     """Manages the generated repository workspace."""
 
@@ -88,7 +102,13 @@ class RepositoryManager:
 
         Handles the case where blueprints may include the root prefix in file paths
         (e.g. 'src/main/java/...' when source_root is already 'src/main').
+        Root-level files (pom.xml, go.mod, etc.) always go to workspace root.
         """
+        # Root-level project files always live at workspace root
+        filename = Path(rel_path).name.lower()
+        if filename in _ROOT_LEVEL_FILES:
+            return self.workspace / Path(rel_path).name  # preserve original case
+
         if root == self.workspace:
             return self.workspace / rel_path
         root_prefix = str(root.relative_to(self.workspace)).replace("\\", "/")

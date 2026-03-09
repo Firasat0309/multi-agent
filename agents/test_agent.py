@@ -112,6 +112,30 @@ class TestAgent(BaseAgent):
 
         return f"{directory}/{test_name}" if directory else test_name
 
+    # Error messages that indicate a build/project configuration issue, not a code bug.
+    _BUILD_CONFIG_ERRORS = (
+        # Java / Maven / Gradle
+        "no pom", "build failure", "could not determine",
+        # Go
+        "no go files", "cannot find module", "go.mod",
+        # Node / TypeScript
+        "package.json", "cannot find module", "enoent",
+        # Rust
+        "cargo.toml", "could not find cargo.toml",
+        # C# / .NET
+        "no project found", "msbuild", ".csproj",
+        # Python
+        "no module named", "modulenotfounderror",
+        # Generic
+        "could not find", "no such file or directory", "not a valid",
+        "no build file", "compileerror", "cannot resolve",
+    )
+
+    def _is_build_config_error(self, error_output: str) -> bool:
+        """Detect if test failure is caused by missing build config, not a code bug."""
+        lower = error_output.lower()
+        return any(marker in lower for marker in self._BUILD_CONFIG_ERRORS)
+
     async def _run_and_fix(
         self, test_path: str, test_code: str, context: AgentContext,
         profile: LanguageProfile, max_attempts: int = 4,
@@ -123,10 +147,15 @@ class TestAgent(BaseAgent):
           1 → fix source file (bug in the implementation exposed by tests)
           2 → fix test file  (adapt to corrected source)
           3 → fix source file (one more pass)
+
+        Safeguards:
+          - Build/config errors (no pom.xml etc.) → only fix tests, never touch source
+          - Size guard: never replace source with content < 50% of original (prevents destruction)
         """
         lang = context.file_blueprint.language if context.file_blueprint else "python"
         source_path = context.file_blueprint.path if context.file_blueprint else ""
         last_error = ""
+        source_modified = False
 
         for attempt in range(max_attempts):
             cmd_result = await self.terminal.run_command(profile.test_command)
@@ -143,7 +172,16 @@ class TestAgent(BaseAgent):
             last_error = error_output[:500]
             logger.info(f"Test failed (attempt {attempt + 1}/{max_attempts})")
 
-            fix_test = attempt % 2 == 0  # even → fix test, odd → fix source
+            # If the error is a build/config issue (no pom.xml etc.),
+            # only fix tests — touching source code won't help.
+            is_build_error = self._is_build_config_error(error_output)
+            fix_test = attempt % 2 == 0 or is_build_error
+
+            if is_build_error and attempt == 0:
+                logger.warning(
+                    "Build configuration error detected — fixing tests only, "
+                    "source files will not be modified"
+                )
 
             if fix_test:
                 logger.info("Fixing test file based on error output")
@@ -160,35 +198,49 @@ class TestAgent(BaseAgent):
                 test_code = self._clean_code(test_code, profile)
                 self.repo.write_test_file(test_path, test_code)
             else:
-                logger.info("Fixing source file based on test failure")
                 source_content = self.repo.read_file(source_path) or ""
+                original_size = len(source_content)
+                logger.info("Fixing source file based on test failure")
+
                 fix_prompt = (
                     f"The following source file has a bug exposed by failing tests:\n\n"
                     f"Source file ({source_path}):\n"
                     f"```{profile.code_fence_name}\n{source_content}\n```\n\n"
                     f"Test error output:\n```\n{error_output}\n```\n\n"
-                    f"Fix the source file to make the tests pass. "
+                    f"Fix ONLY the specific bug(s) — do NOT simplify, remove methods, "
+                    f"or reduce functionality. Keep the file structure and size intact. "
                     f"Output only the complete corrected source file."
                 )
                 fixed_source = await self._call_llm(
                     fix_prompt,
                     system_override=(
                         f"You are an expert {profile.display_name} developer. "
-                        f"Fix bugs in the source file so the tests pass. "
+                        f"Fix the specific bug in the source file so the tests pass. "
+                        f"IMPORTANT: Do NOT simplify or shorten the file. Keep all existing "
+                        f"methods, classes, and functionality intact. Only change what is "
+                        f"necessary to fix the failing test. "
                         f"Output only the complete corrected code, no markdown fences."
                     ),
                 )
                 fixed_source = self._clean_code(fixed_source, profile)
-                if source_path:
+
+                # Size guard: reject rewrites that destroy content (< 50% of original)
+                if source_path and original_size > 0 and len(fixed_source) < original_size * 0.5:
+                    logger.warning(
+                        f"Source fix rejected: new size ({len(fixed_source)}) is less than "
+                        f"50% of original ({original_size}). Keeping original to prevent "
+                        f"content destruction."
+                    )
+                elif source_path:
                     self.repo.write_file(source_path, fixed_source)
+                    source_modified = True
 
         # Exhausted attempts — still mark success=True so the task is not retried.
-        # The errors are logged for visibility.
         return TaskResult(
             success=True,
             output=f"Tests written (still failing after {max_attempts} fix attempts — manual review needed)",
             errors=[last_error],
-            files_modified=[test_path, source_path] if source_path else [test_path],
+            files_modified=[test_path, source_path] if source_modified else [test_path],
             metrics={**self.get_metrics(), "fix_attempts": max_attempts, "tests_passing": False},
         )
 
