@@ -84,6 +84,7 @@ class DockerSandbox(SandboxBase):
         cache_dir: Path | None = None,
     ) -> SandboxInfo:
         import docker
+        import os
         client = docker.from_env()
 
         # Auto-detect image from language profile when not explicitly configured
@@ -92,6 +93,9 @@ class DockerSandbox(SandboxBase):
         profile = get_language_profile(language_name)
         if not image:
             image = profile.docker_image
+
+        # Ensure workspace directory exists and is writable
+        workspace_path.mkdir(parents=True, exist_ok=True)
 
         # ── Build volume mapping ──────────────────────────────────────
         volumes: dict[str, dict[str, str]] = {
@@ -118,11 +122,23 @@ class DockerSandbox(SandboxBase):
 
         # ── Tier-specific container configuration ─────────────────────
         if tier == SandboxTier.TEST:
-            # TEST tier: no network, read-only rootfs, tmpfs for /tmp.
+            # TEST tier: no network, read-only rootfs, tmpfs for writable areas.
             # Workspace is mounted rw so the test-agent fix loop can still
             # write updated files from the host side;  the read-only rootfs
             # prevents the *generated code* from writing outside /workspace
-            # and /tmp.
+            # and the designated tmpfs areas.
+            #
+            # Build tools (Maven, Gradle, Go, etc.) need write access to home-
+            # directory caches even during test execution (lock files, plugin
+            # metadata, wrapper scripts).  We mount tmpfs for /tmp AND /root
+            # so these writes succeed without touching the host filesystem.
+            # The cache_dir volume mounts (if any) overlay specific paths under
+            # /root with host-backed storage for pre-fetched dependencies.
+            tmpfs_mounts = {
+                "/tmp": "size=256m",
+                "/root": "size=512m",
+                "/var/tmp": "size=64m",
+            }
             container = client.containers.run(
                 image,
                 command="sleep infinity",
@@ -132,11 +148,11 @@ class DockerSandbox(SandboxBase):
                 network_disabled=True,
                 read_only=True,
                 volumes=volumes,
-                tmpfs={"/tmp": "size=256m"},
+                tmpfs=tmpfs_mounts,
                 working_dir="/workspace",
-                remove=True,
+                remove=False,  # keep on failure for log inspection
             )
-            logger.info("Created TEST sandbox (network=none, rootfs=ro, tmpfs=/tmp)")
+            logger.info("Created TEST sandbox (network=none, rootfs=ro, tmpfs=/tmp+/root)")
         else:
             # BUILD tier: network access allowed (needs to fetch deps).
             container = client.containers.run(
@@ -148,7 +164,7 @@ class DockerSandbox(SandboxBase):
                 network_disabled=False,
                 volumes=volumes,
                 working_dir="/workspace",
-                remove=True,
+                remove=False,  # keep on failure for log inspection
             )
             logger.info("Created BUILD sandbox (network=on)")
 
@@ -169,9 +185,12 @@ class DockerSandbox(SandboxBase):
             return CommandResult(exit_code=-1, stdout="", stderr="Sandbox not found")
 
         try:
+            # Run as root inside the container to avoid permission issues
+            # with volume-mounted workspace files owned by the host user.
             exec_result = container.exec_run(
                 ["bash", "-c", command],
                 workdir="/workspace",
+                user="root",
                 demux=True,
             )
             stdout = exec_result.output[0].decode("utf-8") if exec_result.output[0] else ""
@@ -190,7 +209,14 @@ class DockerSandbox(SandboxBase):
             try:
                 container.stop(timeout=5)
             except Exception:
-                container.kill()
+                try:
+                    container.kill()
+                except Exception:
+                    pass
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass  # already removed or doesn't exist
             logger.info(f"Destroyed Docker sandbox {sandbox_id}")
 
     async def copy_to(self, sandbox_id: str, src: Path, dest: str) -> None:

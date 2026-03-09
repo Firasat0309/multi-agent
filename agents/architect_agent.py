@@ -77,11 +77,71 @@ class ArchitectAgent(BaseAgent):
         return TaskResult(success=False, errors=["Use design_architecture() method"])
 
     async def design_architecture(self, user_prompt: str) -> RepositoryBlueprint:
-        """Design a complete repository blueprint from user requirements."""
+        """Design a complete repository blueprint from user requirements.
+
+        Uses a higher max_tokens limit because the architecture JSON (with
+        15+ file blueprints and a full architecture_doc) routinely exceeds
+        the default 8192 tokens.  If the response is truncated, we attempt
+        one continuation to complete the JSON.
+        """
         logger.info("Designing architecture from user prompt")
 
-        result = await self._call_llm_json(user_prompt)
+        # Architecture responses are large — use 16k tokens to avoid truncation.
+        response = await self.llm.generate(
+            system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
+            user_prompt=user_prompt,
+            max_tokens=16384,
+        )
+        self._metrics["llm_calls"] += 1
+        self._metrics["tokens_used"] += sum(response.usage.values())
+
+        text = response.content
+
+        # If still truncated, request one continuation
+        if response.stop_reason in ("max_tokens", "length", "MAX_TOKENS"):
+            logger.warning("Architecture response truncated — requesting continuation")
+            continuation = await self.llm.generate(
+                system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
+                user_prompt=(
+                    f"{user_prompt}\n\n"
+                    f"Your previous JSON response was cut off. Here is the end:\n"
+                    f"```\n{text[-500:]}\n```\n"
+                    f"Continue EXACTLY from the cut-off point to complete the JSON. "
+                    f"Output only the continuation — no preamble."
+                ),
+                max_tokens=8192,
+            )
+            self._metrics["llm_calls"] += 1
+            self._metrics["tokens_used"] += sum(continuation.usage.values())
+            text += continuation.content
+
+        result = self._parse_json_response(text)
         return self._parse_blueprint(result)
+
+    @staticmethod
+    def _parse_json_response(text: str) -> dict[str, Any]:
+        """Parse JSON from LLM output, handling fences and partial responses."""
+        text = text.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines)
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            # Try to extract the outermost JSON object
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start != -1 and end > start:
+                try:
+                    return json.loads(text[start:end])
+                except json.JSONDecodeError:
+                    pass
+            logger.error("Could not parse architecture JSON: %s...", text[:200])
+            return {}
 
     def _parse_blueprint(self, data: dict[str, Any]) -> RepositoryBlueprint:
         from core.language import detect_language_from_blueprint, get_language_profile

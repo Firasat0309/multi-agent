@@ -26,6 +26,7 @@ from core.models import (
     TaskType,
 )
 from core.repository_manager import RepositoryManager
+from core.state_machine import EventType, FilePhase, LifecycleEngine
 from core.task_engine import TaskGraph
 from tools.terminal_tools import TerminalTools
 
@@ -250,3 +251,240 @@ class AgentManager:
         if self._live:
             self._live.update_task(task.task_id, task.description, "failed", agent_name)
             self._live.log(f"[red]Failed:[/red] {task.description}")
+
+    # ── Lifecycle-mode execution ─────────────────────────────────────
+
+    async def execute_with_lifecycle(
+        self,
+        engine: LifecycleEngine,
+        global_graph: TaskGraph,
+    ) -> dict[str, Any]:
+        """Execute using the event-sourced lifecycle engine.
+
+        Phase 1: Run per-file lifecycles (Generate → Review → Fix → Test)
+                 driven by LifecycleEngine events.
+        Phase 2: Mark sentinel task completed, then execute the global DAG
+                 (security, module review, architecture review, deploy, docs).
+
+        Returns the same result format as ``execute_graph()``.
+        """
+        start_time = time.monotonic()
+        semaphore = asyncio.Semaphore(self.settings.max_concurrent_agents)
+
+        # Track in-flight file tasks to avoid double-dispatching
+        in_flight: set[str] = set()
+
+        while not engine.all_terminal():
+            actionable = engine.get_actionable_files()
+            # Filter out files already being worked on
+            to_dispatch = [
+                (path, phase) for path, phase in actionable
+                if path not in in_flight
+            ]
+
+            if not to_dispatch:
+                if in_flight:
+                    await asyncio.sleep(0.3)
+                    continue
+                # No files in-flight and nothing actionable — shouldn't happen
+                logger.error("Lifecycle stall: no actionable files and none in-flight")
+                break
+
+            async def run_file_phase(path: str, phase: FilePhase) -> None:
+                async with semaphore:
+                    try:
+                        await self._execute_lifecycle_phase(engine, path, phase)
+                    finally:
+                        in_flight.discard(path)
+
+            for path, phase in to_dispatch:
+                in_flight.add(path)
+
+            await asyncio.gather(
+                *[run_file_phase(p, ph) for p, ph in to_dispatch]
+            )
+
+        # ── Phase 2: Global DAG ──────────────────────────────────────
+        logger.info("All file lifecycles terminal — running global DAG")
+
+        # Mark the sentinel task (ID 1) as completed to unblock the global DAG
+        sentinel = global_graph.get_task(1)
+        if sentinel:
+            global_graph.mark_completed(sentinel.task_id)
+
+        # Reuse the existing graph executor for the global tasks
+        await self.execute_graph(global_graph)
+
+        elapsed = time.monotonic() - start_time
+
+        # Save final repo index
+        self.repo.save_repo_index()
+        try:
+            self.repo.rebuild_dependency_graph()
+        except Exception as e:
+            logger.warning(f"Dependency graph rebuild failed (non-critical): {e}")
+
+        lifecycle_summary = engine.get_results_summary()
+        global_stats = global_graph.get_stats()
+
+        logger.info(
+            "Lifecycle execution complete in %.1fs. Files: %d passed, %d failed. "
+            "Global tasks: %s",
+            elapsed, lifecycle_summary["passed"], lifecycle_summary["failed"],
+            global_stats,
+        )
+
+        return {
+            "stats": {
+                **global_stats,
+                "lifecycle_passed": lifecycle_summary["passed"],
+                "lifecycle_failed": lifecycle_summary["failed"],
+                "lifecycle_total_fixes": lifecycle_summary["total_fix_cycles"],
+            },
+            "metrics": self._metrics,
+            "elapsed_seconds": elapsed,
+            "lifecycle_summary": lifecycle_summary,
+        }
+
+    async def _execute_lifecycle_phase(
+        self,
+        engine: LifecycleEngine,
+        file_path: str,
+        phase: FilePhase,
+    ) -> None:
+        """Execute one lifecycle phase for a single file.
+
+        Maps FilePhase → agent type, builds context, runs the agent, then
+        processes the result as an EventType to drive the state machine.
+        """
+        lc = engine.get_lifecycle(file_path)
+
+        # ── PENDING: fire DEPS_MET to move to GENERATING ──────────
+        if phase == FilePhase.PENDING:
+            engine.process_event(file_path, EventType.DEPS_MET)
+            phase = lc.phase  # now GENERATING
+
+        # Map phase → task type + event on success/failure
+        phase_config: dict[FilePhase, dict[str, Any]] = {
+            FilePhase.GENERATING: {
+                "task_type": TaskType.GENERATE_FILE,
+                "success_event": EventType.CODE_GENERATED,
+                "failure_event": EventType.RETRIES_EXHAUSTED,
+                "description": f"Generate {file_path}",
+            },
+            FilePhase.REVIEWING: {
+                "task_type": TaskType.REVIEW_FILE,
+                "success_event": EventType.REVIEW_PASSED,
+                "failure_event": EventType.REVIEW_FAILED,
+                "description": f"Review {file_path}",
+            },
+            FilePhase.FIXING: {
+                "task_type": TaskType.FIX_CODE,
+                "success_event": EventType.FIX_APPLIED,
+                "failure_event": EventType.RETRIES_EXHAUSTED,
+                "description": f"Fix {file_path} ({lc.fix_trigger} issues)",
+            },
+            FilePhase.TESTING: {
+                "task_type": TaskType.GENERATE_TEST,
+                "success_event": EventType.TEST_PASSED,
+                "failure_event": EventType.TEST_FAILED,
+                "description": f"Test {file_path}",
+            },
+        }
+
+        config = phase_config.get(phase)
+        if config is None:
+            logger.warning("No action for phase %s on %s", phase.value, file_path)
+            return
+
+        # Build a synthetic Task for the context builder
+        task = Task(
+            task_id=0,
+            task_type=config["task_type"],
+            file=file_path,
+            description=config["description"],
+            metadata=self._build_lifecycle_metadata(lc),
+        )
+
+        if self._live:
+            self._live.log(f"[cyan]Lifecycle:[/cyan] {config['description']}")
+
+        # Build context and execute
+        context_builder = ContextBuilder(
+            workspace_dir=self.repo.workspace,
+            blueprint=self.blueprint,
+            repo_index=self.repo.get_repo_index(),
+        )
+        context = context_builder.build(task)
+
+        try:
+            agent = self._create_agent(config["task_type"])
+            record_agent_start()
+            try:
+                result = await agent.execute(context)
+            finally:
+                record_agent_end()
+
+            # Track metrics
+            agent_name = agent.role.value
+            if agent_name not in self._metrics["agent_metrics"]:
+                self._metrics["agent_metrics"][agent_name] = []
+            self._metrics["agent_metrics"][agent_name].append(agent.get_metrics())
+
+            # Determine success/failure for lifecycle events.
+            # Review is special: ReviewerAgent always returns success=True (task
+            # completed), but uses result.metrics["passed"] to indicate the
+            # actual review verdict.
+            if config["task_type"] == TaskType.REVIEW_FILE:
+                review_passed = result.metrics.get("passed", True)
+                if review_passed:
+                    event_data = {"output": result.output}
+                    engine.process_event(file_path, EventType.REVIEW_PASSED, event_data)
+                else:
+                    event_data = {"findings": result.errors, "output": result.output}
+                    engine.process_event(file_path, EventType.REVIEW_FAILED, event_data)
+                self._metrics["tasks_completed"] += 1
+            elif result.success:
+                self._metrics["tasks_completed"] += 1
+                event_data = self._extract_event_data(result, config["task_type"])
+                engine.process_event(file_path, config["success_event"], event_data)
+                logger.info("[%s] %s succeeded", file_path, phase.value)
+                if self._live:
+                    self._live.log(f"[green]Done:[/green] {config['description']}")
+            else:
+                event_data = self._extract_event_data(result, config["task_type"])
+                engine.process_event(file_path, config["failure_event"], event_data)
+                logger.warning("[%s] %s failed: %s", file_path, phase.value, result.errors)
+                if self._live:
+                    self._live.log(
+                        f"[yellow]Issue:[/yellow] {config['description']} — "
+                        f"transitioning via {config['failure_event'].value}"
+                    )
+
+        except Exception as e:
+            logger.exception("[%s] %s error", file_path, phase.value)
+            engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
+            self._metrics["tasks_failed"] += 1
+
+    @staticmethod
+    def _build_lifecycle_metadata(lc: Any) -> dict[str, Any]:
+        """Build task metadata from lifecycle state for downstream agents."""
+        meta: dict[str, Any] = {}
+        if lc.fix_trigger == "review":
+            meta["review_errors"] = lc.review_findings
+            meta["review_output"] = lc.review_output
+            meta["fix_trigger"] = "review"
+        elif lc.fix_trigger == "test":
+            meta["test_errors"] = lc.test_errors
+            meta["fix_trigger"] = "test"
+            meta["test_fix_target"] = lc.test_fix_target
+        return meta
+
+    @staticmethod
+    def _extract_event_data(result: Any, task_type: TaskType) -> dict[str, Any]:
+        """Extract event data from agent result for lifecycle transitions."""
+        data: dict[str, Any] = {}
+        if task_type == TaskType.GENERATE_TEST:
+            if not result.success:
+                data["errors"] = "\n".join(result.errors) if result.errors else result.output
+        return data

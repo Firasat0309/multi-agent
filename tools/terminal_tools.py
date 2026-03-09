@@ -238,7 +238,10 @@ class TerminalTools:
         """Run security scanner for the configured language."""
         if not self._lang.security_scan_command:
             return CommandResult(exit_code=0, stdout="No security scanner configured", stderr="")
-        return await self.run_command(f"{self._lang.security_scan_command}")
+        cmd = self._lang.security_scan_command
+        if file_path and file_path != ".":
+            cmd += f" {file_path}"
+        return await self.run_command(cmd)
 
     async def run_build(self) -> CommandResult:
         """Run build command for the configured language."""
