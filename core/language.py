@@ -26,6 +26,8 @@ class LanguageProfile:
     definition_patterns: list[str] = field(default_factory=list)  # regex for class/func defs
     module_separator: str = "."         # "." for Python/Java, "/" for Go
     code_fence_name: str = ""           # "python", "java", "go", "typescript"
+    source_root: str = ""               # subdirectory under workspace where source files live
+    test_root: str = ""                 # subdirectory under workspace where test files live
 
     def matches_extension(self, path: str) -> bool:
         return any(path.endswith(ext) for ext in self.file_extensions)
@@ -63,6 +65,8 @@ PYTHON = LanguageProfile(
     definition_patterns=[r"^class\s+(\w+)", r"^def\s+(\w+)"],
     module_separator=".",
     code_fence_name="python",
+    source_root="src",
+    test_root="tests",
 )
 
 JAVA = LanguageProfile(
@@ -84,6 +88,8 @@ JAVA = LanguageProfile(
                          r"(?:public|private|protected)\s+(?:static\s+)?\S+\s+(\w+)\s*\("],
     module_separator=".",
     code_fence_name="java",
+    source_root="src/main",
+    test_root="src/test",
 )
 
 GO = LanguageProfile(

@@ -19,25 +19,38 @@ class RepositoryManager:
 
     def __init__(self, workspace_dir: Path) -> None:
         self.workspace = workspace_dir
-        self.src_dir = workspace_dir / "src"
-        self.test_dir = workspace_dir / "tests"
         self.deploy_dir = workspace_dir / "deploy"
         self.docs_dir = workspace_dir / "docs"
         self._repo_index = RepositoryIndex()
         self._lang_profile: LanguageProfile = PYTHON
 
+    @property
+    def src_dir(self) -> Path:
+        """Source root — language-aware (e.g. workspace/src for Python, workspace for Java)."""
+        sr = self._lang_profile.source_root
+        return self.workspace / sr if sr else self.workspace
+
+    @property
+    def test_dir(self) -> Path:
+        """Test root — language-aware (e.g. workspace/tests for Python, workspace for Java)."""
+        tr = self._lang_profile.test_root
+        return self.workspace / tr if tr else self.workspace
+
     def initialize(self, blueprint: RepositoryBlueprint) -> None:
         """Create workspace directory structure from blueprint."""
         self._lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
         self.workspace.mkdir(parents=True, exist_ok=True)
-        self.src_dir.mkdir(exist_ok=True)
-        self.test_dir.mkdir(exist_ok=True)
+        # Only create explicit src/test dirs when the language uses dedicated roots
+        if self._lang_profile.source_root:
+            self.src_dir.mkdir(exist_ok=True)
+        if self._lang_profile.test_root:
+            self.test_dir.mkdir(exist_ok=True)
         self.deploy_dir.mkdir(exist_ok=True)
         self.docs_dir.mkdir(exist_ok=True)
 
         # Create subdirectories from blueprint
         for folder in blueprint.folder_structure:
-            (self.src_dir / folder).mkdir(parents=True, exist_ok=True)
+            self._resolve_write_path(self.src_dir, folder).mkdir(parents=True, exist_ok=True)
 
         # Write architecture doc
         arch_path = self.workspace / "architecture.md"
@@ -70,13 +83,27 @@ class RepositoryManager:
 
         logger.info(f"Initialized workspace at {self.workspace}")
 
+    def _resolve_write_path(self, root: Path, rel_path: str) -> Path:
+        """Resolve the full write path, avoiding double-prefix when rel_path already starts with root.
+
+        Handles the case where blueprints may include the root prefix in file paths
+        (e.g. 'src/main/java/...' when source_root is already 'src/main').
+        """
+        if root == self.workspace:
+            return self.workspace / rel_path
+        root_prefix = str(root.relative_to(self.workspace)).replace("\\", "/")
+        if rel_path.startswith(root_prefix + "/") or rel_path == root_prefix:
+            # Path already includes the root prefix — write relative to workspace
+            return self.workspace / rel_path
+        return root / rel_path
+
     def write_file(self, rel_path: str, content: str) -> Path:
-        """Write a file to the src directory and update index."""
-        file_path = self.src_dir / rel_path
+        """Write a file to the source root and update index."""
+        file_path = self._resolve_write_path(self.src_dir, rel_path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
 
-        # Ensure __init__.py exists in all parent packages
+        # Ensure __init__.py exists in all parent packages (Python only)
         self._ensure_init_files(file_path)
 
         # Update repo index
@@ -86,8 +113,8 @@ class RepositoryManager:
         return file_path
 
     def write_test_file(self, rel_path: str, content: str) -> Path:
-        """Write a test file."""
-        file_path = self.test_dir / rel_path
+        """Write a test file to the test root."""
+        file_path = self._resolve_write_path(self.test_dir, rel_path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
         self._ensure_init_files(file_path)
@@ -111,8 +138,8 @@ class RepositoryManager:
         return file_path
 
     def read_file(self, rel_path: str) -> str | None:
-        """Read a file from the src directory."""
-        file_path = self.src_dir / rel_path
+        """Read a file from the source root."""
+        file_path = self._resolve_write_path(self.src_dir, rel_path)
         if not file_path.exists():
             return None
         return file_path.read_text(encoding="utf-8")

@@ -91,6 +91,13 @@ class TestAgent(BaseAgent):
         if profile.name == "python":
             test_name = f"test_{name}.{ext}"
         elif profile.name == "java":
+            # Strip src/main/ prefix if present — test_root ("src/test") will be prepended
+            # by write_test_file via the RepositoryManager.
+            # Keep the sub-path (e.g. "java/com/example") so package structure is preserved.
+            if directory.startswith("src/main/"):
+                directory = directory[len("src/main/"):]
+            elif directory == "src/main":
+                directory = ""
             test_name = f"{name}Test.{ext}"
         elif profile.name == "go":
             test_name = f"{name}_test.{ext}"
