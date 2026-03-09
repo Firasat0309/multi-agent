@@ -292,6 +292,15 @@ class Pipeline:
                 "for production workloads."
             )
 
+        # Memory stores for fresh generation start empty but are populated
+        # incrementally as files are generated and indexed.  Even within a
+        # single run the dep_store lets later phases (module review, arch
+        # review) know transitive impact without a full filesystem rescan.
+        run_dep_store = DependencyGraphStore(self.settings.workspace_dir)
+        run_embedding_store = EmbeddingStore(
+            persist_dir=self.settings.memory.chroma_persist_dir
+        )
+
         agent_manager = AgentManager(
             settings=self.settings,
             llm_client=self.llm,
@@ -301,6 +310,8 @@ class Pipeline:
             sandbox_manager=sandbox_manager,
             build_sandbox_id=build_sandbox_id,
             test_sandbox_id=test_sandbox_id,
+            dep_store=run_dep_store,
+            embedding_store=run_embedding_store,
         )
 
         try:
@@ -532,6 +543,28 @@ class Pipeline:
         # Scan existing files into the repo index
         repo_manager.scan_existing_repo()
 
+        # ── Load persisted memory stores ──────────────────────────────
+        # Stores are loaded immediately after scanning so the dependency graph
+        # and vector index built from previous runs (or the initial generation
+        # run) are available to the change planner, task builder, and all agents.
+        dep_store = DependencyGraphStore(self.settings.workspace_dir)
+        embedding_store = EmbeddingStore(
+            persist_dir=self.settings.memory.chroma_persist_dir
+        )
+
+        # Sync the in-memory graph from the freshly scanned repo index so the
+        # graph always reflects the current state on disk, not just prior runs.
+        repo_index = repo_manager.get_repo_index()
+        for file_info in repo_index.files:
+            for imp in file_info.imports:
+                dep_store.add_dependency(file_info.path, imp)
+        dep_store.save()
+        logger.info(
+            "Memory stores loaded: dep_graph=%d nodes, chroma_dir=%s",
+            len(dep_store.get_graph().nodes()),
+            self.settings.memory.chroma_persist_dir,
+        )
+
         # Build a minimal blueprint from the analysis (for context builder compat)
         from core.models import FileBlueprint
         blueprint = RepositoryBlueprint(
@@ -598,7 +631,7 @@ class Pipeline:
             self._live.set_phase("Task Planning", "running")
         logger.info("[Phase 3] Building modification task graph...")
 
-        mod_builder = ModificationTaskGraphBuilder()
+        mod_builder = ModificationTaskGraphBuilder(dep_store=dep_store)
         task_graph = mod_builder.build_from_change_plan(change_plan, blueprint)
 
         logger.info("Modification task graph: %d tasks", len(task_graph.tasks))
@@ -662,6 +695,8 @@ class Pipeline:
             sandbox_manager=sandbox_manager,
             build_sandbox_id=build_sandbox_id,
             test_sandbox_id=test_sandbox_id,
+            dep_store=dep_store,
+            embedding_store=embedding_store,
         )
 
         try:

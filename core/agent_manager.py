@@ -32,6 +32,8 @@ from tools.terminal_tools import TerminalTools
 
 if TYPE_CHECKING:
     from core.live_console import LiveConsole
+    from memory.dependency_graph import DependencyGraphStore
+    from memory.embedding_store import EmbeddingStore
     from sandbox.sandbox_runner import SandboxManager
 
 logger = logging.getLogger(__name__)
@@ -64,6 +66,8 @@ class AgentManager:
         sandbox_manager: SandboxManager | None = None,
         build_sandbox_id: str | None = None,
         test_sandbox_id: str | None = None,
+        dep_store: DependencyGraphStore | None = None,
+        embedding_store: EmbeddingStore | None = None,
     ) -> None:
         self.settings = settings
         self.llm = llm_client
@@ -71,6 +75,8 @@ class AgentManager:
         self.blueprint = blueprint
         self._live = live_console
         self._lang = detect_language_from_blueprint(blueprint.tech_stack)
+        self._dep_store = dep_store
+        self._embedding_store = embedding_store
 
         # Two-tier terminal tools: build (network-capable) and test (isolated).
         # TestAgent gets the test terminal; all other agents that need a
@@ -191,6 +197,8 @@ class AgentManager:
                 workspace_dir=self.repo.workspace,
                 blueprint=self.blueprint,
                 repo_index=self.repo.get_repo_index(),
+                dep_store=self._dep_store,
+                embedding_store=self._embedding_store,
             )
             context = context_builder.build(task)
 
@@ -415,6 +423,8 @@ class AgentManager:
             workspace_dir=self.repo.workspace,
             blueprint=self.blueprint,
             repo_index=self.repo.get_repo_index(),
+            dep_store=self._dep_store,
+            embedding_store=self._embedding_store,
         )
         context = context_builder.build(task)
 

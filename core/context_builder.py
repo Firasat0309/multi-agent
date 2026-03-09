@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.ast_extractor import ASTExtractor
 from core.language import detect_language_from_blueprint
@@ -18,12 +18,18 @@ from core.models import (
     ChangePlan,
 )
 
+if TYPE_CHECKING:
+    from memory.dependency_graph import DependencyGraphStore
+    from memory.embedding_store import EmbeddingStore
+
 logger = logging.getLogger(__name__)
 
 # Hard cap on files included in wide-scope reviews to avoid context overflow.
 _MAX_REVIEW_FILES = 20
 # Hard cap on total characters across all related files sent to the LLM.
 _MAX_CONTEXT_CHARS = 120_000
+# Max semantic hits to include from vector search per task.
+_MAX_SEMANTIC_HITS = 3
 
 # Shared extractor instance (stateless aside from cache)
 _ast_extractor = ASTExtractor()
@@ -37,16 +43,24 @@ class ContextBuilder:
         workspace_dir: Path,
         blueprint: RepositoryBlueprint,
         repo_index: RepositoryIndex,
+        dep_store: DependencyGraphStore | None = None,
+        embedding_store: EmbeddingStore | None = None,
     ) -> None:
         self.workspace = workspace_dir
         self.blueprint = blueprint
         self.repo_index = repo_index
+        self._dep_store = dep_store
+        self._embedding_store = embedding_store
 
     def build(self, task: Task) -> AgentContext:
         """Build context for a specific task."""
         file_bp = self._find_blueprint(task.file)
         related = self._collect_related_files(task, file_bp)
         dep_info = self._build_dependency_info(task.file)
+
+        # Augment related files with semantically similar code via vector search.
+        # This finds files that are conceptually related even if not explicitly imported.
+        self._enrich_with_semantic_hits(task, related)
 
         return AgentContext(
             task=task,
@@ -165,7 +179,7 @@ class ContextBuilder:
         return None
 
     def _build_dependency_info(self, file_path: str) -> dict[str, Any]:
-        """Get dependency information from the repo index."""
+        """Get dependency information from the repo index, enriched by dep_store."""
         lang = detect_language_from_blueprint(self.blueprint.tech_stack)
         info: dict[str, Any] = {"upstream": [], "downstream": []}
         target = self.repo_index.get_file(file_path)
@@ -186,7 +200,79 @@ class ContextBuilder:
                 if module in imp or f.path in imp:
                     info["upstream"].append(f.path)
 
+        # Enrich with graph-derived impact analysis when dep_store is available.
+        # This adds transitive dependents and heuristic test files that the
+        # simple import scan above cannot derive.
+        if self._dep_store is not None:
+            impact = self._dep_store.get_impact_analysis(file_path)
+            info["transitive_downstream"] = impact.get("transitive_dependents", [])
+            info["affected_tests"] = impact.get("test_files", [])
+            # Fill gaps: if graph knows direct deps that import scan missed, merge them
+            for p in impact.get("direct_dependents", []):
+                if p not in info["downstream"]:
+                    info["downstream"].append(p)
+            for p in impact.get("direct_dependencies", []):
+                if p not in info["upstream"]:
+                    info["upstream"].append(p)
+
         return info
+
+    def _enrich_with_semantic_hits(
+        self, task: Task, related: dict[str, str]
+    ) -> None:
+        """Add semantically similar files via vector search (in-place).
+
+        Uses the task description as the query so the agent receives code
+        that is conceptually related even when no explicit import exists.
+        Respects the overall context budget and never overwrites files already
+        included via blueprint dependencies.
+        """
+        if self._embedding_store is None:
+            return
+
+        total_chars = sum(len(v) for v in related.values())
+        if total_chars >= _MAX_CONTEXT_CHARS:
+            return
+
+        try:
+            hits = self._embedding_store.search(
+                task.description, n_results=_MAX_SEMANTIC_HITS + len(related)
+            )
+        except Exception:
+            logger.debug("Semantic search failed (non-critical)", exc_info=True)
+            return
+
+        lang = detect_language_from_blueprint(self.blueprint.tech_stack)
+        added = 0
+        for hit in hits:
+            if added >= _MAX_SEMANTIC_HITS:
+                break
+            if total_chars >= _MAX_CONTEXT_CHARS:
+                break
+            file_path = hit.get("file", "")
+            if not file_path or file_path in related:
+                continue
+            content = self._read_file(file_path)
+            if content is None:
+                continue
+            # Use AST stub where possible to keep token budget low
+            file_index = self.repo_index.get_file(file_path)
+            checksum = file_index.checksum if file_index else ""
+            stub = _ast_extractor.extract_stub(
+                file_path, content, lang.name, checksum=checksum,
+            )
+            snippet = (
+                f"// Semantic match (similarity search)\n{stub}"
+                if stub is not None
+                else content[:4_000] + ("\n# ... (truncated)" if len(content) > 4_000 else "")
+            )
+            related[file_path] = snippet
+            total_chars += len(snippet)
+            added += 1
+            logger.debug(
+                "Semantic hit for '%s': %s (dist=%.3f)",
+                task.description[:60], file_path, hit.get("distance", 0),
+            )
 
     # ── Modification-aware context building ───────────────────────────
 
@@ -217,6 +303,10 @@ class ContextBuilder:
                 f"Risk notes: {'; '.join(change_plan.risk_notes)}\n\n"
                 f"{arch_summary}"
             )
+
+        # Semantic enrichment for modification tasks — finds code that is
+        # conceptually similar to the modification description.
+        self._enrich_with_semantic_hits(task, related)
 
         return AgentContext(
             task=task,

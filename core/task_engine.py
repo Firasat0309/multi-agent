@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import networkx as nx
 
 from core.models import Task, TaskStatus, TaskType, RepositoryBlueprint, FileBlueprint, ChangePlan, ChangeAction
 from core.state_machine import LifecycleEngine
+
+if TYPE_CHECKING:
+    from memory.dependency_graph import DependencyGraphStore
 
 logger = logging.getLogger(__name__)
 
@@ -428,16 +431,23 @@ class ModificationTaskGraphBuilder:
     """Builds a task DAG for modifying an existing repository.
 
     The modification flow is:
-      1. MODIFY_FILE tasks for each change in the plan (respecting dependencies)
+      1. MODIFY_FILE tasks for each change in the plan (graph-ordered via dep_store)
       2. GENERATE_FILE tasks for brand-new files in the plan
       3. REVIEW_FILE for each modified/new file
       4. FIX_CODE for each review
-      5. GENERATE_TEST for affected test files
+      5. GENERATE_TEST for affected test files (expanded by dep_store impact analysis)
       6. REVIEW_MODULE for cross-file consistency
+
+    When ``dep_store`` is provided the builder:
+    - Reorders modification tasks topologically so dependencies are modified first
+    - Expands affected_tests using graph-derived impact analysis (not just heuristics)
+    - Logs any detected dependency cycles as warnings before building
+    - Stores per-file impact metadata in task.metadata for downstream context use
     """
 
-    def __init__(self) -> None:
+    def __init__(self, dep_store: DependencyGraphStore | None = None) -> None:
         self._next_id = 1
+        self._dep_store = dep_store
 
     def _alloc_id(self) -> int:
         tid = self._next_id
@@ -457,13 +467,17 @@ class ModificationTaskGraphBuilder:
         graph = TaskGraph()
         file_task_map: dict[str, int] = {}  # file_path → last task_id for that file
 
-        # ── Phase 1: Modification tasks (ordered by depends_on) ───────
-        for change in change_plan.changes:
+        # ── Pre-flight: cycle detection & safe ordering ────────────────
+        ordered_changes = self._order_changes(change_plan.changes)
+
+        # ── Phase 1: Modification tasks (graph-safe order) ────────────
+        for change in ordered_changes:
             deps = [
                 file_task_map[d]
                 for d in change.depends_on
                 if d in file_task_map
             ]
+            impact_meta = self._get_impact_meta(change.file)
             task = Task(
                 task_id=self._alloc_id(),
                 task_type=TaskType.MODIFY_FILE,
@@ -475,6 +489,7 @@ class ModificationTaskGraphBuilder:
                     "change_description": change.description,
                     "target_function": change.function,
                     "target_class": change.class_name,
+                    **impact_meta,
                 },
             )
             graph.add_task(task)
@@ -525,7 +540,10 @@ class ModificationTaskGraphBuilder:
             fix_task_ids.append(fix_task.task_id)
 
         # ── Phase 3: Tests for affected files ─────────────────────────
-        test_targets = set(change_plan.affected_tests) | set(file_task_map.keys())
+        # Merge plan's explicit test list with graph-derived impacted tests.
+        test_targets = self._expand_test_targets(
+            change_plan.affected_tests, list(file_task_map.keys())
+        )
         for file_path in test_targets:
             task = Task(
                 task_id=self._alloc_id(),
@@ -553,9 +571,97 @@ class ModificationTaskGraphBuilder:
         logger.info(
             "Built modification task graph: %d tasks (%d modify, %d new, %d review, %d test)",
             len(graph.tasks),
-            sum(1 for c in change_plan.changes),
+            len(ordered_changes),
             len(change_plan.new_files),
             len(review_task_map),
             len(test_targets),
         )
         return graph
+
+    def _order_changes(self, changes: list[ChangeAction]) -> list[ChangeAction]:
+        """Return changes in safe modification order using the dependency graph.
+
+        When dep_store is available:
+          1. Detect and warn about cycles in the affected subgraph.
+          2. Use get_modification_order() to topologically sort the target files.
+          3. Map back to the original ChangeAction objects.
+
+        Falls back to original order if dep_store is absent or graph is sparse.
+        """
+        if self._dep_store is None or not changes:
+            return changes
+
+        file_paths = [c.file for c in changes]
+
+        # Warn about cycles before they cause silent ordering problems
+        cycles = self._dep_store.detect_cycles()
+        affected_files = set(file_paths)
+        affecting_cycles = [
+            cycle for cycle in cycles
+            if any(f in affected_files for f in cycle)
+        ]
+        if affecting_cycles:
+            logger.warning(
+                "Dependency cycles detected involving modification targets: %s",
+                affecting_cycles,
+            )
+
+        ordered_paths = self._dep_store.get_modification_order(file_paths)
+
+        # Map back to ChangeAction, preserving duplicates (multiple changes per file)
+        path_to_changes: dict[str, list[ChangeAction]] = {}
+        for change in changes:
+            path_to_changes.setdefault(change.file, []).append(change)
+
+        result: list[ChangeAction] = []
+        seen: set[str] = set()
+        for path in ordered_paths:
+            if path not in seen and path in path_to_changes:
+                result.extend(path_to_changes[path])
+                seen.add(path)
+        # Append any changes for files not in the graph (new files, etc.)
+        for change in changes:
+            if change.file not in seen:
+                result.append(change)
+                seen.add(change.file)
+
+        if result != changes:
+            original = [c.file for c in changes]
+            reordered = [c.file for c in result]
+            logger.info(
+                "Modification order resequenced by dependency graph: %s → %s",
+                original, reordered,
+            )
+
+        return result
+
+    def _get_impact_meta(self, file_path: str) -> dict[str, Any]:
+        """Return impact analysis metadata for a file to embed in task.metadata."""
+        if self._dep_store is None:
+            return {}
+        impact = self._dep_store.get_impact_analysis(file_path)
+        return {
+            "impact_direct_dependents": impact.get("direct_dependents", []),
+            "impact_transitive_dependents": impact.get("transitive_dependents", []),
+            "impact_affected_tests": impact.get("test_files", []),
+        }
+
+    def _expand_test_targets(
+        self, plan_tests: list[str], changed_files: list[str]
+    ) -> set[str]:
+        """Merge plan test list with graph-derived impacted test files."""
+        targets: set[str] = set(plan_tests) | set(changed_files)
+
+        if self._dep_store is None:
+            return targets
+
+        for file_path in changed_files:
+            impact = self._dep_store.get_impact_analysis(file_path)
+            graph_tests = impact.get("test_files", [])
+            if graph_tests:
+                logger.debug(
+                    "Graph impact: %s affects tests %s", file_path, graph_tests
+                )
+            targets.update(graph_tests)
+
+        return targets
