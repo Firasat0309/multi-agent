@@ -42,9 +42,9 @@ class RepositoryManager:
         self.workspace.mkdir(parents=True, exist_ok=True)
         # Only create explicit src/test dirs when the language uses dedicated roots
         if self._lang_profile.source_root:
-            self.src_dir.mkdir(exist_ok=True)
+            self.src_dir.mkdir(parents=True, exist_ok=True)
         if self._lang_profile.test_root:
-            self.test_dir.mkdir(exist_ok=True)
+            self.test_dir.mkdir(parents=True, exist_ok=True)
         self.deploy_dir.mkdir(exist_ok=True)
         self.docs_dir.mkdir(exist_ok=True)
 
