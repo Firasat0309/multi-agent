@@ -128,29 +128,33 @@ class ReviewerAgent(BaseAgent):
         return self._parse_review(data, ReviewLevel.ARCHITECTURE)
 
     def _parse_review(self, data: dict[str, Any], level: ReviewLevel) -> ReviewResult:
+        from core.llm_schema import validate_review_response
+
+        # Validate and normalise — catches wrong key names, missing fields, bad types
+        validated = validate_review_response(data)
+
         if not data:
-            # LLM failed to return valid JSON — treat as a passing review with a note
             return ReviewResult(
                 level=level,
                 passed=True,
                 findings=[],
                 summary="Review skipped: LLM did not return a valid response.",
             )
+
         findings = [
             ReviewFinding(
                 level=level,
-                severity=f.get("severity", "info"),
-                file=f.get("file", ""),
-                line=f.get("line"),
-                message=f.get("message", ""),
-                suggestion=f.get("suggestion", ""),
+                severity=f["severity"],
+                file=f["file"],
+                line=f["line"],
+                message=f["message"],
+                suggestion=f["suggestion"],
             )
-            for f in data.get("findings", [])
-            if isinstance(f, dict)
+            for f in validated["findings"]
         ]
         return ReviewResult(
             level=level,
-            passed=data.get("passed", True),
+            passed=validated["passed"],
             findings=findings,
-            summary=data.get("summary", ""),
+            summary=validated["summary"],
         )

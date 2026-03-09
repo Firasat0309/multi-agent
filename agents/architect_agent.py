@@ -85,8 +85,12 @@ class ArchitectAgent(BaseAgent):
 
     def _parse_blueprint(self, data: dict[str, Any]) -> RepositoryBlueprint:
         from core.language import detect_language_from_blueprint, get_language_profile
-        tech_stack = data.get("tech_stack", {})
-        # Derive the project-level language once so it can fill in any missing per-file fields
+        from core.llm_schema import validate_architecture_response
+
+        # Validate and normalise — catches wrong key names, missing fields, bad types
+        data = validate_architecture_response(data)
+
+        tech_stack = data["tech_stack"]
         project_lang = detect_language_from_blueprint(tech_stack).name
 
         file_blueprints = [
@@ -98,17 +102,17 @@ class ArchitectAgent(BaseAgent):
                 language=self._resolve_file_language(fb.get("language", ""), fb["path"], project_lang),
                 layer=fb.get("layer", ""),
             )
-            for fb in data.get("file_blueprints", [])
+            for fb in data["file_blueprints"]
         ]
 
         return RepositoryBlueprint(
-            name=data.get("name", "generated-project"),
-            description=data.get("description", ""),
-            architecture_style=data.get("architecture_style", "REST"),
-            tech_stack=data.get("tech_stack", {}),
-            folder_structure=data.get("folder_structure", []),
+            name=data["name"],
+            description=data["description"],
+            architecture_style=data["architecture_style"],
+            tech_stack=tech_stack,
+            folder_structure=data["folder_structure"],
             file_blueprints=file_blueprints,
-            architecture_doc=data.get("architecture_doc", ""),
+            architecture_doc=data["architecture_doc"],
         )
 
     def _resolve_file_language(self, llm_lang: str, path: str, project_lang: str) -> str:

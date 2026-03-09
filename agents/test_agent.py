@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from agents.base_agent import BaseAgent
@@ -270,11 +271,21 @@ class TestAgent(BaseAgent):
             cmd_result = await self.terminal.run_command(targeted_cmd)
 
             if cmd_result.exit_code == 0:
+                quality = self._check_test_quality(test_code, profile)
+                quality_note = ""
+                if quality["test_count"] < 2:
+                    quality_note = " (WARNING: only {n} test(s) — consider adding more)".format(
+                        n=quality["test_count"]
+                    )
                 return TaskResult(
                     success=True,
-                    output=f"Tests passing after {attempt + 1} attempt(s)",
+                    output=f"Tests passing after {attempt + 1} attempt(s){quality_note}",
                     files_modified=[test_path],
-                    metrics={**self.get_metrics(), "fix_attempts": attempt},
+                    metrics={
+                        **self.get_metrics(),
+                        "fix_attempts": attempt,
+                        **quality,
+                    },
                 )
 
             error_output = f"{cmd_result.stdout}\n{cmd_result.stderr}".strip()
@@ -376,3 +387,50 @@ class TestAgent(BaseAgent):
         if code.endswith("```"):
             code = code[:-3]
         return code.strip() + "\n"
+
+    # ── Test quality gate ────────────────────────────────────────────────
+
+    # Language-specific regex patterns that match individual test functions/methods
+    _TEST_FUNCTION_PATTERNS: dict[str, re.Pattern[str]] = {
+        "python": re.compile(r"^\s*(?:def|async\s+def)\s+test_\w+", re.MULTILINE),
+        "java": re.compile(r"@Test\b", re.MULTILINE),
+        "go": re.compile(r"^func\s+Test\w+\(", re.MULTILINE),
+        "typescript": re.compile(r"(?:it|test)\s*\(", re.MULTILINE),
+        "rust": re.compile(r"#\[test\]", re.MULTILINE),
+        "csharp": re.compile(r"\[(?:Fact|Test|Theory)\]", re.MULTILINE),
+    }
+
+    # Patterns that indicate a trivial / placeholder assertion
+    _TRIVIAL_ASSERTION = re.compile(
+        r"assert\s+True|assertTrue\s*\(\s*true\s*\)|expect\s*\(\s*true\s*\)",
+        re.IGNORECASE,
+    )
+
+    def _check_test_quality(self, test_code: str, profile: LanguageProfile) -> dict[str, Any]:
+        """Lightweight quality gate — count test functions and flag trivial assertions.
+
+        Returns a metrics dict that gets merged into TaskResult.metrics.
+        """
+        pattern = self._TEST_FUNCTION_PATTERNS.get(profile.name)
+        test_count = len(pattern.findall(test_code)) if pattern else 0
+
+        trivial_count = len(self._TRIVIAL_ASSERTION.findall(test_code))
+        has_assertions = bool(re.search(
+            r"assert|expect|should|assertEquals|assertEqual|assert_eq",
+            test_code, re.IGNORECASE,
+        ))
+
+        if test_count == 0:
+            logger.warning("Quality gate: no test functions detected in generated test")
+        elif trivial_count > 0:
+            logger.warning(
+                "Quality gate: %d trivial assertion(s) (e.g. assert True) detected", trivial_count
+            )
+        elif not has_assertions:
+            logger.warning("Quality gate: no assertions found in test code")
+
+        return {
+            "test_count": test_count,
+            "trivial_assertions": trivial_count,
+            "has_assertions": has_assertions,
+        }

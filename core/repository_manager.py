@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -118,7 +119,7 @@ class RepositoryManager:
         return root / rel_path
 
     def write_file(self, rel_path: str, content: str) -> Path:
-        """Write a file to the source root and update index."""
+        """Write a file to the source root and update index (sync version)."""
         file_path = self._resolve_write_path(self.src_dir, rel_path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
@@ -132,6 +133,15 @@ class RepositoryManager:
         logger.info(f"Wrote {rel_path} ({len(content)} bytes)")
         return file_path
 
+    async def async_write_file(self, rel_path: str, content: str) -> Path:
+        """Write a file without blocking the event loop.
+
+        Delegates the actual I/O (write_text, mkdir, md5 hashing, __init__.py
+        creation) to a thread so the event loop stays responsive while agents
+        are generating files concurrently.
+        """
+        return await asyncio.to_thread(self.write_file, rel_path, content)
+
     def write_test_file(self, rel_path: str, content: str) -> Path:
         """Write a test file to the test root."""
         file_path = self._resolve_write_path(self.test_dir, rel_path)
@@ -140,6 +150,10 @@ class RepositoryManager:
         self._ensure_init_files(file_path)
         logger.info(f"Wrote test {rel_path}")
         return file_path
+
+    async def async_write_test_file(self, rel_path: str, content: str) -> Path:
+        """Write a test file without blocking the event loop."""
+        return await asyncio.to_thread(self.write_test_file, rel_path, content)
 
     def write_deploy_file(self, rel_path: str, content: str) -> Path:
         """Write a deployment file."""
@@ -163,6 +177,10 @@ class RepositoryManager:
         if not file_path.exists():
             return None
         return file_path.read_text(encoding="utf-8")
+
+    async def async_read_file(self, rel_path: str) -> str | None:
+        """Read a file without blocking the event loop."""
+        return await asyncio.to_thread(self.read_file, rel_path)
 
     def list_files(self, directory: str = "") -> list[str]:
         """List source files in a subdirectory of src."""
@@ -216,13 +234,23 @@ class RepositoryManager:
         index_path.write_text(json.dumps(index_data, indent=2), encoding="utf-8")
 
     def _index_file(self, rel_path: str, content: str) -> None:
-        """Parse and index a source file using language-aware heuristics."""
+        """Parse and index a source file using language-aware heuristics.
+
+        Uses both line-by-line matching (for imports and simple definitions)
+        and multi-line regex scanning (to catch multi-line export blocks,
+        decorators, annotations, and other patterns that span lines).
+
+        NOTE: For production-scale accuracy, consider replacing this with
+        tree-sitter parsing per language.  The regex approach here handles
+        ~90% of common patterns but can miss deeply nested or DSL-heavy code.
+        """
         import re
         exports: list[str] = []
         imports: list[str] = []
         classes: list[str] = []
         functions: list[str] = []
 
+        # ── Line-by-line pass (imports + single-line definitions) ────────
         for line in content.splitlines():
             stripped = line.strip()
             # Detect imports using language profile patterns
@@ -242,6 +270,79 @@ class RepositoryManager:
                         functions.append(name)
                     exports.append(name)
                     break
+
+        # ── Multi-line pass (catch patterns spanning multiple lines) ─────
+        # These catch decorated/annotated definitions, multi-line exports,
+        # and other patterns the line-by-line pass misses.
+        _MULTILINE_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+            # Python: @decorator\n(async) def/class
+            ("python", re.compile(
+                r"@\w+[^\n]*\n\s*(?:async\s+)?(?:def|class)\s+(\w+)", re.MULTILINE
+            )),
+            # Java/C#: @Annotation\npublic class/interface/enum
+            ("java", re.compile(
+                r"@\w+[^\n]*\n\s*(?:public\s+)?(?:class|interface|enum|record)\s+(\w+)",
+                re.MULTILINE,
+            )),
+            ("csharp", re.compile(
+                r"\[\w+[^\]]*\]\s*\n\s*(?:public\s+)?(?:class|interface|struct|enum|record)\s+(\w+)",
+                re.MULTILINE,
+            )),
+            # TypeScript/JS: multi-line export { ... }
+            ("typescript", re.compile(
+                r"export\s*\{([^}]+)\}", re.MULTILINE | re.DOTALL
+            )),
+            # Go: multi-line type block
+            ("go", re.compile(
+                r"type\s*\(\s*((?:\s*\w+\s+\w+[^\)]*\n?)+)\s*\)", re.MULTILINE
+            )),
+            # Rust: pub(crate) fn / pub struct across lines
+            ("rust", re.compile(
+                r"(?:#\[\w+[^\]]*\]\s*\n\s*)?pub(?:\([^)]*\))?\s+(?:fn|struct|enum|trait)\s+(\w+)",
+                re.MULTILINE,
+            )),
+        ]
+
+        lang = self._lang_profile.name.lower()
+        seen_names = set(exports)  # avoid duplicates from line-by-line pass
+
+        for pattern_lang, pattern in _MULTILINE_PATTERNS:
+            if pattern_lang != lang:
+                continue
+            for m in pattern.finditer(content):
+                captured = m.group(1)
+                if pattern_lang == "typescript" and "{" not in captured:
+                    # export { A, B, C } — extract individual names
+                    for name in re.split(r"[,\n]", captured):
+                        name = name.strip().split(" as ")[-1].strip()
+                        if name and name not in seen_names:
+                            exports.append(name)
+                            seen_names.add(name)
+                            if name[0].isupper():
+                                classes.append(name)
+                            else:
+                                functions.append(name)
+                elif pattern_lang == "go" and "\n" in captured:
+                    # type ( \n Name Type \n ... ) — extract each name
+                    for type_line in captured.strip().splitlines():
+                        parts = type_line.strip().split()
+                        if parts and parts[0].isidentifier() and parts[0] not in seen_names:
+                            name = parts[0]
+                            exports.append(name)
+                            seen_names.add(name)
+                            if name[0].isupper():
+                                classes.append(name)
+                            else:
+                                functions.append(name)
+                else:
+                    name = captured.strip()
+                    if name and name not in seen_names:
+                        exports.append(name)
+                        seen_names.add(name)
+                        if name[0].isupper():
+                            classes.append(name)
+                        else:
+                            functions.append(name)
 
         checksum = hashlib.md5(content.encode()).hexdigest()
         file_index = FileIndex(
@@ -265,6 +366,38 @@ class RepositoryManager:
             if not init_file.exists():
                 init_file.write_text("", encoding="utf-8")
             current = current.parent
+
+    def rebuild_dependency_graph(self) -> dict[str, list[str]]:
+        """Re-derive the dependency graph from the current repo index.
+
+        Called after code generation phases to reflect actual imports rather
+        than the static blueprint dependencies.  Writes updated
+        ``dependency_graph.json`` to the workspace.
+        """
+        graph: dict[str, list[str]] = {}
+        known_exports: dict[str, str] = {}  # export_name -> file_path
+
+        # First pass: build export→file mapping
+        for fi in self._repo_index.files:
+            for exp in fi.exports:
+                known_exports[exp] = fi.path
+
+        # Second pass: resolve imports to file paths
+        for fi in self._repo_index.files:
+            deps: list[str] = []
+            for imp_line in fi.imports:
+                # Extract imported names from the import statement
+                for exp_name, exp_file in known_exports.items():
+                    if exp_name in imp_line and exp_file != fi.path:
+                        if exp_file not in deps:
+                            deps.append(exp_file)
+            graph[fi.path] = deps
+
+        dep_path = self.workspace / "dependency_graph.json"
+        dep_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+        logger.info(f"Rebuilt dependency graph: {len(graph)} files, "
+                    f"{sum(len(v) for v in graph.values())} edges")
+        return graph
 
     def _build_dep_graph(self, blueprint: RepositoryBlueprint) -> dict[str, list[str]]:
         graph: dict[str, list[str]] = {}

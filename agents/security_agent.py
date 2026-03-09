@@ -83,23 +83,21 @@ class SecurityAgent(BaseAgent):
 
         data = await self._call_llm_json(prompt)
 
-        if not data:
-            return TaskResult(
-                success=True,
-                output="Security scan skipped: LLM did not return a valid response.",
-                metrics=self.get_metrics(),
-            )
+        # Validate and normalise — catches wrong key names, missing fields
+        from core.llm_schema import validate_security_response
+        validated = validate_security_response(data)
 
-        vulns = data.get("vulnerabilities", []) if isinstance(data.get("vulnerabilities"), list) else []
+        vulns = validated["vulnerabilities"]
         critical = [v for v in vulns if v.get("severity") in ("critical", "high")]
-        passed = data.get("passed", True)
+        passed = validated["passed"]
+        summary = validated["summary"] or "Security scan complete"
         status = "PASSED" if passed else f"NEEDS ATTENTION ({len(critical)} critical/high)"
 
         return TaskResult(
             # Security scan completing is always a successful task execution.
             # Vulnerabilities are findings, not task failures — they don't block the pipeline.
             success=True,
-            output=f"[{status}] {data.get('summary', 'Security scan complete')}",
+            output=f"[{status}] {summary}",
             errors=[v.get("description", "") for v in critical],
             metrics={
                 "total_vulnerabilities": len(vulns),

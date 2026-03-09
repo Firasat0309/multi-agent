@@ -31,6 +31,7 @@ from tools.terminal_tools import TerminalTools
 
 if TYPE_CHECKING:
     from core.live_console import LiveConsole
+    from sandbox.sandbox_runner import SandboxManager
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,8 @@ class AgentManager:
         repo_manager: RepositoryManager,
         blueprint: RepositoryBlueprint,
         live_console: LiveConsole | None = None,
+        sandbox_manager: SandboxManager | None = None,
+        sandbox_id: str | None = None,
     ) -> None:
         self.settings = settings
         self.llm = llm_client
@@ -66,8 +69,13 @@ class AgentManager:
         self._live = live_console
         self._lang = detect_language_from_blueprint(blueprint.tech_stack)
         self.terminal = TerminalTools(
-            repo_manager.workspace, language=self._lang,
+            repo_manager.workspace,
+            language=self._lang,
+            sandbox_manager=sandbox_manager,
+            sandbox_id=sandbox_id,
         )
+        if sandbox_manager and sandbox_id:
+            logger.info("Agents will execute commands inside Docker sandbox %s", sandbox_id)
         self._metrics: dict[str, Any] = {
             "tasks_completed": 0,
             "tasks_failed": 0,
@@ -120,6 +128,12 @@ class AgentManager:
         # Save final repo index
         self.repo.save_repo_index()
 
+        # Rebuild dependency graph from actual imports (not static blueprint)
+        try:
+            self.repo.rebuild_dependency_graph()
+        except Exception as e:
+            logger.warning(f"Dependency graph rebuild failed (non-critical): {e}")
+
         stats = task_graph.get_stats()
         logger.info(f"Execution complete in {elapsed:.1f}s. Stats: {stats}")
 
@@ -146,14 +160,17 @@ class AgentManager:
                 task.metadata["review_errors"] = review_task.result.errors
                 task.metadata["review_output"] = review_task.result.output
 
-        context_builder = ContextBuilder(
-            workspace_dir=self.repo.workspace,
-            blueprint=self.blueprint,
-            repo_index=self.repo.get_repo_index(),
-        )
-        context = context_builder.build(task)
-
         for attempt in range(task.max_retries):
+            # Rebuild context on EVERY attempt so the agent sees the current
+            # state of the filesystem, not a stale snapshot from before the
+            # first (possibly failed) attempt.
+            context_builder = ContextBuilder(
+                workspace_dir=self.repo.workspace,
+                blueprint=self.blueprint,
+                repo_index=self.repo.get_repo_index(),
+            )
+            context = context_builder.build(task)
+
             try:
                 agent = self._create_agent(task.task_type)
                 agent_name = agent.role.value

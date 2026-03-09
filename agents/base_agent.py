@@ -44,13 +44,17 @@ class BaseAgent(ABC):
             "Output only the requested content with no extra commentary."
         )
 
+    # Maximum number of continuation requests when the LLM hits max_tokens.
+    # Prevents infinite loops if the model keeps producing at-limit output.
+    _MAX_CONTINUATIONS = 4
+
     async def _call_llm(
         self,
         user_prompt: str,
         system_override: str | None = None,
         temperature: float | None = None,
     ) -> str:
-        """Call LLM and track metrics. Auto-continues if output is truncated."""
+        """Call LLM and track metrics. Auto-continues in a loop if output is truncated."""
         response = await self.llm.generate(
             system_prompt=system_override or self.system_prompt,
             user_prompt=user_prompt,
@@ -60,11 +64,18 @@ class BaseAgent(ABC):
         self._metrics["tokens_used"] += sum(response.usage.values())
         content = response.content
 
-        # If the model hit the token limit, request one continuation to complete the file
-        if response.stop_reason in ("max_tokens", "length", "MAX_TOKENS"):
+        # Loop continuations until the model stops naturally or we hit the cap.
+        # Previously this was single-shot — large files (e.g. 500+ line Java
+        # classes) could be silently truncated after one continuation.
+        continuation_count = 0
+        while (
+            response.stop_reason in ("max_tokens", "length", "MAX_TOKENS")
+            and continuation_count < self._MAX_CONTINUATIONS
+        ):
+            continuation_count += 1
             logger.warning(
                 f"LLM output truncated (stop_reason={response.stop_reason!r}), "
-                "requesting continuation"
+                f"requesting continuation {continuation_count}/{self._MAX_CONTINUATIONS}"
             )
             continuation_prompt = (
                 f"{user_prompt}\n\n"
@@ -74,14 +85,47 @@ class BaseAgent(ABC):
                 f"Continue EXACTLY from where the output was cut off. "
                 f"Output only the continuation — no preamble, no repetition."
             )
-            cont_response = await self.llm.generate(
+            response = await self.llm.generate(
                 system_prompt=system_override or self.system_prompt,
                 user_prompt=continuation_prompt,
                 temperature=temperature,
             )
             self._metrics["llm_calls"] += 1
-            self._metrics["tokens_used"] += sum(cont_response.usage.values())
-            content = content + cont_response.content
+            self._metrics["tokens_used"] += sum(response.usage.values())
+            continuation = response.content
+
+            # Clean up the join point: strip markdown fences the continuation
+            # may have added at its start (```java\n...) and find the overlap
+            # region to avoid duplicated lines at the stitch boundary.
+            continuation = continuation.strip()
+            if continuation.startswith("```"):
+                first_nl = continuation.find("\n")
+                if first_nl != -1:
+                    continuation = continuation[first_nl + 1:]
+            if continuation.endswith("```"):
+                continuation = continuation[:-3].rstrip()
+
+            # Detect overlapping tail: the LLM sometimes repeats the last
+            # 1-3 lines for context.  Find the longest suffix of `content`
+            # that matches a prefix of `continuation` and skip it.
+            overlap = 0
+            tail_lines = content.rsplit("\n", 5)[-5:]  # last 5 lines
+            for n in range(min(len(tail_lines), 5), 0, -1):
+                tail = "\n".join(tail_lines[-n:])
+                if continuation.startswith(tail):
+                    overlap = len(tail)
+                    break
+            if overlap:
+                continuation = continuation[overlap:]
+                logger.debug(f"Stripped {overlap}-char overlap at continuation boundary")
+
+            content = content + continuation
+
+        if continuation_count >= self._MAX_CONTINUATIONS:
+            logger.warning(
+                f"Hit max continuation limit ({self._MAX_CONTINUATIONS}). "
+                f"Output may still be incomplete ({len(content)} chars total)."
+            )
 
         return content
 

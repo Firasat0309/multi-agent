@@ -111,6 +111,16 @@ class TaskGraphBuilder:
         graph = TaskGraph()
         file_task_map: dict[str, int] = {}
 
+        # Pre-validate: warn about depends_on references to files not in the blueprint
+        known_paths = {fb.path for fb in blueprint.file_blueprints}
+        for fb in blueprint.file_blueprints:
+            for dep_path in fb.depends_on:
+                if dep_path not in known_paths:
+                    logger.warning(
+                        f"Blueprint: {fb.path} depends on '{dep_path}' which is "
+                        f"not in the blueprint — dependency will be ignored"
+                    )
+
         # Phase 1: Generate code files (respecting dependency order)
         for fb in blueprint.file_blueprints:
             deps = [file_task_map[d] for d in fb.depends_on if d in file_task_map]
@@ -155,18 +165,25 @@ class TaskGraphBuilder:
             graph.add_task(fix_task)
             fix_task_map[fb.path] = fix_task.task_id
 
-        # Phase 3: Generate tests (after fix, so tests run against corrected code)
+        # Phase 3: Generate tests
+        # IMPORTANT: Each test task depends on ALL fix tasks, not just its own.
+        # For compiled languages (Java, Go, Rust, C#), the test command compiles
+        # the entire project.  If UserService.java hasn't been generated yet when
+        # UserTest runs `mvn test`, compilation fails and the fix loop wastes all
+        # attempts on errors from files that don't exist yet.
+        # By depending on all fix tasks, we guarantee every source file is written
+        # and review-fixed before ANY test task begins.
+        all_fix_ids = list(fix_task_map.values())
         test_tasks: list[int] = []
         for fb in blueprint.file_blueprints:
             if fb.layer in ("test", "config", "deploy"):
                 continue
-            fix_task_id = fix_task_map[fb.path]
             task = Task(
                 task_id=self._alloc_id(),
                 task_type=TaskType.GENERATE_TEST,
                 file=fb.path,
                 description=f"Generate tests for {fb.path}",
-                dependencies=[fix_task_id],
+                dependencies=all_fix_ids,
             )
             graph.add_task(task)
             test_tasks.append(task.task_id)

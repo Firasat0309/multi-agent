@@ -120,19 +120,27 @@ class FileIndex:
 @dataclass
 class RepositoryIndex:
     files: list[FileIndex] = field(default_factory=list)
+    # O(1) lookup cache — rebuilt lazily when needed
+    _path_index: dict[str, int] = field(default_factory=dict, repr=False)
+
+    def _rebuild_index(self) -> None:
+        self._path_index = {f.path: i for i, f in enumerate(self.files)}
 
     def get_file(self, path: str) -> FileIndex | None:
-        for f in self.files:
-            if f.path == path:
-                return f
-        return None
+        if not self._path_index and self.files:
+            self._rebuild_index()
+        idx = self._path_index.get(path)
+        return self.files[idx] if idx is not None else None
 
     def add_or_update(self, file_index: FileIndex) -> None:
-        for i, f in enumerate(self.files):
-            if f.path == file_index.path:
-                self.files[i] = file_index
-                return
-        self.files.append(file_index)
+        if not self._path_index and self.files:
+            self._rebuild_index()
+        idx = self._path_index.get(file_index.path)
+        if idx is not None:
+            self.files[idx] = file_index
+        else:
+            self._path_index[file_index.path] = len(self.files)
+            self.files.append(file_index)
 
 
 # ── Review Models ─────────────────────────────────────────────────────────────

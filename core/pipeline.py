@@ -213,6 +213,7 @@ class Pipeline:
         # Spin up sandbox when Docker mode is requested
         from config.settings import SandboxType
         sandbox_manager: SandboxManager | None = None
+        sandbox_id: str | None = None
         if self.settings.sandbox.sandbox_type == SandboxType.DOCKER:
             try:
                 sandbox_manager = SandboxManager(self.settings.sandbox)
@@ -220,7 +221,8 @@ class Pipeline:
                     self.settings.workspace_dir,
                     language_name=lang_profile.name,
                 )
-                logger.info(f"Docker sandbox created: {sandbox_info.sandbox_id}")
+                sandbox_id = sandbox_info.sandbox_id
+                logger.info(f"Docker sandbox created: {sandbox_id}")
             except Exception as e:
                 logger.warning(f"Docker sandbox unavailable ({e}), falling back to local")
                 sandbox_manager = None
@@ -231,6 +233,8 @@ class Pipeline:
             repo_manager=repo_manager,
             blueprint=blueprint,
             live_console=self._live,
+            sandbox_manager=sandbox_manager,
+            sandbox_id=sandbox_id,
         )
 
         try:
