@@ -160,15 +160,20 @@ class TerminalTools:
             src_dir = str(self.working_dir / self._lang.source_root)
             env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{env['PYTHONPATH']}"
 
-        # Reduce host state bleed: hint to build tools to work offline where
-        # possible.  This doesn't fully isolate (only Docker sandbox does),
-        # but prevents generated code from silently downloading dependencies
-        # during test runs.
-        env.setdefault("MAVEN_OPTS", "")
-        if "--offline" not in env["MAVEN_OPTS"]:
-            env["MAVEN_OPTS"] = f"{env['MAVEN_OPTS']} -o".strip()
-        env["GOFLAGS"] = env.get("GOFLAGS", "") + " -mod=mod"
-        env["npm_config_prefer_offline"] = "true"
+        # Reduce host state bleed: hint to build tools to prefer local/cached
+        # artifacts where possible.  This doesn't fully isolate (only Docker
+        # sandbox does), but discourages generated code from silently
+        # downloading arbitrary dependencies during test runs.
+        #
+        # NOTE: We intentionally do NOT force Maven offline (-o) or Go
+        # -mod=readonly here — first builds in a fresh workspace legitimately
+        # need to fetch dependencies.  Instead we use "prefer offline" hints
+        # that still allow downloads when the cache is empty.
+        env.setdefault("npm_config_prefer_offline", "true")
+        # Go: default to -mod=mod (allow go.sum updates) but don't duplicate
+        existing_goflags = env.get("GOFLAGS", "")
+        if "-mod=" not in existing_goflags:
+            env["GOFLAGS"] = f"{existing_goflags} -mod=mod".strip()
 
         try:
             proc = await asyncio.create_subprocess_exec(

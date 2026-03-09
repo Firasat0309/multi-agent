@@ -35,17 +35,17 @@ class WriterAgent(BaseAgent):
 
         # README
         readme = await self._generate_readme(blueprint)
-        self.repo.write_doc_file("README.md", readme)
+        await self.repo.async_write_doc_file("README.md", readme)
         files_written.append("docs/README.md")
 
         # API documentation
         api_docs = await self._generate_api_docs(blueprint, context)
-        self.repo.write_doc_file("API.md", api_docs)
+        await self.repo.async_write_doc_file("API.md", api_docs)
         files_written.append("docs/API.md")
 
         # Changelog
         changelog = self._generate_changelog(blueprint)
-        self.repo.write_doc_file("CHANGELOG.md", changelog)
+        await self.repo.async_write_doc_file("CHANGELOG.md", changelog)
         files_written.append("docs/CHANGELOG.md")
 
         return TaskResult(

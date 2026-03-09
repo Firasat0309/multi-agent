@@ -38,18 +38,18 @@ class DeployAgent(BaseAgent):
 
         # Generate Dockerfile
         dockerfile = await self._generate_dockerfile(blueprint)
-        self.repo.write_deploy_file("Dockerfile", dockerfile)
+        await self.repo.async_write_deploy_file("Dockerfile", dockerfile)
         files_written.append("deploy/Dockerfile")
 
         # Generate docker-compose.yml
         compose = await self._generate_docker_compose(blueprint)
-        self.repo.write_deploy_file("docker-compose.yml", compose)
+        await self.repo.async_write_deploy_file("docker-compose.yml", compose)
         files_written.append("deploy/docker-compose.yml")
 
         # Generate Kubernetes manifests
         k8s_manifests = await self._generate_k8s_manifests(blueprint)
         for name, content in k8s_manifests.items():
-            self.repo.write_deploy_file(f"k8s/{name}", content)
+            await self.repo.async_write_deploy_file(f"k8s/{name}", content)
             files_written.append(f"deploy/k8s/{name}")
 
         return TaskResult(

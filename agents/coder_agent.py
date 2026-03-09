@@ -133,7 +133,7 @@ class CoderAgent(BaseAgent):
 
         code = await self._call_llm(prompt, system_override=self._get_source_system_prompt(lang))
         code = self._clean_fences(code, profile.code_fence_name)
-        self.repo.write_file(fb.path, code)
+        await self.repo.async_write_file(fb.path, code)
 
         return TaskResult(
             success=True,
@@ -177,7 +177,7 @@ class CoderAgent(BaseAgent):
 
         content = await self._call_llm(prompt, system_override=self._get_config_system_prompt(fmt))
         content = self._clean_fences(content, "")  # strip any accidental fences
-        self.repo.write_file(fb.path, content)
+        await self.repo.async_write_file(fb.path, content)
 
         return TaskResult(
             success=True,
@@ -192,8 +192,8 @@ class CoderAgent(BaseAgent):
         review_errors: list[str] = context.task.metadata.get("review_errors", [])
         review_output: str = context.task.metadata.get("review_output", "")
 
-        # Read current file content from the repo
-        current_content = self.repo.read_file(file_path) or ""
+        # Read current file content from the repo (non-blocking)
+        current_content = await self.repo.async_read_file(file_path) or ""
 
         # If review passed (no errors) — nothing to fix, skip LLM call
         if not review_errors and "PASSED" in review_output:
@@ -223,7 +223,7 @@ class CoderAgent(BaseAgent):
 
         fixed_code = await self._call_llm(prompt, system_override=self._get_source_system_prompt(lang))
         fixed_code = self._clean_fences(fixed_code, profile.code_fence_name)
-        self.repo.write_file(file_path, fixed_code)
+        await self.repo.async_write_file(file_path, fixed_code)
 
         return TaskResult(
             success=True,

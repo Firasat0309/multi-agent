@@ -85,7 +85,7 @@ class TestAgent(BaseAgent):
 
         test_code = await self._call_llm(prompt, system_override=self._get_system_prompt(lang))
         test_code = self._clean_code(test_code, profile)
-        self.repo.write_test_file(test_path, test_code)
+        await self.repo.async_write_test_file(test_path, test_code)
 
         # Run tests if terminal available (autonomous debug loop)
         if self.terminal:
@@ -262,8 +262,8 @@ class TestAgent(BaseAgent):
         targeted_cmd = self._build_targeted_test_command(test_path, profile)
         logger.info(f"Test command: {targeted_cmd}")
 
-        # Read source code once for context in fix prompts
-        source_for_context = self.repo.read_file(source_path) or ""
+        # Read source code once for context in fix prompts (non-blocking)
+        source_for_context = await self.repo.async_read_file(source_path) or ""
         # Truncate for prompt inclusion (avoid token bloat)
         source_snippet = source_for_context[:4000]
 
@@ -327,9 +327,9 @@ class TestAgent(BaseAgent):
                     fix_prompt, system_override=self._get_system_prompt(lang)
                 )
                 test_code = self._clean_code(test_code, profile)
-                self.repo.write_test_file(test_path, test_code)
+                await self.repo.async_write_test_file(test_path, test_code)
             else:
-                source_content = self.repo.read_file(source_path) or ""
+                source_content = await self.repo.async_read_file(source_path) or ""
                 original_size = len(source_content)
                 logger.info("Fixing source file based on test failure")
 
@@ -363,7 +363,7 @@ class TestAgent(BaseAgent):
                         f"content destruction."
                     )
                 elif source_path:
-                    self.repo.write_file(source_path, fixed_source)
+                    await self.repo.async_write_file(source_path, fixed_source)
                     source_modified = True
                     # Refresh source snippet for next fix iteration
                     source_snippet = fixed_source[:4000]

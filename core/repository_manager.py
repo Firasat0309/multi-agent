@@ -163,6 +163,10 @@ class RepositoryManager:
         logger.info(f"Wrote deploy artifact {rel_path}")
         return file_path
 
+    async def async_write_deploy_file(self, rel_path: str, content: str) -> Path:
+        """Write a deployment file without blocking the event loop."""
+        return await asyncio.to_thread(self.write_deploy_file, rel_path, content)
+
     def write_doc_file(self, rel_path: str, content: str) -> Path:
         """Write a documentation file."""
         file_path = self.docs_dir / rel_path
@@ -170,6 +174,10 @@ class RepositoryManager:
         file_path.write_text(content, encoding="utf-8")
         logger.info(f"Wrote doc {rel_path}")
         return file_path
+
+    async def async_write_doc_file(self, rel_path: str, content: str) -> Path:
+        """Write a documentation file without blocking the event loop."""
+        return await asyncio.to_thread(self.write_doc_file, rel_path, content)
 
     def read_file(self, rel_path: str) -> str | None:
         """Read a file from the source root."""
