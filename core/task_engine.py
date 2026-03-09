@@ -126,6 +126,7 @@ class TaskGraphBuilder:
 
         # Phase 2: File-level reviews
         review_tasks: list[int] = []
+        review_task_map: dict[str, int] = {}
         for fb in blueprint.file_blueprints:
             gen_task_id = file_task_map[fb.path]
             task = Task(
@@ -137,25 +138,41 @@ class TaskGraphBuilder:
             )
             graph.add_task(task)
             review_tasks.append(task.task_id)
+            review_task_map[fb.path] = task.task_id
 
-        # Phase 3: Generate tests
+        # Phase 2.5: Fix code based on review findings
+        fix_task_map: dict[str, int] = {}
+        for fb in blueprint.file_blueprints:
+            review_task_id = review_task_map[fb.path]
+            fix_task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.FIX_CODE,
+                file=fb.path,
+                description=f"Fix {fb.path} based on review",
+                dependencies=[review_task_id],
+                metadata={"review_task_id": review_task_id},
+            )
+            graph.add_task(fix_task)
+            fix_task_map[fb.path] = fix_task.task_id
+
+        # Phase 3: Generate tests (after fix, so tests run against corrected code)
         test_tasks: list[int] = []
         for fb in blueprint.file_blueprints:
             if fb.layer in ("test", "config", "deploy"):
                 continue
-            gen_task_id = file_task_map[fb.path]
+            fix_task_id = fix_task_map[fb.path]
             task = Task(
                 task_id=self._alloc_id(),
                 task_type=TaskType.GENERATE_TEST,
                 file=fb.path,
                 description=f"Generate tests for {fb.path}",
-                dependencies=[gen_task_id],
+                dependencies=[fix_task_id],
             )
             graph.add_task(task)
             test_tasks.append(task.task_id)
 
-        # Phase 4: Security scan (after all code generated)
-        all_gen_ids = list(file_task_map.values())
+        # Phase 4: Security scan (after all fixes applied)
+        all_gen_ids = list(fix_task_map.values())
         sec_task = Task(
             task_id=self._alloc_id(),
             task_type=TaskType.SECURITY_SCAN,

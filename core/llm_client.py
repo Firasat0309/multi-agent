@@ -324,4 +324,17 @@ class LLMClient:
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines)
-        return json.loads(text)
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            logger.warning("LLM returned non-JSON; extracting first JSON object from response")
+            # Try to extract a JSON object from anywhere in the text
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start != -1 and end > start:
+                try:
+                    return json.loads(text[start:end])
+                except json.JSONDecodeError:
+                    pass
+            logger.error(f"Could not parse JSON from LLM response: {text[:200]}")
+            return {}

@@ -72,6 +72,7 @@ class Pipeline:
         """Execute the full generation pipeline."""
         start_time = time.monotonic()
         errors: list[str] = []
+        self._file_handler: logging.FileHandler | None = None
 
         self._start_live()
 
@@ -79,10 +80,33 @@ class Pipeline:
             return await self._run_inner(user_prompt, start_time, errors)
         finally:
             self._stop_live()
+            # Ensure file handler is closed even on early exit / exception
+            if self._file_handler:
+                self._stop_file_logging(self._file_handler)
+                self._file_handler = None
+
+    def _start_file_logging(self, workspace: Path) -> logging.FileHandler:
+        """Attach a file handler so all logs are persisted to workspace/run.log."""
+        workspace.mkdir(parents=True, exist_ok=True)
+        log_path = workspace / "run.log"
+        fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        ))
+        logging.getLogger().addHandler(fh)
+        return fh
+
+    def _stop_file_logging(self, fh: logging.FileHandler) -> None:
+        logging.getLogger().removeHandler(fh)
+        fh.close()
 
     async def _run_inner(
         self, user_prompt: str, start_time: float, errors: list[str]
     ) -> PipelineResult:
+        file_handler = self._start_file_logging(self.settings.workspace_dir)
+        self._file_handler = file_handler
         logger.info("Starting code generation pipeline")
         logger.info(f"Prompt: {user_prompt[:100]}...")
 
@@ -256,6 +280,20 @@ class Pipeline:
         logger.info(f"Stats: {stats}")
         logger.info(f"Elapsed: {elapsed:.1f}s | Workspace: {self.settings.workspace_dir}")
 
+        # Write structured activity report
+        self._write_run_report(
+            workspace=self.settings.workspace_dir,
+            prompt=user_prompt,
+            blueprint=blueprint,
+            task_graph=task_graph,
+            stats=stats,
+            elapsed=elapsed,
+            success=success,
+        )
+
+        self._stop_file_logging(file_handler)
+        self._file_handler = None
+
         return PipelineResult(
             success=success,
             workspace_path=self.settings.workspace_dir,
@@ -265,6 +303,53 @@ class Pipeline:
             errors=errors,
             elapsed_seconds=elapsed,
         )
+
+    def _write_run_report(
+        self,
+        workspace: Path,
+        prompt: str,
+        blueprint: Any,
+        task_graph: TaskGraph,
+        stats: dict[str, int],
+        elapsed: float,
+        success: bool,
+    ) -> None:
+        """Write a structured JSON report of the entire run to workspace/run_report.json."""
+        import json
+        from datetime import datetime, timezone
+
+        task_entries = []
+        for task in task_graph.tasks.values():
+            entry: dict[str, Any] = {
+                "id": task.task_id,
+                "type": task.task_type.value,
+                "file": task.file,
+                "description": task.description,
+                "status": task.status.value,
+                "retries": task.retry_count,
+            }
+            if task.result:
+                entry["output"] = task.result.output
+                entry["errors"] = task.result.errors
+                entry["files_modified"] = task.result.files_modified
+                entry["metrics"] = task.result.metrics
+            task_entries.append(entry)
+
+        report: dict[str, Any] = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "success": success,
+            "elapsed_seconds": round(elapsed, 2),
+            "prompt": prompt,
+            "project": blueprint.name if blueprint else "",
+            "language": blueprint.tech_stack.get("language", "") if blueprint else "",
+            "architecture_style": blueprint.architecture_style if blueprint else "",
+            "task_stats": stats,
+            "tasks": task_entries,
+        }
+
+        report_path = workspace / "run_report.json"
+        report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+        logger.info(f"Activity report written to {report_path}")
 
     def _index_workspace(self, repo_manager: RepositoryManager) -> None:
         """Index all generated files into memory stores."""

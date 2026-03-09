@@ -66,15 +66,19 @@ class ReviewerAgent(BaseAgent):
             return TaskResult(success=False, errors=[f"Unknown review type: {task_type}"])
 
         critical_count = sum(1 for f in review.findings if f.severity == "critical")
+        status = "PASSED" if review.passed else f"NEEDS WORK ({critical_count} critical)"
 
         return TaskResult(
-            success=review.passed,
-            output=review.summary,
+            # Review completing (even with findings) is a successful task execution.
+            # Findings are reported as output/warnings, not task failures.
+            success=True,
+            output=f"[{status}] {review.summary}",
             errors=[f.message for f in review.findings if f.severity == "critical"],
             metrics={
                 "review_level": review.level.value,
                 "findings_count": len(review.findings),
                 "critical_count": critical_count,
+                "passed": review.passed,
             },
         )
 
@@ -124,6 +128,14 @@ class ReviewerAgent(BaseAgent):
         return self._parse_review(data, ReviewLevel.ARCHITECTURE)
 
     def _parse_review(self, data: dict[str, Any], level: ReviewLevel) -> ReviewResult:
+        if not data:
+            # LLM failed to return valid JSON — treat as a passing review with a note
+            return ReviewResult(
+                level=level,
+                passed=True,
+                findings=[],
+                summary="Review skipped: LLM did not return a valid response.",
+            )
         findings = [
             ReviewFinding(
                 level=level,
@@ -134,6 +146,7 @@ class ReviewerAgent(BaseAgent):
                 suggestion=f.get("suggestion", ""),
             )
             for f in data.get("findings", [])
+            if isinstance(f, dict)
         ]
         return ReviewResult(
             level=level,

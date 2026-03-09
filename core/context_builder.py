@@ -68,8 +68,8 @@ class ContextBuilder:
         if file_bp:
             paths_to_read.update(file_bp.depends_on)
 
-        # For review tasks, read the target file
-        if task.task_type in (TaskType.REVIEW_FILE, TaskType.GENERATE_TEST):
+        # For review/fix/test tasks, read the target file
+        if task.task_type in (TaskType.REVIEW_FILE, TaskType.GENERATE_TEST, TaskType.FIX_CODE):
             paths_to_read.add(task.file)
 
         # For module/architecture review, read files up to the cap to avoid
@@ -96,12 +96,18 @@ class ContextBuilder:
         return related
 
     def _read_file(self, rel_path: str) -> str | None:
-        src_path = self.workspace / "src" / rel_path
-        if src_path.exists():
-            try:
-                return src_path.read_text(encoding="utf-8")
-            except Exception:
-                logger.warning(f"Failed to read {src_path}")
+        # Search across all language source roots — order matters: most specific first
+        candidates = [
+            self.workspace / rel_path,              # absolute path (Java: src/main/java/...)
+            self.workspace / "src" / "main" / rel_path,  # Java short path (java/com/...)
+            self.workspace / "src" / rel_path,      # Python / TypeScript
+        ]
+        for path in candidates:
+            if path.exists():
+                try:
+                    return path.read_text(encoding="utf-8")
+                except Exception:
+                    logger.warning(f"Failed to read {path}")
         return None
 
     def _build_dependency_info(self, file_path: str) -> dict[str, Any]:

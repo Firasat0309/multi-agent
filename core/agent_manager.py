@@ -139,6 +139,13 @@ class AgentManager:
             self._live.update_task(task.task_id, task.description, "in_progress")
             self._live.log(f"[cyan]Starting:[/cyan] {task.description}")
 
+        # For FIX_CODE tasks, pull review findings from the review task's result
+        if task.task_type == TaskType.FIX_CODE and "review_task_id" in task.metadata:
+            review_task = task_graph.get_task(task.metadata["review_task_id"])
+            if review_task and review_task.result:
+                task.metadata["review_errors"] = review_task.result.errors
+                task.metadata["review_output"] = review_task.result.output
+
         context_builder = ContextBuilder(
             workspace_dir=self.repo.workspace,
             blueprint=self.blueprint,

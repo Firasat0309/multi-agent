@@ -8,7 +8,7 @@ from typing import Any
 
 from agents.base_agent import BaseAgent
 from core.language import get_language_profile, LanguageProfile
-from core.models import AgentContext, AgentRole, TaskResult
+from core.models import AgentContext, AgentRole, TaskResult, TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +74,10 @@ class CoderAgent(BaseAgent):
         return self._get_source_system_prompt("python")
 
     async def execute(self, context: AgentContext) -> TaskResult:
-        """Generate code or config content for the assigned file."""
+        """Generate or fix code for the assigned file."""
+        if context.task.task_type == TaskType.FIX_CODE:
+            return await self._fix_code(context)
+
         if not context.file_blueprint:
             return TaskResult(
                 success=False,
@@ -140,6 +143,52 @@ class CoderAgent(BaseAgent):
             success=True,
             output=f"Generated config {fb.path} ({len(content)} bytes, {fmt})",
             files_modified=[fb.path],
+            metrics=self.get_metrics(),
+        )
+
+    async def _fix_code(self, context: AgentContext) -> TaskResult:
+        """Fix a file based on review findings."""
+        file_path = context.task.file
+        review_errors: list[str] = context.task.metadata.get("review_errors", [])
+        review_output: str = context.task.metadata.get("review_output", "")
+
+        # Read current file content from the repo
+        current_content = self.repo.read_file(file_path) or ""
+
+        # If review passed (no errors) — nothing to fix, skip LLM call
+        if not review_errors and "PASSED" in review_output:
+            logger.info(f"Skipping fix for {file_path} — review passed")
+            return TaskResult(
+                success=True,
+                output=f"No fixes needed for {file_path} (review passed)",
+                files_modified=[],
+                metrics=self.get_metrics(),
+            )
+
+        fb = context.file_blueprint
+        lang = (fb.language if fb else None) or context.blueprint.tech_stack.get("language", "python")
+        profile = get_language_profile(lang)
+        logger.info(f"Fixing {file_path} based on {len(review_errors)} review issue(s)")
+
+        issues_text = "\n".join(f"- {e}" for e in review_errors) if review_errors else review_output
+
+        prompt = (
+            f"{self._format_context(context)}\n\n"
+            f"The following file has review issues that must be fixed:\n\n"
+            f"File: {file_path}\n\n"
+            f"Current content:\n```{profile.code_fence_name}\n{current_content}\n```\n\n"
+            f"Review findings to fix:\n{issues_text}\n\n"
+            f"Output the complete corrected file. Output only the code, nothing else."
+        )
+
+        fixed_code = await self._call_llm(prompt, system_override=self._get_source_system_prompt(lang))
+        fixed_code = self._clean_fences(fixed_code, profile.code_fence_name)
+        self.repo.write_file(file_path, fixed_code)
+
+        return TaskResult(
+            success=True,
+            output=f"Fixed {file_path} ({len(review_errors)} issue(s) addressed)",
+            files_modified=[file_path],
             metrics=self.get_metrics(),
         )
 
