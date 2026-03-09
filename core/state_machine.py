@@ -1,0 +1,388 @@
+"""Event-sourced state machine for per-file lifecycle management.
+
+Replaces the static, pre-baked FIX_CODE tasks in the DAG with a dynamic
+state machine that routes files through Generate → Review → Fix → Test
+cycles driven by actual outcomes (review findings, test results).
+
+Architecture:
+  - Each source file gets a ``FileLifecycle`` instance (its own state machine)
+  - ``LifecycleEngine`` orchestrates all file lifecycles + inter-file deps
+  - Transitions are driven by ``EventType`` values emitted by agents
+  - An append-only event log provides full auditability and replay
+  - ``max_visits`` guards prevent infinite loops
+
+The networkx DAG is still used for:
+  - Inter-file dependency ordering (file A depends on file B)
+  - Global-phase ordering (security scan, module review, deploy, docs)
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+logger = logging.getLogger(__name__)
+
+
+# ── Enums ───────────────────────────────────────────────────────────────
+
+class FilePhase(Enum):
+    """Lifecycle phase of a single source file."""
+
+    PENDING = "pending"           # waiting for dependency files to be generated
+    GENERATING = "generating"     # CoderAgent producing the file
+    REVIEWING = "reviewing"       # ReviewerAgent checking the file
+    FIXING = "fixing"             # CoderAgent fixing based on review or test feedback
+    TESTING = "testing"           # TestAgent generating/running tests
+    PASSED = "passed"             # terminal: file completed successfully
+    FAILED = "failed"             # terminal: exhausted retries
+
+
+class EventType(Enum):
+    """Events that drive lifecycle transitions."""
+
+    DEPS_MET = "deps_met"
+    CODE_GENERATED = "code_generated"
+    REVIEW_PASSED = "review_passed"
+    REVIEW_FAILED = "review_failed"
+    FIX_APPLIED = "fix_applied"
+    TEST_PASSED = "test_passed"
+    TEST_FAILED = "test_failed"
+    RETRIES_EXHAUSTED = "retries_exhausted"
+
+
+# ── Event (immutable audit record) ──────────────────────────────────────
+
+@dataclass(frozen=True)
+class Event:
+    """An immutable record of something that happened during file processing."""
+
+    event_type: EventType
+    file_path: str
+    timestamp: float
+    phase_before: FilePhase
+    phase_after: FilePhase
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def __repr__(self) -> str:
+        return (
+            f"Event({self.event_type.value}, {self.file_path}, "
+            f"{self.phase_before.value}→{self.phase_after.value})"
+        )
+
+
+# ── Transition table ────────────────────────────────────────────────────
+# Standard transitions: (from_phase, event_type) → to_phase
+# FIX_APPLIED is special — destination depends on fix_trigger (handled in code)
+
+_TRANSITIONS: dict[tuple[FilePhase, EventType], FilePhase] = {
+    (FilePhase.PENDING, EventType.DEPS_MET): FilePhase.GENERATING,
+    (FilePhase.GENERATING, EventType.CODE_GENERATED): FilePhase.REVIEWING,
+    (FilePhase.REVIEWING, EventType.REVIEW_PASSED): FilePhase.TESTING,
+    (FilePhase.REVIEWING, EventType.REVIEW_FAILED): FilePhase.FIXING,
+    (FilePhase.TESTING, EventType.TEST_PASSED): FilePhase.PASSED,
+    (FilePhase.TESTING, EventType.TEST_FAILED): FilePhase.FIXING,
+}
+
+
+# ── Per-file state machine ──────────────────────────────────────────────
+
+class FileLifecycle:
+    """State machine tracking one file through Generate → Review → Fix → Test.
+
+    The machine supports two distinct fix cycles:
+      1. Review fix cycle:  REVIEWING → FIXING → REVIEWING → ...
+      2. Test fix cycle:    TESTING  → FIXING → TESTING  → ...
+
+    Each cycle has its own counter and max-visit guard.  For test fixes,
+    the target alternates between "test" (fix the test file) and "source"
+    (fix the source file under test) — mirroring the proven strategy from
+    the old ``_run_and_fix`` loop.
+    """
+
+    def __init__(
+        self,
+        file_path: str,
+        *,
+        max_review_fixes: int = 2,
+        max_test_fixes: int = 3,
+    ) -> None:
+        self.file_path = file_path
+        self.phase = FilePhase.PENDING
+        self.max_review_fixes = max_review_fixes
+        self.max_test_fixes = max_test_fixes
+
+        # Fix-cycle tracking
+        self.review_fix_count = 0
+        self.test_fix_count = 0
+        self.fix_trigger: str = ""          # "review" | "test"
+        self._test_fix_target: str = "test"  # alternates: "test" ↔ "source"
+
+        # Context carried between phases for downstream agents
+        self.review_findings: list[str] = []
+        self.review_output: str = ""
+        self.test_errors: str = ""
+        self.tests_generated: bool = False
+
+        # Append-only event log
+        self.event_log: list[Event] = []
+
+    # ── Properties ──────────────────────────────────────────────────
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.phase in (FilePhase.PASSED, FilePhase.FAILED)
+
+    @property
+    def test_fix_target(self) -> str:
+        """Whether the next test-fix should target 'test' or 'source'."""
+        return self._test_fix_target
+
+    @property
+    def total_fix_count(self) -> int:
+        return self.review_fix_count + self.test_fix_count
+
+    # ── Core transition logic ───────────────────────────────────────
+
+    def process_event(
+        self,
+        event_type: EventType,
+        data: dict[str, Any] | None = None,
+    ) -> FilePhase:
+        """Process an event and transition to the next phase.
+
+        Returns the new phase.
+        Raises ``ValueError`` for invalid transitions.
+        """
+        data = data or {}
+        old_phase = self.phase
+
+        # RETRIES_EXHAUSTED — universal terminal transition
+        if event_type == EventType.RETRIES_EXHAUSTED:
+            self.phase = FilePhase.FAILED
+            self._record(event_type, old_phase, self.phase, data)
+            return self.phase
+
+        # FIX_APPLIED — destination depends on what triggered the fix
+        if event_type == EventType.FIX_APPLIED and self.phase == FilePhase.FIXING:
+            if self.fix_trigger == "review":
+                self.phase = FilePhase.REVIEWING
+            elif self.fix_trigger == "test":
+                self.phase = FilePhase.TESTING
+                # Alternate fix target for next test-fix cycle
+                self._test_fix_target = (
+                    "source" if self._test_fix_target == "test" else "test"
+                )
+            else:
+                raise ValueError(
+                    f"FIX_APPLIED with unknown fix_trigger={self.fix_trigger!r} "
+                    f"for {self.file_path}"
+                )
+            self._record(event_type, old_phase, self.phase, data)
+            return self.phase
+
+        # Standard transition lookup
+        key = (self.phase, event_type)
+        new_phase = _TRANSITIONS.get(key)
+        if new_phase is None:
+            raise ValueError(
+                f"No transition: {self.phase.value} --[{event_type.value}]--> ??? "
+                f"for {self.file_path}"
+            )
+
+        # ── Cycle-limit guards ──────────────────────────────────────
+        if event_type == EventType.REVIEW_FAILED:
+            self.review_fix_count += 1
+            self.fix_trigger = "review"
+            self.review_findings = data.get("findings", [])
+            self.review_output = data.get("output", "")
+
+            if self.review_fix_count > self.max_review_fixes:
+                # Skip fix, proceed directly to testing
+                new_phase = FilePhase.TESTING
+                self.fix_trigger = ""
+                logger.warning(
+                    "%s: review fix limit (%d) reached — proceeding to testing",
+                    self.file_path, self.max_review_fixes,
+                )
+
+        elif event_type == EventType.TEST_FAILED:
+            self.test_fix_count += 1
+            self.fix_trigger = "test"
+            self.test_errors = data.get("errors", "")
+
+            if self.test_fix_count > self.max_test_fixes:
+                # Accept as-is — tests were generated, just not all passing
+                new_phase = FilePhase.PASSED
+                self.fix_trigger = ""
+                logger.warning(
+                    "%s: test fix limit (%d) reached — marking passed with warnings",
+                    self.file_path, self.max_test_fixes,
+                )
+
+        elif event_type == EventType.REVIEW_PASSED:
+            self.review_findings = []
+            self.review_output = data.get("output", "")
+
+        elif event_type == EventType.TEST_PASSED:
+            self.test_errors = ""
+
+        self.phase = new_phase
+        self._record(event_type, old_phase, self.phase, data)
+        return self.phase
+
+    def _record(
+        self,
+        event_type: EventType,
+        old_phase: FilePhase,
+        new_phase: FilePhase,
+        data: dict[str, Any],
+    ) -> None:
+        event = Event(
+            event_type=event_type,
+            file_path=self.file_path,
+            timestamp=time.monotonic(),
+            phase_before=old_phase,
+            phase_after=new_phase,
+            data=data,
+        )
+        self.event_log.append(event)
+        logger.info(
+            "[%s] %s --[%s]--> %s",
+            self.file_path, old_phase.value, event_type.value, new_phase.value,
+        )
+
+
+# ── Lifecycle engine (orchestrates all files) ───────────────────────────
+
+class LifecycleEngine:
+    """Orchestrates per-file state machines with inter-file dependency awareness.
+
+    Responsibilities:
+      - Manages a ``FileLifecycle`` per source file
+      - Checks inter-file dependencies before allowing PENDING → GENERATING
+      - Provides ``get_actionable_files()`` for the executor to dispatch work
+      - Aggregates event logs across all files for observability
+      - Tracks which files skip testing (config, deploy layers)
+    """
+
+    def __init__(
+        self,
+        file_paths: list[str],
+        file_deps: dict[str, list[str]],
+        *,
+        max_review_fixes: int = 2,
+        max_test_fixes: int = 3,
+    ) -> None:
+        self._lifecycles: dict[str, FileLifecycle] = {}
+        self._deps = file_deps
+        self._skip_testing: set[str] = set()
+
+        for path in file_paths:
+            self._lifecycles[path] = FileLifecycle(
+                path,
+                max_review_fixes=max_review_fixes,
+                max_test_fixes=max_test_fixes,
+            )
+
+    # ── File configuration ──────────────────────────────────────────
+
+    def skip_testing(self, file_path: str) -> None:
+        """Mark a file as not needing tests (config, deploy, test layers)."""
+        self._skip_testing.add(file_path)
+
+    # ── Lifecycle access ────────────────────────────────────────────
+
+    def get_lifecycle(self, file_path: str) -> FileLifecycle:
+        return self._lifecycles[file_path]
+
+    def has_file(self, file_path: str) -> bool:
+        return file_path in self._lifecycles
+
+    # ── Event processing ────────────────────────────────────────────
+
+    def process_event(
+        self,
+        file_path: str,
+        event_type: EventType,
+        data: dict[str, Any] | None = None,
+    ) -> FilePhase:
+        """Process an event for a file and handle auto-skip logic."""
+        lc = self._lifecycles[file_path]
+        new_phase = lc.process_event(event_type, data)
+
+        # If review passed and file should skip testing → auto-pass
+        if new_phase == FilePhase.TESTING and file_path in self._skip_testing:
+            new_phase = lc.process_event(EventType.TEST_PASSED)
+            logger.info("[%s] testing skipped (config/deploy layer)", file_path)
+
+        return new_phase
+
+    # ── Execution queries ───────────────────────────────────────────
+
+    def get_actionable_files(self) -> list[tuple[str, FilePhase]]:
+        """Return files ready for the next action.
+
+        A file is actionable if:
+          - PENDING and all dependency files have passed GENERATING phase
+          - In any active phase (GENERATING, REVIEWING, FIXING, TESTING)
+
+        Terminal files (PASSED, FAILED) are never returned.
+        """
+        actionable: list[tuple[str, FilePhase]] = []
+
+        for path, lc in self._lifecycles.items():
+            if lc.is_terminal:
+                continue
+
+            if lc.phase == FilePhase.PENDING:
+                deps = self._deps.get(path, [])
+                deps_met = all(
+                    dep not in self._lifecycles
+                    or self._lifecycles[dep].phase not in (
+                        FilePhase.PENDING, FilePhase.GENERATING,
+                    )
+                    for dep in deps
+                )
+                if deps_met:
+                    actionable.append((path, lc.phase))
+            else:
+                actionable.append((path, lc.phase))
+
+        return actionable
+
+    def all_terminal(self) -> bool:
+        """True when every file has reached PASSED or FAILED."""
+        return all(lc.is_terminal for lc in self._lifecycles.values())
+
+    # ── Observability ───────────────────────────────────────────────
+
+    def get_stats(self) -> dict[str, int]:
+        """Phase counts across all files."""
+        return dict(Counter(lc.phase.value for lc in self._lifecycles.values()))
+
+    def get_full_event_log(self) -> list[Event]:
+        """Chronologically sorted event log across all files."""
+        all_events: list[Event] = []
+        for lc in self._lifecycles.values():
+            all_events.extend(lc.event_log)
+        all_events.sort(key=lambda e: e.timestamp)
+        return all_events
+
+    def get_results_summary(self) -> dict[str, Any]:
+        """Summary suitable for pipeline reporting."""
+        passed = [p for p, lc in self._lifecycles.items() if lc.phase == FilePhase.PASSED]
+        failed = [p for p, lc in self._lifecycles.items() if lc.phase == FilePhase.FAILED]
+        total_fixes = sum(lc.total_fix_count for lc in self._lifecycles.values())
+        return {
+            "total_files": len(self._lifecycles),
+            "passed": len(passed),
+            "failed": len(failed),
+            "total_fix_cycles": total_fixes,
+            "passed_files": passed,
+            "failed_files": failed,
+        }

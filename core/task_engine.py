@@ -1,14 +1,25 @@
-"""Task DAG engine with topological execution ordering."""
+"""Task DAG engine with topological execution ordering.
+
+Two execution modes:
+  1. **Legacy DAG** — ``TaskGraphBuilder.build_from_blueprint()`` creates a static
+     graph with pre-baked FIX_CODE tasks.  Used when lifecycle mode is disabled.
+  2. **Lifecycle + global DAG** — ``LifecyclePlanBuilder.build()`` creates:
+     - A ``LifecycleEngine`` for per-file Generate→Review→Fix→Test cycles
+     - A slim ``TaskGraph`` for global phases (security, module review, deploy, docs)
+     The per-file lifecycle is event-driven; the global DAG runs after all files
+     reach a terminal state.
+"""
 
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import Iterator
+from typing import Any, Iterator
 
 import networkx as nx
 
 from core.models import Task, TaskStatus, TaskType, RepositoryBlueprint, FileBlueprint
+from core.state_machine import LifecycleEngine
 
 logger = logging.getLogger(__name__)
 
@@ -263,3 +274,151 @@ class TaskGraphBuilder:
 
         logger.info(f"Built task graph with {len(graph.tasks)} tasks")
         return graph
+
+
+class LifecyclePlanBuilder:
+    """Builds a LifecycleEngine + global TaskGraph from a blueprint.
+
+    The per-file lifecycle (Generate → Review → Fix → Test) is handled by
+    the ``LifecycleEngine``.  The global phases (security scan, module review,
+    architecture review, deploy, docs) are still managed as a small DAG.
+    """
+
+    def __init__(self) -> None:
+        self._next_id = 1
+
+    def _alloc_id(self) -> int:
+        tid = self._next_id
+        self._next_id += 1
+        return tid
+
+    def build(
+        self,
+        blueprint: RepositoryBlueprint,
+        *,
+        max_review_fixes: int = 2,
+        max_test_fixes: int = 3,
+    ) -> tuple[LifecycleEngine, TaskGraph]:
+        """Build a lifecycle engine + global task graph.
+
+        Returns:
+            (lifecycle_engine, global_task_graph)
+        """
+        # ── Validate blueprint deps ─────────────────────────────────
+        known_paths = {fb.path for fb in blueprint.file_blueprints}
+        for fb in blueprint.file_blueprints:
+            for dep_path in fb.depends_on:
+                if dep_path not in known_paths:
+                    logger.warning(
+                        "Blueprint: %s depends on '%s' which is not in the "
+                        "blueprint — dependency will be ignored",
+                        fb.path, dep_path,
+                    )
+
+        # ── Build per-file lifecycle engine ──────────────────────────
+        file_paths = [fb.path for fb in blueprint.file_blueprints]
+        file_deps = {
+            fb.path: [d for d in fb.depends_on if d in known_paths]
+            for fb in blueprint.file_blueprints
+        }
+
+        engine = LifecycleEngine(
+            file_paths=file_paths,
+            file_deps=file_deps,
+            max_review_fixes=max_review_fixes,
+            max_test_fixes=max_test_fixes,
+        )
+
+        # Mark config/deploy/test files to skip testing
+        for fb in blueprint.file_blueprints:
+            if fb.layer in ("test", "config", "deploy"):
+                engine.skip_testing(fb.path)
+
+        # ── Build global task graph (runs after all files terminal) ──
+        global_graph = TaskGraph()
+
+        # Sentinel task: marks lifecycle completion (auto-completed by executor)
+        lifecycle_done = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.REVIEW_FILE,  # placeholder type
+            file="*",
+            description="[sentinel] All per-file lifecycles completed",
+            dependencies=[],
+        )
+        global_graph.add_task(lifecycle_done)
+
+        # Security scan
+        sec_task = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.SECURITY_SCAN,
+            file="*",
+            description="Security scan of entire codebase",
+            dependencies=[lifecycle_done.task_id],
+        )
+        global_graph.add_task(sec_task)
+
+        # Module review
+        mod_review = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.REVIEW_MODULE,
+            file="*",
+            description="Module consistency review",
+            dependencies=[lifecycle_done.task_id],
+        )
+        global_graph.add_task(mod_review)
+
+        # Module fix (per-file, depends on module review)
+        mod_fix_ids: list[int] = []
+        for fb in blueprint.file_blueprints:
+            if fb.layer in ("config", "deploy"):
+                continue
+            mod_fix = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.FIX_CODE,
+                file=fb.path,
+                description=f"Fix {fb.path} based on module review",
+                dependencies=[mod_review.task_id],
+                metadata={"review_task_id": mod_review.task_id},
+            )
+            global_graph.add_task(mod_fix)
+            mod_fix_ids.append(mod_fix.task_id)
+
+        # Architecture review
+        arch_review = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.REVIEW_ARCHITECTURE,
+            file="*",
+            description="Architecture review for dependency cycles and layer violations",
+            dependencies=mod_fix_ids + [sec_task.task_id],
+        )
+        global_graph.add_task(arch_review)
+
+        # Deploy
+        deploy_task = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.GENERATE_DEPLOY,
+            file="deploy/",
+            description="Generate Dockerfile and Kubernetes manifests",
+            dependencies=[arch_review.task_id],
+        )
+        global_graph.add_task(deploy_task)
+
+        # Docs
+        docs_task = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.GENERATE_DOCS,
+            file="docs/",
+            description="Generate README, changelog, API docs",
+            dependencies=[arch_review.task_id],
+        )
+        global_graph.add_task(docs_task)
+
+        errors = global_graph.validate()
+        if errors:
+            raise ValueError(f"Global task graph validation failed: {errors}")
+
+        logger.info(
+            "Built lifecycle plan: %d files (lifecycle) + %d global tasks",
+            len(file_paths), len(global_graph.tasks),
+        )
+        return engine, global_graph

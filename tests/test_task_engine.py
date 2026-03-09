@@ -8,7 +8,7 @@ from core.models import (
     TaskStatus,
     TaskType,
 )
-from core.task_engine import TaskGraph, TaskGraphBuilder
+from core.task_engine import TaskGraph, TaskGraphBuilder, LifecyclePlanBuilder
 
 
 class TestTaskGraph:
@@ -138,3 +138,102 @@ class TestTaskGraphBuilder:
 
         order = graph.get_execution_order()
         assert len(order) == len(graph.tasks)
+
+
+class TestLifecyclePlanBuilder:
+    def _make_blueprint(self) -> RepositoryBlueprint:
+        return RepositoryBlueprint(
+            name="test",
+            description="test project",
+            architecture_style="REST",
+            file_blueprints=[
+                FileBlueprint(path="models/User.java", purpose="User entity", layer="model"),
+                FileBlueprint(
+                    path="repos/UserRepo.java",
+                    purpose="User repository",
+                    depends_on=["models/User.java"],
+                    layer="repository",
+                ),
+                FileBlueprint(
+                    path="services/UserService.java",
+                    purpose="User service",
+                    depends_on=["repos/UserRepo.java"],
+                    layer="service",
+                ),
+                FileBlueprint(path="pom.xml", purpose="Maven config", layer="config"),
+            ],
+        )
+
+    def test_build_returns_engine_and_graph(self):
+        builder = LifecyclePlanBuilder()
+        engine, global_graph = builder.build(self._make_blueprint())
+
+        # Engine should have 4 files
+        assert engine.has_file("models/User.java")
+        assert engine.has_file("repos/UserRepo.java")
+        assert engine.has_file("services/UserService.java")
+        assert engine.has_file("pom.xml")
+
+        # Global graph should have: sentinel + security + module review
+        # + module fixes (3, config excluded) + arch review + deploy + docs
+        assert len(global_graph.tasks) > 5
+        assert len(global_graph.validate()) == 0
+
+    def test_config_files_skip_testing(self):
+        builder = LifecyclePlanBuilder()
+        engine, _ = builder.build(self._make_blueprint())
+
+        from core.state_machine import EventType, FilePhase
+
+        # pom.xml should auto-pass testing
+        engine.process_event("pom.xml", EventType.DEPS_MET)
+        engine.process_event("pom.xml", EventType.CODE_GENERATED)
+        engine.process_event("pom.xml", EventType.REVIEW_PASSED)
+
+        lc = engine.get_lifecycle("pom.xml")
+        assert lc.phase == FilePhase.PASSED
+
+    def test_file_deps_respected(self):
+        builder = LifecyclePlanBuilder()
+        engine, _ = builder.build(self._make_blueprint())
+
+        actionable = engine.get_actionable_files()
+        paths = [p for p, _ in actionable]
+
+        # models/User.java and pom.xml have no deps → actionable
+        assert "models/User.java" in paths
+        assert "pom.xml" in paths
+        # services/UserService.java depends on repos → not actionable
+        assert "services/UserService.java" not in paths
+
+    def test_sentinel_task_exists(self):
+        builder = LifecyclePlanBuilder()
+        _, global_graph = builder.build(self._make_blueprint())
+
+        sentinel = global_graph.get_task(1)
+        assert sentinel is not None
+        assert "sentinel" in sentinel.description.lower()
+
+    def test_global_graph_has_all_phases(self):
+        builder = LifecyclePlanBuilder()
+        _, global_graph = builder.build(self._make_blueprint())
+
+        task_types = {t.task_type for t in global_graph.tasks.values()}
+        assert TaskType.SECURITY_SCAN in task_types
+        assert TaskType.REVIEW_MODULE in task_types
+        assert TaskType.REVIEW_ARCHITECTURE in task_types
+        assert TaskType.GENERATE_DEPLOY in task_types
+        assert TaskType.GENERATE_DOCS in task_types
+        assert TaskType.FIX_CODE in task_types  # module fix tasks
+
+    def test_custom_fix_limits(self):
+        builder = LifecyclePlanBuilder()
+        engine, _ = builder.build(
+            self._make_blueprint(),
+            max_review_fixes=5,
+            max_test_fixes=7,
+        )
+
+        lc = engine.get_lifecycle("models/User.java")
+        assert lc.max_review_fixes == 5
+        assert lc.max_test_fixes == 7

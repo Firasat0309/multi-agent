@@ -19,6 +19,7 @@ from core.llm_client import LLMClient, LLMConfigError
 from core.models import RepositoryBlueprint
 from core.observability import record_task_completion, start_metrics_server, setup_tracing
 from core.repository_manager import RepositoryManager
+from core.state_machine import LifecycleEngine
 from core.task_engine import TaskGraph
 from memory.dependency_graph import DependencyGraphStore
 from memory.embedding_store import EmbeddingStore
@@ -169,11 +170,24 @@ class Pipeline:
         # ── Phase 2: Planning ─────────────────────────────────────────────
         if self._live:
             self._live.set_phase("Task Planning", "running")
-        logger.info("[Phase 2] Building task graph...")
+
+        use_lifecycle = self.settings.enable_lifecycle
+        logger.info(
+            "[Phase 2] Building %s...",
+            "lifecycle plan" if use_lifecycle else "task graph",
+        )
         planner = PlannerAgent(llm_client=self.llm, repo_manager=repo_manager)
 
+        lifecycle_engine: LifecycleEngine | None = None
+        task_graph: TaskGraph | None = None
+        global_graph: TaskGraph | None = None
+
         try:
-            task_graph = await planner.create_task_graph(blueprint)
+            if use_lifecycle:
+                lifecycle_engine, global_graph = await planner.create_lifecycle_plan(blueprint)
+                task_graph = global_graph  # used for reporting / live display
+            else:
+                task_graph = await planner.create_task_graph(blueprint)
         except LLMConfigError as e:
             logger.error(str(e))
             if self._live:
@@ -197,7 +211,13 @@ class Pipeline:
                 elapsed_seconds=time.monotonic() - start_time,
             )
 
+        assert task_graph is not None
         logger.info(f"Task graph: {len(task_graph.tasks)} tasks")
+        if use_lifecycle and lifecycle_engine:
+            logger.info(
+                "Lifecycle engine: %d files, global DAG: %d tasks",
+                len(lifecycle_engine.get_stats()), len(task_graph.tasks),
+            )
 
         if self._live:
             self._live.complete_phase("Task Planning")
@@ -280,7 +300,12 @@ class Pipeline:
         )
 
         try:
-            exec_result = await agent_manager.execute_graph(task_graph)
+            if use_lifecycle and lifecycle_engine and global_graph:
+                exec_result = await agent_manager.execute_with_lifecycle(
+                    lifecycle_engine, global_graph,
+                )
+            else:
+                exec_result = await agent_manager.execute_graph(task_graph)
         except Exception as e:
             logger.exception("Task execution failed")
             if self._live:
@@ -317,7 +342,11 @@ class Pipeline:
 
         elapsed = time.monotonic() - start_time
         stats = exec_result.get("stats", {})
-        success = stats.get("failed", 0) == 0 and stats.get("blocked", 0) == 0
+        success = (
+            stats.get("failed", 0) == 0
+            and stats.get("blocked", 0) == 0
+            and stats.get("lifecycle_failed", 0) == 0
+        )
 
         if self._live:
             self._live.complete_phase("Finalize")
