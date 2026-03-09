@@ -29,6 +29,15 @@ dependencies = [
     "click>=8.1.0",
     "aiofiles>=23.2.0",
     "bandit>=1.7.0",
+    # AST extraction — tree-sitter core + language grammars
+    "tree-sitter>=0.23.0",
+    "tree-sitter-java>=0.23.0",
+    # Future language grammars (uncomment as needed):
+    # "tree-sitter-python>=0.23.0",
+    # "tree-sitter-go>=0.23.0",
+    # "tree-sitter-typescript>=0.23.0",
+    # "tree-sitter-rust>=0.23.0",
+    # "tree-sitter-c-sharp>=0.23.0",
 ]
 
 [project.optional-dependencies]

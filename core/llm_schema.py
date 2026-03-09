@@ -1,8 +1,11 @@
-"""Lightweight schema validation for LLM JSON responses.
+"""Pydantic schema validation for LLM JSON responses.
 
 LLMs sometimes return valid JSON with wrong key names, missing fields, or
-incorrect types.  These validators catch those issues early with warnings
-and provide sensible defaults instead of silently producing empty results.
+incorrect types.  A pre-processing step resolves common key aliases, then
+Pydantic models enforce the schema strictly.
+
+**Key principle:** A validation failure is a task failure, not a silent pass.
+The retry loop in agent_manager.py will re-run the task with fresh context.
 """
 
 from __future__ import annotations
@@ -10,174 +13,167 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError
+
 logger = logging.getLogger(__name__)
 
+# Re-export so agents can ``from core.llm_schema import ValidationError``
+__all__ = [
+    "ArchitectureResponse",
+    "FileBlueprintSchema",
+    "ReviewFindingSchema",
+    "ReviewResponse",
+    "SecurityResponse",
+    "SecurityVulnerability",
+    "ValidationError",
+    "validate_architecture_response",
+    "validate_review_response",
+    "validate_security_response",
+]
 
-# ── Common key-name variants that LLMs produce ──────────────────────────────
 
-_ALIASES: dict[str, list[str]] = {
+# ── Top-level key aliases (resolved before Pydantic validation) ──────────────
+
+_TOP_LEVEL_ALIASES: dict[str, list[str]] = {
     "passed": ["pass", "success", "ok", "approved"],
     "findings": ["issues", "problems", "errors", "violations"],
     "vulnerabilities": ["vulns", "vulnerability", "security_issues"],
-    "summary": ["description", "overview", "conclusion"],
-    "suggestion": ["fix", "recommendation", "remediation"],
-    "remediation": ["fix", "suggestion", "recommendation"],
+    "summary": ["overview", "conclusion"],
     "file_blueprints": ["files", "blueprints", "file_list"],
     "architecture_style": ["architecture", "arch_style", "style"],
     "tech_stack": ["stack", "technology", "technologies"],
     "folder_structure": ["folders", "structure", "directories"],
-    "purpose": ["description", "desc", "role"],
-    "depends_on": ["dependencies", "deps"],
 }
 
 
-def _get(data: dict, key: str, expected_type: type, default: Any,
-         context: str = "") -> Any:
-    """Extract *key* from *data* with type checking and alias fallback."""
-    value = data.get(key)
+def _normalize_keys(data: dict[str, Any]) -> dict[str, Any]:
+    """Resolve common LLM key variants at the top level.
 
-    # Try common LLM aliases when primary key is missing
-    if value is None:
-        for alt in _ALIASES.get(key, []):
-            value = data.get(alt)
-            if value is not None:
-                logger.debug("%s: LLM used '%s' instead of '%s'", context, alt, key)
-                break
-
-    if value is None:
-        return default
-
-    if not isinstance(value, expected_type):
-        logger.warning(
-            "%s: key '%s' expected %s, got %s — using default",
-            context, key, expected_type.__name__, type(value).__name__,
-        )
-        return default
-
-    return value
-
-
-# ── Validators ───────────────────────────────────────────────────────────────
-
-def validate_architecture_response(data: dict[str, Any]) -> dict[str, Any]:
-    """Validate and normalise an architecture blueprint JSON response."""
-    ctx = "architect"
+    Field-level aliases inside nested objects (findings, vulnerabilities,
+    file_blueprints) are handled by Pydantic ``validation_alias`` on each
+    model field — no recursive normalisation needed here.
+    """
     if not data:
-        logger.error("%s: LLM returned empty response", ctx)
-        return _empty_architecture()
+        return data
 
-    blueprints_raw = _get(data, "file_blueprints", list, [], ctx)
-    file_blueprints = _validate_file_blueprints(blueprints_raw, ctx)
-
-    if not file_blueprints:
-        logger.warning("%s: No valid file_blueprints in LLM response", ctx)
-
-    return {
-        "name": _get(data, "name", str, "unnamed-project", ctx),
-        "description": _get(data, "description", str, "", ctx),
-        "architecture_style": _get(data, "architecture_style", str, "REST", ctx),
-        "tech_stack": _get(data, "tech_stack", dict, {}, ctx),
-        "folder_structure": _get(data, "folder_structure", list, [], ctx),
-        "file_blueprints": file_blueprints,
-        "architecture_doc": _get(data, "architecture_doc", str, "", ctx),
-    }
+    normalized = dict(data)
+    for canonical, alts in _TOP_LEVEL_ALIASES.items():
+        if canonical not in normalized:
+            for alt in alts:
+                if alt in normalized:
+                    normalized[canonical] = normalized.pop(alt)
+                    logger.debug("LLM used '%s' instead of '%s'", alt, canonical)
+                    break
+    return normalized
 
 
-def validate_review_response(data: dict[str, Any]) -> dict[str, Any]:
-    """Validate and normalise a code review JSON response."""
-    ctx = "reviewer"
-    if not data:
-        return {"passed": True, "summary": "", "findings": []}
-
-    findings_raw = _get(data, "findings", list, [], ctx)
-    findings = _validate_findings(findings_raw, ctx)
-
-    return {
-        "passed": _get(data, "passed", bool, True, ctx),
-        "summary": _get(data, "summary", str, "", ctx),
-        "findings": findings,
-    }
+# ── Pydantic models ──────────────────────────────────────────────────────────
 
 
-def validate_security_response(data: dict[str, Any]) -> dict[str, Any]:
-    """Validate and normalise a security scan JSON response."""
-    ctx = "security"
-    if not data:
-        return {"passed": True, "vulnerabilities": [], "summary": ""}
+class ReviewFindingSchema(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
 
-    vulns_raw = _get(data, "vulnerabilities", list, [], ctx)
-    vulns = _validate_vulns(vulns_raw, ctx)
-
-    return {
-        "passed": _get(data, "passed", bool, True, ctx),
-        "summary": _get(data, "summary", str, "", ctx),
-        "vulnerabilities": vulns,
-    }
-
-
-# ── Item-level validators ────────────────────────────────────────────────────
-
-def _validate_findings(items: list, ctx: str) -> list[dict]:
-    valid = []
-    for i, f in enumerate(items):
-        if not isinstance(f, dict):
-            logger.warning("%s: finding #%d is not a dict, skipping", ctx, i)
-            continue
-        valid.append({
-            "severity": f.get("severity", "info"),
-            "file": f.get("file", ""),
-            "line": f.get("line"),
-            "message": f.get("message", ""),
-            "suggestion": f.get("suggestion", f.get("fix", f.get("remediation", ""))),
-        })
-    return valid
+    severity: str
+    file: str = ""
+    line: int | None = None
+    message: str = Field(
+        default="",
+        validation_alias=AliasChoices("message", "description", "desc", "detail"),
+    )
+    suggestion: str = Field(
+        default="",
+        validation_alias=AliasChoices("suggestion", "fix", "recommendation", "remediation"),
+    )
 
 
-def _validate_vulns(items: list, ctx: str) -> list[dict]:
-    valid = []
-    for i, v in enumerate(items):
-        if not isinstance(v, dict):
-            logger.warning("%s: vulnerability #%d is not a dict, skipping", ctx, i)
-            continue
-        valid.append({
-            "severity": v.get("severity", "medium"),
-            "file": v.get("file", ""),
-            "line": v.get("line"),
-            "type": v.get("type", "unknown"),
-            "description": v.get("description", v.get("message", "")),
-            "remediation": v.get("remediation", v.get("fix", v.get("suggestion", ""))),
-        })
-    return valid
+class ReviewResponse(BaseModel):
+    """Schema for code-review JSON.  ``passed`` has **no default** — the LLM
+    must explicitly state whether the review passed."""
+
+    passed: bool                                   # Required — no silent True
+    summary: str                                   # Required
+    findings: list[ReviewFindingSchema] = []
 
 
-def _validate_file_blueprints(items: list, ctx: str) -> list[dict]:
-    valid = []
-    for i, fb in enumerate(items):
-        if not isinstance(fb, dict):
-            logger.warning("%s: blueprint #%d is not a dict, skipping", ctx, i)
-            continue
-        path = fb.get("path")
-        if not path:
-            logger.warning("%s: blueprint #%d missing 'path', skipping", ctx, i)
-            continue
-        valid.append({
-            "path": path,
-            "purpose": fb.get("purpose", fb.get("description", "")),
-            "depends_on": fb.get("depends_on", fb.get("dependencies", [])),
-            "exports": fb.get("exports", []),
-            "language": fb.get("language", ""),
-            "layer": fb.get("layer", ""),
-        })
-    return valid
+class SecurityVulnerability(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    severity: str
+    file: str = ""
+    line: int | None = None
+    type: str = "unknown"
+    description: str = Field(
+        default="",
+        validation_alias=AliasChoices("description", "message"),
+    )
+    remediation: str = Field(
+        default="",
+        validation_alias=AliasChoices("remediation", "fix", "suggestion", "recommendation"),
+    )
 
 
-def _empty_architecture() -> dict[str, Any]:
-    return {
-        "name": "unnamed-project",
-        "description": "",
-        "architecture_style": "REST",
-        "tech_stack": {},
-        "folder_structure": [],
-        "file_blueprints": [],
-        "architecture_doc": "",
-    }
+class SecurityResponse(BaseModel):
+    """Schema for security-scan JSON.  ``passed`` has **no default**."""
+
+    passed: bool                                   # Required — no silent True
+    summary: str                                   # Required
+    vulnerabilities: list[SecurityVulnerability] = []
+
+
+class FileBlueprintSchema(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    path: str                                      # Required
+    purpose: str = Field(
+        default="",
+        validation_alias=AliasChoices("purpose", "description", "desc", "role"),
+    )
+    depends_on: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("depends_on", "dependencies", "deps"),
+    )
+    exports: list[str] = []
+    language: str = ""
+    layer: str = ""
+
+
+class ArchitectureResponse(BaseModel):
+    name: str = "unnamed-project"
+    description: str = ""
+    architecture_style: str = "REST"
+    tech_stack: dict[str, str] = {}
+    folder_structure: list[str] = []
+    file_blueprints: list[FileBlueprintSchema] = []
+    architecture_doc: str = ""
+
+
+# ── Validators (normalise → Pydantic) ────────────────────────────────────────
+
+
+def validate_architecture_response(data: dict[str, Any]) -> ArchitectureResponse:
+    """Validate and normalise an architecture blueprint JSON response.
+
+    Raises ``pydantic.ValidationError`` on invalid data.
+    """
+    normalized = _normalize_keys(data or {})
+    return ArchitectureResponse.model_validate(normalized)
+
+
+def validate_review_response(data: dict[str, Any]) -> ReviewResponse:
+    """Validate and normalise a code review JSON response.
+
+    Raises ``pydantic.ValidationError`` when required fields (``passed``,
+    ``summary``) are missing — a validation failure is a task failure.
+    """
+    normalized = _normalize_keys(data or {})
+    return ReviewResponse.model_validate(normalized)
+
+
+def validate_security_response(data: dict[str, Any]) -> SecurityResponse:
+    """Validate and normalise a security scan JSON response.
+
+    Raises ``pydantic.ValidationError`` when required fields (``passed``,
+    ``summary``) are missing — a validation failure is a task failure.
+    """
+    normalized = _normalize_keys(data or {})
+    return SecurityResponse.model_validate(normalized)

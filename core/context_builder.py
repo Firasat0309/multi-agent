@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from core.ast_extractor import ASTExtractor
 from core.language import detect_language_from_blueprint
 from core.models import (
     AgentContext,
@@ -22,6 +23,9 @@ logger = logging.getLogger(__name__)
 _MAX_REVIEW_FILES = 20
 # Hard cap on total characters across all related files sent to the LLM.
 _MAX_CONTEXT_CHARS = 120_000
+
+# Shared extractor instance (stateless aside from cache)
+_ast_extractor = ASTExtractor()
 
 
 class ContextBuilder:
@@ -61,33 +65,82 @@ class ContextBuilder:
     def _collect_related_files(
         self, task: Task, file_bp: FileBlueprint | None
     ) -> dict[str, str]:
-        """Read only the files this task depends on, respecting token budget."""
+        """Read only the files this task depends on, respecting token budget.
+
+        For dependency files (not the task's own target), we use AST-extracted
+        stubs when the language is supported by tree-sitter.  This gives the
+        LLM the public API surface (class/method/field signatures) without
+        implementation bodies — typically a 5-10x context reduction.
+
+        The target file itself is always included in full so the agent has
+        complete source when reviewing, testing, or fixing it.
+        """
         related: dict[str, str] = {}
         paths_to_read: set[str] = set()
 
+        # Files that should be included as AST stubs (dependencies)
+        dependency_paths: set[str] = set()
+        # Files that MUST be included in full (target file being worked on)
+        full_source_paths: set[str] = set()
+
         if file_bp:
-            paths_to_read.update(file_bp.depends_on)
+            dependency_paths.update(file_bp.depends_on)
 
-        # For review/fix/test tasks, read the target file
+        # For review/fix/test tasks, read the target file in full
         if task.task_type in (TaskType.REVIEW_FILE, TaskType.GENERATE_TEST, TaskType.FIX_CODE):
-            paths_to_read.add(task.file)
+            full_source_paths.add(task.file)
 
-        # For module/architecture review, read files up to the cap to avoid
-        # overflowing the LLM context window on large repositories.
+        # For module/architecture review, read files up to the cap
         if task.task_type in (TaskType.REVIEW_MODULE, TaskType.REVIEW_ARCHITECTURE):
             for fb in self.blueprint.file_blueprints[:_MAX_REVIEW_FILES]:
-                paths_to_read.add(fb.path)
+                full_source_paths.add(fb.path)
 
+        # Detect language for AST extraction
+        lang = detect_language_from_blueprint(self.blueprint.tech_stack)
+
+        # Process full-source files first (highest priority)
         total_chars = 0
-        for p in paths_to_read:
+        for p in full_source_paths:
+            if total_chars >= _MAX_CONTEXT_CHARS:
+                break
+            content = self._read_file(p)
+            if content is not None:
+                if len(content) > 8_000:
+                    content = content[:8_000] + "\n# ... (truncated)"
+                related[p] = content
+                total_chars += len(content)
+
+        # Process dependency files — use AST stubs where possible
+        for p in dependency_paths:
+            if p in related:
+                continue  # already included as full source
             if total_chars >= _MAX_CONTEXT_CHARS:
                 logger.debug(
                     "Context budget reached (%d chars), skipping remaining files", total_chars
                 )
                 break
             content = self._read_file(p)
-            if content is not None:
-                # Truncate individual files that are excessively large
+            if content is None:
+                continue
+
+            # Try AST stub extraction — much more compact than raw source
+            file_index = self.repo_index.get_file(p)
+            checksum = file_index.checksum if file_index else ""
+            stub = _ast_extractor.extract_stub(
+                p, content, lang.name, checksum=checksum,
+            )
+
+            if stub is not None:
+                # Stub is typically 5-10x smaller than full source
+                related[p] = f"// AST stub (signatures only)\n{stub}"
+                total_chars += len(stub)
+                logger.debug(
+                    "Using AST stub for %s (%d→%d chars, %.0f%% reduction)",
+                    p, len(content), len(stub),
+                    (1 - len(stub) / len(content)) * 100 if content else 0,
+                )
+            else:
+                # Fallback: raw truncation for unsupported languages
                 if len(content) > 8_000:
                     content = content[:8_000] + "\n# ... (truncated)"
                 related[p] = content

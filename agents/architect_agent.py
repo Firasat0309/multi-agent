@@ -87,32 +87,32 @@ class ArchitectAgent(BaseAgent):
         from core.language import detect_language_from_blueprint, get_language_profile
         from core.llm_schema import validate_architecture_response
 
-        # Validate and normalise — catches wrong key names, missing fields, bad types
-        data = validate_architecture_response(data)
+        # Raises pydantic.ValidationError on structurally invalid data.
+        validated = validate_architecture_response(data)
 
-        tech_stack = data["tech_stack"]
+        tech_stack = validated.tech_stack
         project_lang = detect_language_from_blueprint(tech_stack).name
 
         file_blueprints = [
             FileBlueprint(
-                path=fb["path"],
-                purpose=fb["purpose"],
-                depends_on=fb.get("depends_on", []),
-                exports=fb.get("exports", []),
-                language=self._resolve_file_language(fb.get("language", ""), fb["path"], project_lang),
-                layer=fb.get("layer", ""),
+                path=fb.path,
+                purpose=fb.purpose,
+                depends_on=fb.depends_on,
+                exports=fb.exports,
+                language=self._resolve_file_language(fb.language, fb.path, project_lang),
+                layer=fb.layer,
             )
-            for fb in data["file_blueprints"]
+            for fb in validated.file_blueprints
         ]
 
         return RepositoryBlueprint(
-            name=data["name"],
-            description=data["description"],
-            architecture_style=data["architecture_style"],
+            name=validated.name,
+            description=validated.description,
+            architecture_style=validated.architecture_style,
             tech_stack=tech_stack,
-            folder_structure=data["folder_structure"],
+            folder_structure=validated.folder_structure,
             file_blueprints=file_blueprints,
-            architecture_doc=data["architecture_doc"],
+            architecture_doc=validated.architecture_doc,
         )
 
     def _resolve_file_language(self, llm_lang: str, path: str, project_lang: str) -> str:

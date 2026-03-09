@@ -42,9 +42,15 @@ def cli(verbose: bool) -> None:
 @click.option("--workspace", "-w", default="workspace", help="Output directory")
 @click.option("--model", "-m", default="claude-sonnet-4-20250514", help="LLM model")
 @click.option("--provider", "-p", default="anthropic", help="LLM provider")
-@click.option("--sandbox", "-s", default="local", help="Sandbox type (docker/local)")
+@click.option("--sandbox", "-s", default="docker", help="Sandbox type (docker/local)")
 @click.option("--max-agents", default=4, help="Max concurrent agents")
 @click.option("--no-interactive", is_flag=True, default=False, help="Disable live display (plain logs)")
+@click.option(
+    "--allow-host-execution",
+    is_flag=True,
+    default=False,
+    help="Allow running without Docker isolation (NOT recommended for untrusted prompts)",
+)
 def generate(
     prompt: str,
     workspace: str,
@@ -53,6 +59,7 @@ def generate(
     sandbox: str,
     max_agents: int,
     no_interactive: bool,
+    allow_host_execution: bool,
 ) -> None:
     """Generate a backend project from a natural language prompt."""
     try:
@@ -64,6 +71,7 @@ def generate(
             ),
             sandbox=SandboxConfig(sandbox_type=SandboxType(sandbox)),
             max_concurrent_agents=max_agents,
+            allow_host_execution=allow_host_execution or sandbox == "local",
         )
 
         pipeline = Pipeline(settings, interactive=not no_interactive)

@@ -54,16 +54,24 @@ class ReviewerAgent(BaseAgent):
 
     async def execute(self, context: AgentContext) -> TaskResult:
         """Execute the appropriate review level."""
+        from pydantic import ValidationError
+
         task_type = context.task.task_type
 
-        if task_type == TaskType.REVIEW_FILE:
-            review = await self._review_file(context)
-        elif task_type == TaskType.REVIEW_MODULE:
-            review = await self._review_module(context)
-        elif task_type == TaskType.REVIEW_ARCHITECTURE:
-            review = await self._review_architecture(context)
-        else:
-            return TaskResult(success=False, errors=[f"Unknown review type: {task_type}"])
+        try:
+            if task_type == TaskType.REVIEW_FILE:
+                review = await self._review_file(context)
+            elif task_type == TaskType.REVIEW_MODULE:
+                review = await self._review_module(context)
+            elif task_type == TaskType.REVIEW_ARCHITECTURE:
+                review = await self._review_architecture(context)
+            else:
+                return TaskResult(success=False, errors=[f"Unknown review type: {task_type}"])
+        except ValidationError as e:
+            return TaskResult(
+                success=False,
+                errors=[f"LLM output validation failed: {e}"],
+            )
 
         critical_count = sum(1 for f in review.findings if f.severity == "critical")
         status = "PASSED" if review.passed else f"NEEDS WORK ({critical_count} critical)"
@@ -130,31 +138,24 @@ class ReviewerAgent(BaseAgent):
     def _parse_review(self, data: dict[str, Any], level: ReviewLevel) -> ReviewResult:
         from core.llm_schema import validate_review_response
 
-        # Validate and normalise — catches wrong key names, missing fields, bad types
+        # Raises pydantic.ValidationError if required fields are missing —
+        # caught by execute() which returns TaskResult(success=False).
         validated = validate_review_response(data)
-
-        if not data:
-            return ReviewResult(
-                level=level,
-                passed=True,
-                findings=[],
-                summary="Review skipped: LLM did not return a valid response.",
-            )
 
         findings = [
             ReviewFinding(
                 level=level,
-                severity=f["severity"],
-                file=f["file"],
-                line=f["line"],
-                message=f["message"],
-                suggestion=f["suggestion"],
+                severity=f.severity,
+                file=f.file,
+                line=f.line,
+                message=f.message,
+                suggestion=f.suggestion,
             )
-            for f in validated["findings"]
+            for f in validated.findings
         ]
         return ReviewResult(
             level=level,
-            passed=validated["passed"],
+            passed=validated.passed,
             findings=findings,
-            summary=validated["summary"],
+            summary=validated.summary,
         )

@@ -1,17 +1,24 @@
-"""Sandbox runner supporting Docker and local execution modes."""
+"""Sandbox runner supporting Docker and local execution modes.
+
+Two-tier Docker isolation model:
+
+  BUILD sandbox — network enabled (dependency fetching), workspace rw.
+  TEST  sandbox — network disabled, read-only rootfs, tmpfs for /tmp.
+                  Prevents LLM-generated test code from exfiltrating data
+                  or mutating the host outside the workspace.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import tempfile
 import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from config.settings import SandboxConfig, SandboxType
+from config.settings import SandboxConfig, SandboxTier, SandboxType
 from tools.terminal_tools import CommandResult
 
 logger = logging.getLogger(__name__)
@@ -21,6 +28,7 @@ logger = logging.getLogger(__name__)
 class SandboxInfo:
     sandbox_id: str
     sandbox_type: SandboxType
+    tier: SandboxTier
     workspace_path: Path
     status: str = "created"
 
@@ -29,7 +37,12 @@ class SandboxBase(ABC):
     """Abstract sandbox interface."""
 
     @abstractmethod
-    async def create(self, workspace_path: Path, language_name: str = "python") -> SandboxInfo:
+    async def create(
+        self,
+        workspace_path: Path,
+        language_name: str = "python",
+        tier: SandboxTier = SandboxTier.BUILD,
+    ) -> SandboxInfo:
         ...
 
     @abstractmethod
@@ -56,7 +69,12 @@ class DockerSandbox(SandboxBase):
         self.config = config
         self._containers: dict[str, Any] = {}
 
-    async def create(self, workspace_path: Path, language_name: str = "python") -> SandboxInfo:
+    async def create(
+        self,
+        workspace_path: Path,
+        language_name: str = "python",
+        tier: SandboxTier = SandboxTier.BUILD,
+    ) -> SandboxInfo:
         import docker
         client = docker.from_env()
 
@@ -66,27 +84,59 @@ class DockerSandbox(SandboxBase):
             from core.language import get_language_profile
             image = get_language_profile(language_name).docker_image
 
-        container = client.containers.run(
-            image,
-            command="sleep infinity",
-            detach=True,
-            mem_limit=self.config.memory_limit,
-            nano_cpus=int(self.config.cpu_limit * 1e9),
-            network_disabled=not self.config.network_enabled,
-            volumes={
-                str(workspace_path.resolve()): {"bind": "/workspace", "mode": "rw"}
-            },
-            working_dir="/workspace",
-            remove=True,
-        )
+        # ── Tier-specific container configuration ─────────────────────
+        if tier == SandboxTier.TEST:
+            # TEST tier: no network, read-only rootfs, tmpfs for /tmp.
+            # Workspace is mounted rw so the test-agent fix loop can still
+            # write updated files from the host side;  the read-only rootfs
+            # prevents the *generated code* from writing outside /workspace
+            # and /tmp.
+            container = client.containers.run(
+                image,
+                command="sleep infinity",
+                detach=True,
+                mem_limit=self.config.memory_limit,
+                nano_cpus=int(self.config.cpu_limit * 1e9),
+                network_disabled=True,
+                read_only=True,
+                volumes={
+                    str(workspace_path.resolve()): {
+                        "bind": "/workspace",
+                        "mode": "rw",
+                    },
+                },
+                tmpfs={"/tmp": "size=256m"},
+                working_dir="/workspace",
+                remove=True,
+            )
+            logger.info("Created TEST sandbox (network=none, rootfs=ro, tmpfs=/tmp)")
+        else:
+            # BUILD tier: network access allowed (needs to fetch deps).
+            container = client.containers.run(
+                image,
+                command="sleep infinity",
+                detach=True,
+                mem_limit=self.config.memory_limit,
+                nano_cpus=int(self.config.cpu_limit * 1e9),
+                network_disabled=False,
+                volumes={
+                    str(workspace_path.resolve()): {
+                        "bind": "/workspace",
+                        "mode": "rw",
+                    },
+                },
+                working_dir="/workspace",
+                remove=True,
+            )
+            logger.info("Created BUILD sandbox (network=on)")
 
         sandbox_id = container.id[:12]
         self._containers[sandbox_id] = container
-        logger.info(f"Created Docker sandbox {sandbox_id}")
 
         return SandboxInfo(
             sandbox_id=sandbox_id,
             sandbox_type=SandboxType.DOCKER,
+            tier=tier,
             workspace_path=workspace_path,
             status="running",
         )
@@ -151,13 +201,18 @@ class LocalSandbox(SandboxBase):
         self._workspaces: dict[str, Path] = {}
         self._counter = 0
 
-    async def create(self, workspace_path: Path, language_name: str = "python") -> SandboxInfo:
+    async def create(self, workspace_path: Path, language_name: str = "python", tier: SandboxTier = SandboxTier.BUILD) -> SandboxInfo:
         self._counter += 1
-        sandbox_id = f"local-{self._counter}"
+        sandbox_id = f"local-{tier.value}-{self._counter}"
         self._workspaces[sandbox_id] = workspace_path
+        logger.warning(
+            "LocalSandbox provides NO isolation — generated code runs directly "
+            "on the host.  Use Docker sandbox for production."
+        )
         return SandboxInfo(
             sandbox_id=sandbox_id,
             sandbox_type=SandboxType.LOCAL,
+            tier=tier,
             workspace_path=workspace_path,
             status="running",
         )
@@ -212,10 +267,13 @@ class SandboxManager:
         return LocalSandbox()
 
     async def create_sandbox(
-        self, workspace_path: Path, language_name: str = "python"
+        self,
+        workspace_path: Path,
+        language_name: str = "python",
+        tier: SandboxTier = SandboxTier.BUILD,
     ) -> SandboxInfo:
         backend = self._create_sandbox_backend()
-        info = await backend.create(workspace_path, language_name=language_name)
+        info = await backend.create(workspace_path, language_name=language_name, tier=tier)
         self._active[info.sandbox_id] = (backend, info)
         return info
 

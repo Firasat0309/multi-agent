@@ -83,14 +83,22 @@ class SecurityAgent(BaseAgent):
 
         data = await self._call_llm_json(prompt)
 
-        # Validate and normalise — catches wrong key names, missing fields
+        # Validate and normalise — raises ValidationError if required fields
+        # (passed, summary) are missing.
+        from pydantic import ValidationError
         from core.llm_schema import validate_security_response
-        validated = validate_security_response(data)
+        try:
+            validated = validate_security_response(data)
+        except ValidationError as e:
+            return TaskResult(
+                success=False,
+                errors=[f"LLM output validation failed: {e}"],
+            )
 
-        vulns = validated["vulnerabilities"]
-        critical = [v for v in vulns if v.get("severity") in ("critical", "high")]
-        passed = validated["passed"]
-        summary = validated["summary"] or "Security scan complete"
+        vulns = validated.vulnerabilities
+        critical = [v for v in vulns if v.severity in ("critical", "high")]
+        passed = validated.passed
+        summary = validated.summary or "Security scan complete"
         status = "PASSED" if passed else f"NEEDS ATTENTION ({len(critical)} critical/high)"
 
         return TaskResult(
@@ -98,7 +106,7 @@ class SecurityAgent(BaseAgent):
             # Vulnerabilities are findings, not task failures — they don't block the pipeline.
             success=True,
             output=f"[{status}] {summary}",
-            errors=[v.get("description", "") for v in critical],
+            errors=[v.description for v in critical],
             metrics={
                 "total_vulnerabilities": len(vulns),
                 "critical_count": len(critical),

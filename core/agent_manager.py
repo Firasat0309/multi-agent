@@ -60,7 +60,8 @@ class AgentManager:
         blueprint: RepositoryBlueprint,
         live_console: LiveConsole | None = None,
         sandbox_manager: SandboxManager | None = None,
-        sandbox_id: str | None = None,
+        build_sandbox_id: str | None = None,
+        test_sandbox_id: str | None = None,
     ) -> None:
         self.settings = settings
         self.llm = llm_client
@@ -68,14 +69,27 @@ class AgentManager:
         self.blueprint = blueprint
         self._live = live_console
         self._lang = detect_language_from_blueprint(blueprint.tech_stack)
-        self.terminal = TerminalTools(
+
+        # Two-tier terminal tools: build (network-capable) and test (isolated).
+        # TestAgent gets the test terminal; all other agents that need a
+        # terminal (SecurityAgent, etc.) get the build terminal.
+        self.build_terminal = TerminalTools(
             repo_manager.workspace,
             language=self._lang,
             sandbox_manager=sandbox_manager,
-            sandbox_id=sandbox_id,
+            sandbox_id=build_sandbox_id,
         )
-        if sandbox_manager and sandbox_id:
-            logger.info("Agents will execute commands inside Docker sandbox %s", sandbox_id)
+        self.test_terminal = TerminalTools(
+            repo_manager.workspace,
+            language=self._lang,
+            sandbox_manager=sandbox_manager,
+            sandbox_id=test_sandbox_id,
+        )
+        if sandbox_manager and build_sandbox_id:
+            logger.info(
+                "Build commands routed to sandbox %s; test execution to sandbox %s",
+                build_sandbox_id, test_sandbox_id,
+            )
         self._metrics: dict[str, Any] = {
             "tasks_completed": 0,
             "tasks_failed": 0,
@@ -88,12 +102,19 @@ class AgentManager:
         if agent_cls is None:
             raise ValueError(f"No agent registered for task type: {task_type}")
 
-        # Some agents need terminal tools
-        if agent_cls in (TestAgent, SecurityAgent):
+        # TestAgent → test terminal (no-network sandbox for generated tests).
+        # SecurityAgent → build terminal (bandit needs the full env).
+        if agent_cls is TestAgent:
             return agent_cls(
                 llm_client=self.llm,
                 repo_manager=self.repo,
-                terminal=self.terminal,
+                terminal=self.test_terminal,
+            )
+        if agent_cls is SecurityAgent:
+            return agent_cls(
+                llm_client=self.llm,
+                repo_manager=self.repo,
+                terminal=self.build_terminal,
             )
         return agent_cls(llm_client=self.llm, repo_manager=self.repo)
 

@@ -210,22 +210,63 @@ class Pipeline:
             self._live.set_phase("Code Generation & Review", "running")
         logger.info("[Phase 3] Executing tasks...")
 
-        # Spin up sandbox when Docker mode is requested
-        from config.settings import SandboxType
+        # Spin up sandbox(es) when Docker mode is requested.
+        # Two-tier model: BUILD sandbox (network for deps) + TEST sandbox
+        # (no network, read-only rootfs — prevents data exfiltration by
+        # LLM-generated test code).
+        from config.settings import SandboxTier, SandboxType
         sandbox_manager: SandboxManager | None = None
-        sandbox_id: str | None = None
+        build_sandbox_id: str | None = None
+        test_sandbox_id: str | None = None
+
         if self.settings.sandbox.sandbox_type == SandboxType.DOCKER:
             try:
                 sandbox_manager = SandboxManager(self.settings.sandbox)
-                sandbox_info = await sandbox_manager.create_sandbox(
+                build_info = await sandbox_manager.create_sandbox(
                     self.settings.workspace_dir,
                     language_name=lang_profile.name,
+                    tier=SandboxTier.BUILD,
                 )
-                sandbox_id = sandbox_info.sandbox_id
-                logger.info(f"Docker sandbox created: {sandbox_id}")
+                build_sandbox_id = build_info.sandbox_id
+                logger.info("Docker BUILD sandbox created: %s", build_sandbox_id)
+
+                test_info = await sandbox_manager.create_sandbox(
+                    self.settings.workspace_dir,
+                    language_name=lang_profile.name,
+                    tier=SandboxTier.TEST,
+                )
+                test_sandbox_id = test_info.sandbox_id
+                logger.info("Docker TEST sandbox created: %s (network=none)", test_sandbox_id)
             except Exception as e:
-                logger.warning(f"Docker sandbox unavailable ({e}), falling back to local")
-                sandbox_manager = None
+                if self.settings.allow_host_execution:
+                    logger.warning(
+                        "Docker sandbox unavailable (%s), falling back to host "
+                        "execution (--allow-host-execution is set)", e,
+                    )
+                    sandbox_manager = None
+                else:
+                    msg = (
+                        f"Docker sandbox unavailable: {e}.  "
+                        "Either install/start Docker or pass --allow-host-execution "
+                        "to run without isolation (NOT recommended for untrusted prompts)."
+                    )
+                    logger.error(msg)
+                    if self._live:
+                        self._live.fail_phase("Code Generation & Review", msg)
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=self.settings.workspace_dir,
+                        blueprint=blueprint,
+                        errors=[msg],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+        else:
+            # Explicit --sandbox local
+            logger.warning(
+                "Running in LOCAL mode with NO sandbox isolation.  Generated "
+                "code will execute directly on the host.  Use Docker sandbox "
+                "for production workloads."
+            )
 
         agent_manager = AgentManager(
             settings=self.settings,
@@ -234,7 +275,8 @@ class Pipeline:
             blueprint=blueprint,
             live_console=self._live,
             sandbox_manager=sandbox_manager,
-            sandbox_id=sandbox_id,
+            build_sandbox_id=build_sandbox_id,
+            test_sandbox_id=test_sandbox_id,
         )
 
         try:

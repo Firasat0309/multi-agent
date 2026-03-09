@@ -19,6 +19,18 @@ class SandboxType(str, Enum):
     LOCAL = "local"  # For development/testing only
 
 
+class SandboxTier(str, Enum):
+    """Isolation level for Docker sandboxes.
+
+    BUILD — network access allowed (needs to fetch dependencies).
+    TEST  — no network, read-only rootfs, tmpfs for /tmp.  Prevents
+            LLM-generated test code from exfiltrating data or mutating
+            the host.
+    """
+    BUILD = "build"
+    TEST = "test"
+
+
 @dataclass(frozen=True)
 class LLMConfig:
     provider: LLMProvider = LLMProvider.ANTHROPIC
@@ -67,6 +79,7 @@ class Settings:
     review_levels: list[str] = field(
         default_factory=lambda: ["file", "module", "architecture"]
     )
+    allow_host_execution: bool = False  # Must be True to run without Docker
 
     @classmethod
     def from_env(cls) -> Settings:
