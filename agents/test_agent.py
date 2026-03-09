@@ -53,20 +53,37 @@ class TestAgent(BaseAgent):
         profile = get_language_profile(lang)
         logger.info(f"Generating {profile.display_name} tests for {fb.path}")
 
+        # Compute test file path based on language conventions
+        test_path = self._compute_test_path(fb.path, profile)
+
+        # Get the actual source code for explicit inclusion in the prompt
+        source_code = context.related_files.get(fb.path, "")
+
+        # Build language-specific hints (package declaration, framework, etc.)
+        lang_hints = self._build_test_hints(test_path, fb, profile)
+
         formatted = self._format_context(context)
         prompt = (
             f"{formatted}\n\n"
             f"Generate comprehensive {profile.display_name} tests for: {fb.path}\n"
             f"The file's purpose: {fb.purpose}\n"
             f"The file exports: {', '.join(fb.exports)}\n\n"
+        )
+
+        # Explicitly include source code so the LLM knows what to test
+        if source_code:
+            prompt += (
+                f"Here is the actual source code to test:\n"
+                f"```{profile.code_fence_name}\n{source_code}\n```\n\n"
+            )
+
+        prompt += (
+            f"{lang_hints}\n\n"
             f"Generate complete, working test code. Output only the code."
         )
 
         test_code = await self._call_llm(prompt, system_override=self._get_system_prompt(lang))
         test_code = self._clean_code(test_code, profile)
-
-        # Compute test file path based on language conventions
-        test_path = self._compute_test_path(fb.path, profile)
         self.repo.write_test_file(test_path, test_code)
 
         # Run tests if terminal available (autonomous debug loop)
@@ -112,6 +129,87 @@ class TestAgent(BaseAgent):
 
         return f"{directory}/{test_name}" if directory else test_name
 
+    def _build_targeted_test_command(self, test_path: str, profile: LanguageProfile) -> str:
+        """Build a command that runs ONLY the specific test file/class.
+
+        Instead of running all tests (e.g. ``mvn test``, ``pytest``), this
+        targets the individual test so that errors from other test files do not
+        contaminate the output or waste fix attempts.
+        """
+        filename = test_path.split("/")[-1]
+        class_name = filename.rsplit(".", 1)[0] if "." in filename else filename
+
+        # Workspace-relative path (prepend test_root when the language uses one)
+        if profile.test_root and not test_path.startswith(profile.test_root):
+            ws_test_path = f"{profile.test_root}/{test_path}"
+        else:
+            ws_test_path = test_path
+
+        if profile.name == "python":
+            return f"pytest -v --tb=short {ws_test_path}"
+        elif profile.name == "java":
+            # -Dtest targets a specific test class; Maven still compiles everything
+            # but only RUNS the targeted test, keeping error output relevant.
+            return f"mvn test -Dtest={class_name} -DfailIfNoTests=false"
+        elif profile.name == "go":
+            pkg_dir = ws_test_path.rsplit("/", 1)[0] if "/" in ws_test_path else "."
+            return f"go test -v ./{pkg_dir}/"
+        elif profile.name in ("typescript", "ts"):
+            return f"npx jest --verbose {ws_test_path}"
+        elif profile.name == "rust":
+            return f"cargo test {class_name}"
+        elif profile.name in ("csharp", "c#"):
+            return f"dotnet test --filter FullyQualifiedName~{class_name}"
+        else:
+            return profile.test_command
+
+    def _compute_java_package(self, test_path: str) -> str:
+        """Extract Java package declaration from test path.
+
+        E.g. ``java/com/example/service/UserServiceTest.java`` → ``com.example.service``
+        """
+        parts = test_path.replace("\\", "/").split("/")
+        # Strip leading "java/" directory (it's a source-root, not a package)
+        if parts and parts[0] == "java":
+            parts = parts[1:]
+        if parts:
+            parts = parts[:-1]  # remove filename
+        return ".".join(parts) if parts else ""
+
+    def _build_test_hints(self, test_path: str, fb: Any, profile: LanguageProfile) -> str:
+        """Build language-specific hints for test generation quality."""
+        hints = [
+            f"- Test file will be saved as: {test_path}",
+            "- Import the classes/functions from the source file being tested",
+            "- Test both happy paths and error/edge cases",
+            "- Use descriptive test method names",
+        ]
+
+        if profile.name == "java":
+            pkg = self._compute_java_package(test_path)
+            if pkg:
+                hints.insert(0, f"- Start with: package {pkg};")
+            hints.append("- Use JUnit 5 (@Test, @BeforeEach, Assertions.assertEquals, etc.)")
+            hints.append("- Use Mockito for mocking dependencies (@Mock, @InjectMocks, @ExtendWith(MockitoExtension.class))")
+            hints.append("- Import from the correct package matching the source file")
+        elif profile.name == "python":
+            hints.append("- Use pytest assertions (assert x == y) and fixtures")
+            hints.append("- Use unittest.mock (patch, MagicMock) for mocking dependencies")
+        elif profile.name == "go":
+            hints.append("- Use the standard testing package (testing.T)")
+            hints.append("- Test file MUST be in the same package as the source")
+        elif profile.name in ("typescript", "ts"):
+            hints.append("- Use Jest describe/it/expect blocks")
+            hints.append("- Use jest.mock() for mocking dependencies")
+        elif profile.name == "rust":
+            hints.append("- Use #[cfg(test)] mod tests { ... } or separate test file")
+            hints.append("- Use assert_eq!, assert_ne!, assert! macros")
+        elif profile.name in ("csharp", "c#"):
+            hints.append("- Use xUnit or NUnit [Fact]/[Test] attributes")
+            hints.append("- Use Moq for mocking dependencies")
+
+        return "Requirements:\n" + "\n".join(hints)
+
     # Error messages that indicate a build/project configuration issue, not a code bug.
     _BUILD_CONFIG_ERRORS = (
         # Java / Maven / Gradle
@@ -149,16 +247,27 @@ class TestAgent(BaseAgent):
           3 → fix source file (one more pass)
 
         Safeguards:
+          - Runs only the SPECIFIC test file, not the entire suite
           - Build/config errors (no pom.xml etc.) → only fix tests, never touch source
           - Size guard: never replace source with content < 50% of original (prevents destruction)
+          - Error output truncated to 2000 chars to prevent token explosion
         """
         lang = context.file_blueprint.language if context.file_blueprint else "python"
         source_path = context.file_blueprint.path if context.file_blueprint else ""
         last_error = ""
         source_modified = False
 
+        # Build targeted command that runs ONLY this specific test
+        targeted_cmd = self._build_targeted_test_command(test_path, profile)
+        logger.info(f"Test command: {targeted_cmd}")
+
+        # Read source code once for context in fix prompts
+        source_for_context = self.repo.read_file(source_path) or ""
+        # Truncate for prompt inclusion (avoid token bloat)
+        source_snippet = source_for_context[:4000]
+
         for attempt in range(max_attempts):
-            cmd_result = await self.terminal.run_command(profile.test_command)
+            cmd_result = await self.terminal.run_command(targeted_cmd)
 
             if cmd_result.exit_code == 0:
                 return TaskResult(
@@ -190,8 +299,17 @@ class TestAgent(BaseAgent):
                 fix_prompt = (
                     f"The following test file failed:\n\n"
                     f"```{profile.code_fence_name}\n{test_code}\n```\n\n"
+                )
+                # Include source code so the LLM knows what correct behavior looks like
+                if source_snippet:
+                    fix_prompt += (
+                        f"Source code being tested ({source_path}):\n"
+                        f"```{profile.code_fence_name}\n{source_snippet}\n```\n\n"
+                    )
+                fix_prompt += (
                     f"Error output:\n```\n{error_for_prompt}\n```\n\n"
                     f"Fix the test code so it compiles and passes. "
+                    f"The tests should accurately test the source code shown above. "
                     f"Output only the complete corrected test file."
                 )
                 test_code = await self._call_llm(
@@ -236,6 +354,8 @@ class TestAgent(BaseAgent):
                 elif source_path:
                     self.repo.write_file(source_path, fixed_source)
                     source_modified = True
+                    # Refresh source snippet for next fix iteration
+                    source_snippet = fixed_source[:4000]
 
         # Exhausted attempts — still mark success=True so the task is not retried.
         return TaskResult(

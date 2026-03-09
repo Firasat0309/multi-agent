@@ -58,13 +58,19 @@ class TerminalTools:
                 stderr=f"Command not allowed: {base_cmd}",
             )
 
+        # Build environment — include source root in PYTHONPATH so imports resolve
+        env = {**os.environ, "PYTHONPATH": str(self.working_dir)}
+        if self._lang.source_root:
+            src_dir = str(self.working_dir / self._lang.source_root)
+            env["PYTHONPATH"] = f"{src_dir}{os.pathsep}{env['PYTHONPATH']}"
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *parts,
                 cwd=str(self.working_dir),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, "PYTHONPATH": str(self.working_dir)},
+                env=env,
             )
             try:
                 stdout, stderr = await asyncio.wait_for(
