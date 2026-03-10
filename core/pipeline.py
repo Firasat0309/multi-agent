@@ -298,6 +298,9 @@ class Pipeline:
             persist_dir=self.settings.memory.chroma_persist_dir,
             embedding_model=self.settings.memory.embedding_model,
         )
+        # Wire incremental embedding into repo_manager so every write_file()
+        # call indexes the new content immediately instead of only at finalization.
+        repo_manager._embedding_store = run_embedding_store
 
         agent_manager = AgentManager(
             settings=self.settings,
@@ -526,6 +529,9 @@ class Pipeline:
             persist_dir=self.settings.memory.chroma_persist_dir,
             embedding_model=self.settings.memory.embedding_model,
         )
+        # Wire incremental embedding into repo_manager so every write_file()
+        # call during modification indexes the new content immediately.
+        repo_manager._embedding_store = embedding_store
 
         # Sync the in-memory graph from the freshly scanned repo index so the
         # graph always reflects the current state on disk, not just prior runs.

@@ -15,6 +15,11 @@ from core.language import LanguageProfile, detect_language_from_blueprint, PYTHO
 from core.import_validator import ImportValidator
 from core.models import FileIndex, RepositoryBlueprint, RepositoryIndex
 
+# Avoid circular imports: EmbeddingStore is imported lazily in write_file()
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from memory.embedding_store import EmbeddingStore
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,13 +40,18 @@ _ROOT_LEVEL_FILES = {
 class RepositoryManager:
     """Manages the generated repository workspace."""
 
-    def __init__(self, workspace_dir: Path) -> None:
+    def __init__(
+        self,
+        workspace_dir: Path,
+        embedding_store: EmbeddingStore | None = None,
+    ) -> None:
         self.workspace = workspace_dir
         self.deploy_dir = workspace_dir / "deploy"
         self.docs_dir = workspace_dir / "docs"
         self._repo_index = RepositoryIndex()
         self._lang_profile: LanguageProfile = PYTHON
         self._import_validator = ImportValidator()
+        self._embedding_store = embedding_store
 
     @property
     def src_dir(self) -> Path:
@@ -168,6 +178,14 @@ class RepositoryManager:
             logger.warning(
                 "Broken imports detected in %s: %s", rel_path, broken
             )
+
+        # Incremental embedding update — keeps vector index current as files
+        # are written rather than deferring everything to finalization.
+        if self._embedding_store is not None:
+            try:
+                self._embedding_store.index_file(rel_path, content)
+            except Exception as e:
+                logger.warning("Embedding index update failed for %s: %s", rel_path, e)
 
         logger.info(f"Wrote {rel_path} ({len(content)} bytes)")
         return file_path
