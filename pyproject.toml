@@ -29,6 +29,8 @@ dependencies = [
     "click>=8.1.0",
     "aiofiles>=23.2.0",
     "bandit>=1.7.0",
+    # Embeddings
+    "sentence-transformers>=3.0.0",
     # AST extraction — tree-sitter core + language grammars
     "tree-sitter>=0.23.0",
     "tree-sitter-java>=0.23.0",
