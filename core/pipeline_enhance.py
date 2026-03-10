@@ -13,7 +13,7 @@ from core.agent_manager import AgentManager
 from core.event_bus import EventBus
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient, calculate_cost
-from core.models import FileBlueprint, RepositoryBlueprint, TokenCost
+from core.models import ChangeAction, ChangeActionType, FileBlueprint, RepositoryBlueprint, TokenCost
 from core.plan_approver import PlanApprover, PlanPendingApprovalError
 from core.repository_manager import RepositoryManager
 from core.run_reporter import RunReporter
@@ -194,6 +194,49 @@ class EnhancePipeline:
                     errors=["Change plan rejected by user"],
                     elapsed_seconds=time.monotonic() - start_time,
                 )
+
+        # ── Reconcile new_files against workspace ────────────────────────────
+        # The LLM sometimes mis-classifies existing files as new (e.g. pom.xml,
+        # application.properties that are already present in the repo).  A
+        # GENERATE_FILE task on an existing file overwrites it from scratch and
+        # fails if the file has no blueprint entry.  The correct treatment is a
+        # MODIFY_FILE task, so we demote any already-existing "new" files to
+        # a change action and remove them from new_files.
+        workspace = self._settings.workspace_dir
+        truly_new: list[FileBlueprint] = []
+        for nf in change_plan.new_files:
+            if (workspace / nf.path).exists():
+                logger.warning(
+                    "new_files entry '%s' already exists on disk — demoting to modify change",
+                    nf.path,
+                )
+                # Only add a modify action if one isn't already there to avoid
+                # generating two tasks for the same file.
+                already_in_changes = any(c.file == nf.path for c in change_plan.changes)
+                if not already_in_changes:
+                    change_plan.changes.append(ChangeAction(
+                        type=ChangeActionType.CREATE_FILE,
+                        file=nf.path,
+                        description=nf.purpose,
+                    ))
+            else:
+                truly_new.append(nf)
+
+        if len(truly_new) != len(change_plan.new_files):
+            logger.info(
+                "new_files reconciled: %d truly new, %d demoted to modify",
+                len(truly_new), len(change_plan.new_files) - len(truly_new),
+            )
+        change_plan.new_files = truly_new
+
+        # Enrich the repo blueprint with genuinely new files so the context
+        # builder can supply file_blueprint to CoderAgent for GENERATE_FILE tasks.
+        if change_plan.new_files:
+            blueprint.file_blueprints = blueprint.file_blueprints + change_plan.new_files
+            logger.info(
+                "Blueprint enriched with %d new file(s) from change plan",
+                len(change_plan.new_files),
+            )
 
         # ── Phase 3: Build modification task DAG ─────────────────────────────
         self._phase("Task Planning", "running")

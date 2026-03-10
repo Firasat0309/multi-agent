@@ -346,39 +346,66 @@ class AgentManager:
         """
         start_time = time.monotonic()
         semaphore = asyncio.Semaphore(self.settings.max_concurrent_agents)
+        phase_timeout: float = float(self.settings.phase_timeout_seconds)
 
-        # Track in-flight file tasks to avoid double-dispatching
+        # in_flight      — file paths whose current phase is actively executing.
+        # running_tasks  — the asyncio.Task objects backing those coroutines.
         in_flight: set[str] = set()
+        running_tasks: set[asyncio.Task[None]] = set()
+
+        async def run_file_phase(path: str, phase: FilePhase) -> None:
+            async with semaphore:
+                try:
+                    await asyncio.wait_for(
+                        self._execute_lifecycle_phase(engine, path, phase),
+                        timeout=phase_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "[%s] %s timed out after %ds — marking FAILED",
+                        path, phase.value, int(phase_timeout),
+                    )
+                    try:
+                        engine.process_event(path, EventType.RETRIES_EXHAUSTED)
+                    except Exception:
+                        pass
+                    self._metrics["tasks_failed"] += 1
+                finally:
+                    in_flight.discard(path)
 
         while not engine.all_terminal():
+            # Start a task for every file that just became actionable.
             actionable = engine.get_actionable_files()
-            # Filter out files already being worked on
             to_dispatch = [
                 (path, phase) for path, phase in actionable
                 if path not in in_flight
             ]
-
-            if not to_dispatch:
-                if in_flight:
-                    await asyncio.sleep(0.3)
-                    continue
-                # No files in-flight and nothing actionable — shouldn't happen
-                logger.error("Lifecycle stall: no actionable files and none in-flight")
-                break
-
-            async def run_file_phase(path: str, phase: FilePhase) -> None:
-                async with semaphore:
-                    try:
-                        await self._execute_lifecycle_phase(engine, path, phase)
-                    finally:
-                        in_flight.discard(path)
-
             for path, phase in to_dispatch:
                 in_flight.add(path)
+                t = asyncio.create_task(
+                    run_file_phase(path, phase), name=f"lifecycle:{path}",
+                )
+                running_tasks.add(t)
+                t.add_done_callback(running_tasks.discard)
 
-            await asyncio.gather(
-                *[run_file_phase(p, ph) for p, ph in to_dispatch]
-            )
+            if not running_tasks:
+                # Nothing running and nothing new — genuine stall (e.g. dep cycle).
+                logger.error(
+                    "Lifecycle stall: no actionable files and none in-flight. "
+                    "Phase counts: %s", engine.get_stats(),
+                )
+                break
+
+            # Wait for any single task to finish before re-evaluating the engine.
+            # FIRST_COMPLETED means a file whose deps just cleared can start
+            # immediately rather than waiting for the whole current batch to drain.
+            await asyncio.wait(running_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+        # Cancel any tasks still in flight (only reached after a stall break).
+        for t in list(running_tasks):
+            t.cancel()
+        if running_tasks:
+            await asyncio.gather(*list(running_tasks), return_exceptions=True)
 
         # ── Phase 2: Global DAG ──────────────────────────────────────
         logger.info("All file lifecycles terminal — running global DAG")
@@ -423,6 +450,8 @@ class AgentManager:
                 "lifecycle_passed": lifecycle_summary["passed"],
                 "lifecycle_failed": lifecycle_summary["failed"],
                 "lifecycle_total_fixes": lifecycle_summary["total_fix_cycles"],
+                # Files whose code is valid but whose tests didn't fully pass.
+                "lifecycle_tests_degraded": lifecycle_summary["tests_degraded"],
             },
             "metrics": self._metrics,
             "elapsed_seconds": elapsed,
@@ -527,7 +556,11 @@ class AgentManager:
             # completed), but uses result.metrics["passed"] to indicate the
             # actual review verdict.
             if config["task_type"] == TaskType.REVIEW_FILE:
-                review_passed = result.metrics.get("passed", True)
+                # Treat a task-level failure (e.g. JSON parse error) as a
+                # review failure rather than silently passing the file through.
+                # Also change the default to False so an empty metrics dict
+                # (result of a ValidationError) doesn't produce a false pass.
+                review_passed = result.success and result.metrics.get("passed", False)
                 if review_passed:
                     event_data = {"output": result.output}
                     engine.process_event(file_path, EventType.REVIEW_PASSED, event_data)

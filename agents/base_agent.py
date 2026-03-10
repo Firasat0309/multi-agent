@@ -100,6 +100,32 @@ class BaseAgent(ABC):
             self._metrics["tokens_used"] += sum(response.usage.values())
 
             if response.stop_reason == "end_turn":
+                # If the LLM returned text but never called write_file for the
+                # target file, inject a recovery turn rather than exiting.
+                # This handles the case where the model outputs code as plain
+                # text instead of routing it through the write_file tool.
+                target_file = context.file_blueprint.path if context.file_blueprint else None
+                if (
+                    target_file
+                    and target_file not in files_written
+                    and response.content
+                    and iteration < max_iterations - 1
+                ):
+                    logger.warning(
+                        "%s: end_turn reached but %s not yet written — injecting write_file reminder (iter %d)",
+                        self.__class__.__name__, target_file, iteration,
+                    )
+                    messages.append({"role": "assistant", "content": response.raw_content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"You have not called write_file yet. "
+                            f"Please call write_file with path='{target_file}' "
+                            f"and the complete file content now. "
+                            f"Do NOT respond with plain text — use the write_file tool."
+                        ),
+                    })
+                    continue
                 return self._parse_agentic_result(context, response.content, files_written)
 
             if not response.tool_calls:
@@ -254,17 +280,30 @@ class BaseAgent(ABC):
     async def _tool_list_files(self, inp: dict) -> str:
         directory = inp.get("directory", "")
         pattern = inp.get("pattern", "**/*")
-        base = self.repo.workspace
+        # Always operate on the resolved absolute workspace path so that
+        # relative_to() and startswith() comparisons are consistent.
+        workspace = self.repo.workspace.resolve()
+        base = workspace
         if directory:
-            # Security: resolve to prevent path traversal outside workspace
-            target = (base / directory).resolve()
-            if not str(target).startswith(str(base.resolve())):
+            dir_path = Path(directory)
+            # If the LLM supplies an absolute path, try to strip the workspace
+            # prefix so it can be treated as workspace-relative.  Reject it if
+            # it escapes the workspace entirely.
+            if dir_path.is_absolute():
+                try:
+                    directory = str(dir_path.relative_to(workspace))
+                except ValueError:
+                    return "Error: access denied (path escapes workspace)"
+            target = (workspace / directory).resolve()
+            if not str(target).startswith(str(workspace)):
                 return "Error: access denied (path escapes workspace)"
             base = target
         if not base.exists():
             return f"Directory not found: {directory or '.'}"
+        if not base.is_dir():
+            return f"Not a directory: {directory}"
         files = sorted(
-            str(p.relative_to(self.repo.workspace))
+            str(p.relative_to(workspace))
             for p in base.rglob(pattern)
             if p.is_file()
         )

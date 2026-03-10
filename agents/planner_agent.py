@@ -44,7 +44,7 @@ class PlannerAgent(BaseAgent):
         self,
         blueprint: RepositoryBlueprint,
         *,
-        max_review_fixes: int = 2,
+        max_review_fixes: int = 3,
         max_test_fixes: int = 3,
     ) -> tuple[LifecycleEngine, TaskGraph]:
         """Build an event-sourced lifecycle engine + global task graph.

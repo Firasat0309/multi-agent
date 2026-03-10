@@ -76,6 +76,10 @@ class Settings:
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     max_concurrent_agents: int = 4
     max_debug_iterations: int = 5
+    # Maximum wall-clock seconds allowed for a single lifecycle phase (generate,
+    # review, fix, build, test).  Phases that exceed this budget are cancelled
+    # and the file is marked FAILED so the rest of the pipeline can proceed.
+    phase_timeout_seconds: int = 600
     review_levels: list[str] = field(
         default_factory=lambda: ["file", "module", "architecture"]
     )

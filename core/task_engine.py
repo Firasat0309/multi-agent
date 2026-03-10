@@ -347,8 +347,19 @@ class ModificationTaskGraphBuilder:
         # ── Pre-flight: cycle detection & safe ordering ────────────────
         ordered_changes = self._order_changes(resolved_changes)
 
+        # Files that are brand-new (in new_files) must be created by a
+        # GENERATE_FILE task (Phase 1b), not a MODIFY_FILE task — the file
+        # doesn't exist yet and PatchAgent cannot patch a non-existent file.
+        # Routing them through MODIFY_FILE also causes a duplicate task when
+        # the same path appears in both change_plan.changes and new_files.
+        new_file_paths = {nf.path for nf in change_plan.new_files}
+
         # ── Phase 1: Modification tasks (graph-safe order) ────────────
         for change in ordered_changes:
+            # Skip files that are truly new — handled by GENERATE_FILE below.
+            if change.file in new_file_paths:
+                continue
+
             deps = [
                 file_task_map[d]
                 for d in change.depends_on
