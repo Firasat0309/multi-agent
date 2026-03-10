@@ -19,6 +19,7 @@ from core.language import detect_language_from_blueprint
 from core.live_console import LiveConsole, LiveConsoleHandler
 from core.llm_client import LLMClient, LLMConfigError
 from core.models import RepositoryBlueprint, ChangePlan, RepoAnalysis
+from core.plan_approver import PlanApprover, PlanPendingApprovalError
 from core.observability import record_task_completion, start_metrics_server, setup_tracing
 from core.repository_manager import RepositoryManager
 from core.state_machine import LifecycleEngine
@@ -643,6 +644,33 @@ class Pipeline:
 
         if self._live:
             self._live.complete_phase("Change Planning")
+
+        # ── Approval gate (optional) ───────────────────────────────────
+        if self.settings.require_plan_approval:
+            approver = PlanApprover(
+                interactive=self.interactive,
+                workspace=self.settings.workspace_dir,
+            )
+            try:
+                approved = approver.display_and_approve(change_plan)
+            except PlanPendingApprovalError as e:
+                logger.info("Plan pending human approval: %s", e)
+                return PipelineResult(
+                    success=False,
+                    workspace_path=self.settings.workspace_dir,
+                    repo_analysis=repo_analysis,
+                    errors=[str(e)],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
+            if not approved:
+                logger.info("Change plan rejected by user")
+                return PipelineResult(
+                    success=False,
+                    workspace_path=self.settings.workspace_dir,
+                    repo_analysis=repo_analysis,
+                    errors=["Change plan rejected by user"],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
 
         # ── Phase 3: Build modification task DAG ──────────────────────
         if self._live:

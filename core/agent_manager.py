@@ -10,6 +10,7 @@ from typing import Any, TYPE_CHECKING
 from agents.base_agent import BaseAgent
 from agents.coder_agent import CoderAgent
 from agents.deploy_agent import DeployAgent
+from agents.integration_test_agent import IntegrationTestAgent
 from agents.patch_agent import PatchAgent
 from agents.reviewer_agent import ReviewerAgent
 from agents.security_agent import SecurityAgent
@@ -51,7 +52,8 @@ TASK_AGENT_MAP: dict[TaskType, type[BaseAgent]] = {
     TaskType.GENERATE_DEPLOY: DeployAgent,
     TaskType.GENERATE_DOCS: WriterAgent,
     TaskType.FIX_CODE: CoderAgent,
-    TaskType.MODIFY_FILE: PatchAgent,   # surgical patch; falls back to CoderAgent on failure
+    TaskType.MODIFY_FILE: PatchAgent,                            # surgical patch
+    TaskType.GENERATE_INTEGRATION_TEST: IntegrationTestAgent,
 }
 
 
@@ -113,9 +115,9 @@ class AgentManager:
         if agent_cls is None:
             raise ValueError(f"No agent registered for task type: {task_type}")
 
-        # TestAgent → test terminal (no-network sandbox for generated tests).
+        # TestAgent / IntegrationTestAgent → test terminal (no-network sandbox).
         # SecurityAgent → build terminal (bandit needs the full env).
-        if agent_cls is TestAgent:
+        if agent_cls in (TestAgent, IntegrationTestAgent):
             return agent_cls(
                 llm_client=self.llm,
                 repo_manager=self.repo,

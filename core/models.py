@@ -48,6 +48,8 @@ class TaskType(str, Enum):
     ANALYZE_REPO = "analyze_repo"
     PLAN_CHANGES = "plan_changes"
     MODIFY_FILE = "modify_file"
+    # ── Quality & validation task types ──
+    GENERATE_INTEGRATION_TEST = "generate_integration_test"
 
 
 class TaskStatus(str, Enum):
@@ -98,6 +100,7 @@ class AgentRole(str, Enum):
     WRITER = "writer"
     REPO_ANALYZER = "repo_analyzer"
     CHANGE_PLANNER = "change_planner"
+    INTEGRATION_TESTER = "integration_tester"
 
 
 @dataclass

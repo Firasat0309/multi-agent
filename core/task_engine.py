@@ -387,13 +387,23 @@ class LifecyclePlanBuilder:
             global_graph.add_task(mod_fix)
             mod_fix_ids.append(mod_fix.task_id)
 
-        # Architecture review
+        # Integration tests — run after all per-file fixes and module review
+        integration_test = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.GENERATE_INTEGRATION_TEST,
+            file="tests/integration/",
+            description="Generate integration tests verifying cross-module interactions",
+            dependencies=mod_fix_ids + [sec_task.task_id],
+        )
+        global_graph.add_task(integration_test)
+
+        # Architecture review (after integration tests + security)
         arch_review = Task(
             task_id=self._alloc_id(),
             task_type=TaskType.REVIEW_ARCHITECTURE,
             file="*",
             description="Architecture review for dependency cycles and layer violations",
-            dependencies=mod_fix_ids + [sec_task.task_id],
+            dependencies=[integration_test.task_id],
         )
         global_graph.add_task(arch_review)
 
@@ -467,6 +477,14 @@ class ModificationTaskGraphBuilder:
         """
         graph = TaskGraph()
         file_task_map: dict[str, int] = {}  # file_path → last task_id for that file
+
+        # ── Pre-flight: conflict detection ────────────────────────────
+        conflicts = self._detect_conflicts(change_plan.changes)
+        if conflicts:
+            for conflict in conflicts:
+                logger.warning("Change conflict: %s", conflict)
+            # Surface conflicts as risk notes for downstream visibility
+            change_plan.risk_notes.extend(conflicts)
 
         # ── Pre-flight: cycle detection & safe ordering ────────────────
         ordered_changes = self._order_changes(change_plan.changes)
@@ -666,3 +684,41 @@ class ModificationTaskGraphBuilder:
             targets.update(graph_tests)
 
         return targets
+
+    def _detect_conflicts(self, changes: list[ChangeAction]) -> list[str]:
+        """Detect when multiple changes target the same function/class in the same file.
+
+        Returns a list of human-readable conflict descriptions.  Conflicts are
+        promoted to ``ChangePlan.risk_notes`` and logged as warnings so the
+        operator (or the approval gate) can decide whether to proceed.
+
+        Serialization: conflicting changes are left in their original order;
+        the dependency graph in ``build_from_change_plan`` will emit them as
+        sequential tasks by virtue of using ``file_task_map`` (each file slot
+        holds only the last task_id, so each subsequent task for the same file
+        implicitly depends on the previous one).
+        """
+        conflicts: list[str] = []
+        # file → list of (class_name, function) tuples already seen
+        file_targets: dict[str, list[tuple[str, str]]] = {}
+
+        for change in changes:
+            target = (change.class_name or "", change.function or "")
+            previous = file_targets.setdefault(change.file, [])
+
+            # A conflict is two changes targeting the *same named symbol*
+            # in the same file (ignoring blank/unnamed targets).
+            if any(t != ("", "") and t == target and target != ("", "") for t in previous):
+                qualifier = (
+                    f"{change.class_name}.{change.function}"
+                    if change.function
+                    else (change.class_name or change.function or "unnamed symbol")
+                )
+                conflicts.append(
+                    f"Multiple changes targeting '{qualifier}' in {change.file} — "
+                    "changes will be serialized but may produce merge conflicts"
+                )
+
+            previous.append(target)
+
+        return conflicts

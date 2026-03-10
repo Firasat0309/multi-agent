@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from agents.base_agent import BaseAgent
+from core.coverage_runner import CoverageRunner
 from core.language import get_language_profile, LanguageProfile
 from core.models import AgentContext, AgentRole, TaskResult
 from tools.terminal_tools import TerminalTools
@@ -277,6 +278,34 @@ class TestAgent(BaseAgent):
                     quality_note = " (WARNING: only {n} test(s) — consider adding more)".format(
                         n=quality["test_count"]
                     )
+
+                # ── Coverage measurement ──────────────────────────────
+                coverage_metrics: dict[str, Any] = {}
+                if self.terminal and source_path:
+                    try:
+                        cov = await CoverageRunner().run_with_coverage(
+                            test_file=test_path,
+                            source_file=source_path,
+                            terminal=self.terminal,
+                            lang=profile,
+                            min_coverage=0.80,
+                        )
+                        coverage_metrics = {
+                            "line_coverage": cov.line_coverage,
+                            "branch_coverage": cov.branch_coverage,
+                            "coverage_gate_passed": cov.passed_gate,
+                        }
+                        if not cov.passed_gate:
+                            quality_note += (
+                                f" (coverage {cov.line_pct} below 80% gate)"
+                            )
+                            logger.warning(
+                                "Coverage gate failed for %s: %s < 80%%",
+                                source_path, cov.line_pct,
+                            )
+                    except Exception as cov_err:
+                        logger.debug("Coverage measurement skipped: %s", cov_err)
+
                 return TaskResult(
                     success=True,
                     output=f"Tests passing after {attempt + 1} attempt(s){quality_note}",
@@ -285,6 +314,7 @@ class TestAgent(BaseAgent):
                         **self.get_metrics(),
                         "fix_attempts": attempt,
                         **quality,
+                        **coverage_metrics,
                     },
                 )
 
