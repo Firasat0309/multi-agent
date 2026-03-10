@@ -12,6 +12,8 @@ from core.language import get_language_profile
 from core.llm_client import LLMClient, LLMResponse, ToolCall
 from core.models import AgentContext, AgentRole, Task, TaskResult
 from core.repository_manager import RepositoryManager
+from tools.code_search import CodeSearch
+from tools.file_tools import FileTools, PatchError
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +31,10 @@ class BaseAgent(ABC):
         self.llm = llm_client
         self.repo = repo_manager
         self._metrics: dict[str, Any] = {"llm_calls": 0, "tokens_used": 0}
+        # Tool helpers are created once per agent instance and reused across all
+        # tool dispatch calls — avoiding per-call re-instantiation overhead.
+        self._code_search = CodeSearch(repo_manager.workspace)
+        self._file_tools = FileTools(repo_manager.workspace)
 
     @abstractmethod
     async def execute(self, context: AgentContext) -> TaskResult:
@@ -188,24 +194,20 @@ class BaseAgent(ABC):
         return f"Written {len(content)} bytes to {path}"
 
     async def _tool_search_code(self, inp: dict) -> str:
-        from tools.code_search import CodeSearch
         query = inp.get("query", "")
         file_pattern = inp.get("file_pattern", "**/*")
         if not query:
             return "Error: 'query' is required"
-        searcher = CodeSearch(self.repo.workspace)
-        results = searcher.search(query, file_pattern=file_pattern, max_results=20)
+        results = self._code_search.search(query, file_pattern=file_pattern, max_results=20)
         if not results:
             return f"No results for: {query}"
         return "\n".join(f"{r.file}:{r.line}: {r.content}" for r in results[:20])
 
     async def _tool_find_definition(self, inp: dict) -> str:
-        from tools.code_search import CodeSearch
         symbol = inp.get("symbol", "")
         if not symbol:
             return "Error: 'symbol' is required"
-        searcher = CodeSearch(self.repo.workspace)
-        results = searcher.find_definition(symbol)
+        results = self._code_search.find_definition(symbol)
         if not results:
             return f"No definition found for: {symbol}"
         return "\n".join(f"{r.file}:{r.line}: {r.content}" for r in results[:10])
@@ -230,17 +232,12 @@ class BaseAgent(ABC):
         return "\n".join(files[:200]) if files else "No files found"
 
     async def _tool_apply_patch(self, inp: dict) -> str:
-        from tools.file_tools import FileTools, PatchError
         path = inp.get("path", "")
         patch = inp.get("patch", "")
         if not path or not patch:
             return "Error: 'path' and 'patch' are required"
-        ft = FileTools(self.repo.workspace)
         try:
-            # apply_patch may not exist on older FileTools — fall back
-            if hasattr(ft, "apply_patch"):
-                return ft.apply_patch(path, patch)
-            return "Error: apply_patch is not available in this installation"
+            return self._file_tools.apply_patch(path, patch)
         except PatchError as exc:
             return f"Patch failed: {exc}"
 

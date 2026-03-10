@@ -189,7 +189,9 @@ class ContextBuilder:
         # ── Priority 4: module review files ──────────────────────────────────
         if task.task_type in (TaskType.REVIEW_MODULE, TaskType.REVIEW_ARCHITECTURE):
             already = {c.path for c in candidates}
-            for fb in self.blueprint.file_blueprints[:_MAX_REVIEW_FILES]:
+            ranked = self._rank_review_files(task)
+            n_ranked = len(ranked)
+            for rank, fb in enumerate(ranked):
                 if fb.path in already:
                     continue
                 content = self._read_file(fb.path)
@@ -203,9 +205,11 @@ class ContextBuilder:
                     if stub is not None
                     else (content[:8_000] + "\n# ... (truncated)" if len(content) > 8_000 else content)
                 )
+                # Relevance score descends linearly from 0.9 (rank 0) to 0.5 (last).
+                relevance = 0.9 - 0.4 * (rank / max(n_ranked - 1, 1))
                 candidates.append(ContextFile(
                     path=fb.path, content=body,
-                    priority=4, relevance_score=0.5, is_stub=stub is not None,
+                    priority=4, relevance_score=relevance, is_stub=stub is not None,
                 ))
 
         # ── Sort: (priority asc, relevance_score desc) ───────────────────────
@@ -225,6 +229,74 @@ class ContextBuilder:
                 continue
             result[cf.path] = cf.content
             total += len(cf.content)
+
+        return result
+
+    # ── Review-file ranking ───────────────────────────────────────────────────
+
+    def _rank_review_files(self, task: Task) -> list[FileBlueprint]:
+        """Return up to ``_MAX_REVIEW_FILES`` blueprint files ranked by relevance.
+
+        REVIEW_MODULE — prioritises by directory proximity to ``task.file``,
+        then by same architectural layer, then by dependency overlap.
+
+        REVIEW_ARCHITECTURE — samples proportionally across all layers so the
+        LLM sees the full stack rather than an arbitrary positional slice.
+        """
+        if task.task_type == TaskType.REVIEW_MODULE:
+            return self._rank_module_review_files(task.file)
+        return self._rank_architecture_review_files()
+
+    def _rank_module_review_files(self, target_file: str) -> list[FileBlueprint]:
+        """Rank files for REVIEW_MODULE by closeness to ``target_file``."""
+        target_dir = str(Path(target_file).parent)
+        target_fb = self._find_blueprint(target_file)
+        target_layer = target_fb.layer if target_fb else ""
+        target_deps = set(target_fb.depends_on) if target_fb else set()
+
+        def _score(fb: FileBlueprint) -> float:
+            fb_dir = str(Path(fb.path).parent)
+            if fb_dir == target_dir:
+                return 3.0
+            # Parent or child directory
+            if fb_dir.startswith(target_dir + "/") or target_dir.startswith(fb_dir + "/"):
+                return 2.0
+            if target_layer and fb.layer == target_layer:
+                return 1.5
+            overlap = len(set(fb.depends_on) & target_deps)
+            if overlap:
+                return 1.0 + overlap * 0.1
+            return 0.5
+
+        ranked = sorted(self.blueprint.file_blueprints, key=_score, reverse=True)
+        return ranked[:_MAX_REVIEW_FILES]
+
+    def _rank_architecture_review_files(self) -> list[FileBlueprint]:
+        """Sample files proportionally across all architectural layers."""
+        by_layer: dict[str, list[FileBlueprint]] = {}
+        for fb in self.blueprint.file_blueprints:
+            by_layer.setdefault(fb.layer or "other", []).append(fb)
+
+        n_layers = len(by_layer)
+        if n_layers == 0:
+            return self.blueprint.file_blueprints[:_MAX_REVIEW_FILES]
+
+        per_layer = max(1, _MAX_REVIEW_FILES // n_layers)
+        result: list[FileBlueprint] = []
+        seen: set[str] = set()
+
+        for layer_files in by_layer.values():
+            for fb in layer_files[:per_layer]:
+                result.append(fb)
+                seen.add(fb.path)
+
+        # Fill remaining budget from whichever layers had extras
+        if len(result) < _MAX_REVIEW_FILES:
+            for fb in self.blueprint.file_blueprints:
+                if len(result) >= _MAX_REVIEW_FILES:
+                    break
+                if fb.path not in seen:
+                    result.append(fb)
 
         return result
 
