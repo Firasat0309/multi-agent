@@ -96,25 +96,43 @@ class ChangePlannerAgent(BaseAgent):
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
-        """Not used directly — use plan_changes() instead."""
-        return TaskResult(success=False, errors=["Use plan_changes() method"])
+        """Plan changes from task metadata (keys: 'user_request', 'repo_analysis')."""
+        user_request: str = context.task.metadata.get("user_request", context.task.description)
+        repo_analysis: RepoAnalysis | None = context.task.metadata.get("repo_analysis")
+        if repo_analysis is None:
+            return TaskResult(
+                success=False,
+                errors=["'repo_analysis' missing from task metadata — run RepositoryAnalyzerAgent first"],
+            )
+        try:
+            plan = await self.plan_changes(user_request, repo_analysis)
+            return TaskResult(
+                success=True,
+                output=f"Change plan created: {len(plan.changes)} change(s), {len(plan.new_files)} new file(s)",
+                metrics=self.get_metrics(),
+            )
+        except Exception as exc:
+            logger.exception("ChangePlannerAgent.execute failed")
+            return TaskResult(success=False, errors=[str(exc)])
 
     async def plan_changes(
         self,
         user_request: str,
         repo_analysis: RepoAnalysis,
-        file_contents: dict[str, str] | None = None,
     ) -> ChangePlan:
         """Produce a structured change plan for a modification request.
 
         Args:
             user_request: The user's natural-language description of the desired change.
             repo_analysis: Output of RepositoryAnalyzerAgent.analyze_repository().
-            file_contents: Optional dict of file_path → content for targeted files.
+
+        File contents are fetched lazily — only the top-ranked modules (up to
+        ``_MAX_CONTEXT_MODULES``) are read from disk, so this method is safe
+        to call on repos of any size without OOM risk.
         """
         logger.info("Planning changes for request: %s", user_request[:100])
 
-        repo_context = self._build_repo_context(repo_analysis, file_contents, user_request)
+        repo_context = self._build_repo_context(repo_analysis, user_request)
 
         prompt = (
             f"The user wants to modify an existing codebase.\n\n"
@@ -139,7 +157,6 @@ class ChangePlannerAgent(BaseAgent):
     def _build_repo_context(
         self,
         analysis: RepoAnalysis,
-        file_contents: dict[str, str] | None,
         user_request: str = "",
     ) -> str:
         """Build a compact text representation of the repository for LLM context.
@@ -147,6 +164,11 @@ class ChangePlannerAgent(BaseAgent):
         Modules are ranked by keyword overlap with *user_request* so the
         capped list contains the most relevant modules rather than an
         arbitrary positional slice of the full module list.
+
+        File contents are fetched lazily — only the top ``_MAX_CONTEXT_MODULES``
+        files are read from disk via ``self.repo.read_source_files()``, so
+        this method never loads more than ~60 files into memory regardless of
+        how large the repository is.
 
         File contents are rendered as AST stubs (signatures only) when the
         language is supported by tree-sitter, falling back to 4 000-char
@@ -190,15 +212,23 @@ class ChangePlannerAgent(BaseAgent):
         if omitted:
             lines.append(f"  ... and {omitted} more modules omitted")
 
-        # File contents — prefer AST stubs over raw truncation.
+        # Fetch only the ranked files — bounded by _MAX_CONTEXT_MODULES.
+        # self.repo.read_source_files() reads exactly the paths listed so
+        # no more than len(shown) files are ever held in memory at once.
+        top_paths = [m.file for m in shown]
+        file_contents = self.repo.read_source_files(top_paths)
+
         if file_contents:
             lines.append("")
             lines.append("Key file contents (AST stubs where available):")
             lang_profile = detect_language_from_blueprint(analysis.tech_stack)
             total_chars = 0
-            for path, content in file_contents.items():
+            for path in top_paths:  # preserve relevance order
+                content = file_contents.get(path)
+                if content is None:
+                    continue
                 if total_chars > 30_000:
-                    lines.append("  ... remaining files omitted (budget reached)")
+                    lines.append("  ... remaining files omitted (token budget reached)")
                     break
                 stub = _ast_extractor.extract_stub(path, content, lang_profile.name)
                 if stub is not None:

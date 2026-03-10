@@ -18,8 +18,18 @@ class PlannerAgent(BaseAgent):
     role = AgentRole.PLANNER
 
     async def execute(self, context: AgentContext) -> TaskResult:
-        """Not used directly - use create_lifecycle_plan instead."""
-        return TaskResult(success=False, errors=["Use create_lifecycle_plan() method"])
+        """Build a lifecycle plan from context.blueprint."""
+        try:
+            _, global_graph = await self.create_lifecycle_plan(context.blueprint)
+            stats = global_graph.get_stats()
+            return TaskResult(
+                success=True,
+                output=f"Plan created for {len(context.blueprint.file_blueprints)} files. Global tasks: {stats}",
+                metrics=self.get_metrics(),
+            )
+        except Exception as exc:
+            logger.exception("PlannerAgent.execute failed")
+            return TaskResult(success=False, errors=[str(exc)])
 
     async def create_task_graph(self, blueprint: RepositoryBlueprint) -> TaskGraph:
         """Build the task graph via the lifecycle plan builder.

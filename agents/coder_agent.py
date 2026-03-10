@@ -11,6 +11,10 @@ from core.agent_tools import CODER_TOOLS, ToolDefinition
 from core.language import get_language_profile, LanguageProfile
 from core.models import AgentContext, AgentRole, ChangeAction, ChangeActionType, TaskResult, TaskType
 
+# Files with more lines than this threshold are modified via unified diff instead
+# of a full-file rewrite.  Diffs are ~5–20× cheaper in tokens for large files.
+_LARGE_FILE_THRESHOLD = 200
+
 logger = logging.getLogger(__name__)
 
 # File extensions that are configuration/resource files, not source code.
@@ -245,12 +249,14 @@ class CoderAgent(BaseAgent):
         file_path = context.task.file
         review_errors: list[str] = context.task.metadata.get("review_errors", [])
         review_output: str = context.task.metadata.get("review_output", "")
+        build_errors: str = context.task.metadata.get("build_errors", "")
+        fix_trigger: str = context.task.metadata.get("fix_trigger", "review")
 
         # Read current file content from the repo (non-blocking)
         current_content = await self.repo.async_read_file(file_path) or ""
 
         # If review passed (no errors) — nothing to fix, skip LLM call
-        if not review_errors and "PASSED" in review_output:
+        if not review_errors and "PASSED" in review_output and fix_trigger == "review":
             logger.info(f"Skipping fix for {file_path} — review passed")
             return TaskResult(
                 success=True,
@@ -264,14 +270,19 @@ class CoderAgent(BaseAgent):
         profile = get_language_profile(lang)
         logger.info(f"Fixing {file_path} based on {len(review_errors)} review issue(s)")
 
-        issues_text = "\n".join(f"- {e}" for e in review_errors) if review_errors else review_output
+        if fix_trigger == "build" and build_errors:
+            issues_text = f"Compilation/build errors to fix:\n{build_errors}"
+        elif review_errors:
+            issues_text = "\n".join(f"- {e}" for e in review_errors)
+        else:
+            issues_text = review_output
 
         prompt = (
             f"{self._format_context(context)}\n\n"
             f"The following file has review issues that must be fixed:\n\n"
             f"File: {file_path}\n\n"
             f"Current content:\n```{profile.code_fence_name}\n{current_content}\n```\n\n"
-            f"Review findings to fix:\n{issues_text}\n\n"
+            f"Issues to fix ({fix_trigger}):\n{issues_text}\n\n"
             f"Output the complete corrected file. Output only the code, nothing else."
         )
 
@@ -311,12 +322,11 @@ class CoderAgent(BaseAgent):
         )
 
     async def _modify_file(self, context: AgentContext) -> TaskResult:
-        """Modify an existing file based on a change action (patch editing).
+        """Modify an existing file based on a change action.
 
-        Instead of regenerating the entire file from scratch, this reads the
-        current file content, sends it to the LLM with the specific change
-        request, and writes back the modified version — preserving all
-        existing code that isn't being changed.
+        For files above ``_LARGE_FILE_THRESHOLD`` lines, attempts a unified
+        diff patch first (cheaper and more reliable for large files).  Falls
+        back to full-file rewrite only when the diff fails or for small files.
         """
         file_path = context.task.file
         change_desc: str = context.task.metadata.get("change_description", "")
@@ -327,7 +337,6 @@ class CoderAgent(BaseAgent):
         # Read the current file content
         current_content = await self.repo.async_read_file(file_path)
         if current_content is None:
-            # File doesn't exist yet — fall back to full generation if we have a blueprint
             if context.file_blueprint:
                 return await self._generate_source(context)
             return TaskResult(
@@ -338,15 +347,30 @@ class CoderAgent(BaseAgent):
         fb = context.file_blueprint
         lang = (fb.language if fb else None) or context.blueprint.tech_stack.get("language", "python")
         profile = get_language_profile(lang)
-        logger.info(f"Modifying {file_path}: {change_desc[:80]}")
 
-        # Build a targeted modification prompt
         target_hint = ""
         if target_class:
             target_hint += f"Target class: {target_class}\n"
         if target_function:
             target_hint += f"Target function/method: {target_function}\n"
 
+        line_count = len(current_content.splitlines())
+        logger.info("Modifying %s (%d lines): %s", file_path, line_count, change_desc[:80])
+
+        # Large files: try a surgical diff first to save tokens.
+        if line_count > _LARGE_FILE_THRESHOLD:
+            result = await self._try_diff_modification(
+                context, file_path, current_content, lang, profile,
+                change_desc, change_type, target_hint,
+            )
+            if result is not None:
+                return result
+            logger.warning(
+                "Diff modification failed for %s (%d lines) — falling back to full rewrite",
+                file_path, line_count,
+            )
+
+        # Full-file rewrite (small files, or large-file diff fallback)
         prompt = (
             f"{self._format_context(context)}\n\n"
             f"MODIFICATION REQUEST for: {file_path}\n"
@@ -354,10 +378,9 @@ class CoderAgent(BaseAgent):
             f"{target_hint}"
             f"Description: {change_desc}\n\n"
             f"Current file content:\n```{profile.code_fence_name}\n{current_content}\n```\n\n"
-            f"Apply the modification to the file. Output the COMPLETE modified file "
+            f"Apply the modification. Output the COMPLETE modified file "
             f"preserving all existing code. Output only the code, nothing else."
         )
-
         modified_code = await self._call_llm(
             prompt, system_override=self._get_modify_system_prompt(lang),
         )
@@ -366,7 +389,66 @@ class CoderAgent(BaseAgent):
 
         return TaskResult(
             success=True,
-            output=f"Modified {file_path}: {change_desc[:80]} ({len(modified_code)} bytes)",
+            output=f"Modified {file_path}: {change_desc[:80]} (full rewrite, {len(modified_code)} bytes)",
+            files_modified=[file_path],
+            metrics=self.get_metrics(),
+        )
+
+    async def _try_diff_modification(
+        self,
+        context: AgentContext,
+        file_path: str,
+        current_content: str,
+        lang: str,
+        profile: LanguageProfile,
+        change_desc: str,
+        change_type: str,
+        target_hint: str,
+    ) -> TaskResult | None:
+        """Ask the LLM for a unified diff patch and apply it.
+
+        Returns a ``TaskResult`` on success, or ``None`` if the diff could not
+        be validated or applied (so the caller can fall back to full rewrite).
+        """
+        # Show line numbers so the LLM can emit correct @@ offsets
+        numbered = "\n".join(
+            f"{i + 1:4d}  {line}"
+            for i, line in enumerate(current_content.splitlines())
+        )
+        prompt = (
+            f"File to modify: {file_path}\n"
+            f"Language: {profile.display_name}\n"
+            f"Change type: {change_type}\n"
+            f"{target_hint}"
+            f"Change description: {change_desc}\n\n"
+            f"Current file content (line numbers for reference):\n"
+            f"```\n{numbered}\n```\n\n"
+            "Generate a unified diff patch. "
+            "Output ONLY the raw diff — no markdown fences, no explanation.\n"
+            f"Format:\n--- a/{file_path}\n+++ b/{file_path}\n@@ -LINE,COUNT +LINE,COUNT @@\n..."
+        )
+        system = (
+            "You are a surgical code modification agent. "
+            "Output ONLY a standard unified diff — never rewrite entire files.\n"
+            "Include 3 lines of context around each change hunk.\n"
+            "Line numbers in @@ headers MUST match the actual file content exactly."
+        )
+
+        patch_text = await self._call_llm(prompt, system_override=system)
+
+        valid, err = self._file_tools.validate_patch(file_path, patch_text)
+        if not valid:
+            logger.debug("Diff validation failed for %s: %s", file_path, err)
+            return None
+
+        applied = self._file_tools.apply_patch(file_path, patch_text)
+        if not applied:
+            logger.debug("Diff application failed for %s", file_path)
+            return None
+
+        return TaskResult(
+            success=True,
+            output=f"Patched {file_path}: {change_desc[:80]} (diff on {len(current_content.splitlines())} lines)",
             files_modified=[file_path],
             metrics=self.get_metrics(),
         )

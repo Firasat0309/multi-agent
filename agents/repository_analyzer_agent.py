@@ -86,8 +86,21 @@ class RepositoryAnalyzerAgent(BaseAgent):
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
-        """Not used directly — use analyze_repository() instead."""
-        return TaskResult(success=False, errors=["Use analyze_repository() method"])
+        """Analyse the workspace bound to this agent's repo_manager."""
+        try:
+            analysis = await self.analyze_repository(self.repo.workspace)
+            return TaskResult(
+                success=True,
+                output=(
+                    f"Repository analysed: {len(analysis.modules)} module(s), "
+                    f"style={analysis.architecture_style!r}, "
+                    f"stack={analysis.tech_stack}"
+                ),
+                metrics=self.get_metrics(),
+            )
+        except Exception as exc:
+            logger.exception("RepositoryAnalyzerAgent.execute failed")
+            return TaskResult(success=False, errors=[str(exc)])
 
     async def analyze_repository(self, workspace_dir: Path) -> RepoAnalysis:
         """Scan an existing repository and produce a complete analysis.

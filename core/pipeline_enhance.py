@@ -142,12 +142,10 @@ class EnhancePipeline:
         logger.info("[Phase 2] Planning targeted changes...")
 
         planner = ChangePlannerAgent(llm_client=self._llm, repo_manager=repo_manager)
-        file_contents = repo_manager.read_all_source_files()
         try:
             change_plan = await planner.plan_changes(
                 user_request=user_prompt,
                 repo_analysis=repo_analysis,
-                file_contents=file_contents,
             )
         except Exception as e:
             logger.exception("Change planning failed")

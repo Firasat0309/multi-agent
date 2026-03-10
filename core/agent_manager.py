@@ -7,7 +7,9 @@ import logging
 import time
 from typing import Any, TYPE_CHECKING
 
+from agents.architect_agent import ArchitectAgent
 from agents.base_agent import BaseAgent
+from agents.build_verifier_agent import BuildVerifierAgent
 from agents.coder_agent import CoderAgent
 from agents.deploy_agent import DeployAgent
 from agents.integration_test_agent import IntegrationTestAgent
@@ -15,6 +17,7 @@ from agents.patch_agent import PatchAgent
 from agents.reviewer_agent import ReviewerAgent
 from agents.security_agent import SecurityAgent
 from agents.test_agent import TestAgent
+from agents.planner_agent import PlannerAgent
 from agents.writer_agent import WriterAgent
 from config.settings import Settings
 from core.context_builder import ContextBuilder
@@ -55,6 +58,9 @@ TASK_AGENT_MAP: dict[TaskType, type[BaseAgent]] = {
     TaskType.FIX_CODE: CoderAgent,
     TaskType.MODIFY_FILE: PatchAgent,                            # surgical patch
     TaskType.GENERATE_INTEGRATION_TEST: IntegrationTestAgent,
+    TaskType.DESIGN_ARCHITECTURE: ArchitectAgent,
+    TaskType.CREATE_PLAN: PlannerAgent,
+    TaskType.VERIFY_BUILD: BuildVerifierAgent,
 }
 
 
@@ -127,6 +133,12 @@ class AgentManager:
                 terminal=self.test_terminal,
             )
         if agent_cls is SecurityAgent:
+            return agent_cls(
+                llm_client=self.llm,
+                repo_manager=self.repo,
+                terminal=self.build_terminal,
+            )
+        if agent_cls is BuildVerifierAgent:
             return agent_cls(
                 llm_client=self.llm,
                 repo_manager=self.repo,
@@ -455,6 +467,12 @@ class AgentManager:
                 "failure_event": EventType.RETRIES_EXHAUSTED,
                 "description": f"Fix {file_path} ({lc.fix_trigger} issues)",
             },
+            FilePhase.BUILDING: {
+                "task_type": TaskType.VERIFY_BUILD,
+                "success_event": EventType.BUILD_PASSED,
+                "failure_event": EventType.BUILD_FAILED,
+                "description": f"Verify build for {file_path}",
+            },
             FilePhase.TESTING: {
                 "task_type": TaskType.GENERATE_TEST,
                 "success_event": EventType.TEST_PASSED,
@@ -606,6 +624,9 @@ class AgentManager:
             meta["test_errors"] = lc.test_errors
             meta["fix_trigger"] = "test"
             meta["test_fix_target"] = lc.test_fix_target
+        elif lc.fix_trigger == "build":
+            meta["build_errors"] = lc.build_errors
+            meta["fix_trigger"] = "build"
         return meta
 
     @staticmethod
@@ -615,4 +636,6 @@ class AgentManager:
         if task_type == TaskType.GENERATE_TEST:
             if not result.success:
                 data["errors"] = "\n".join(result.errors) if result.errors else result.output
+        if task_type == TaskType.VERIFY_BUILD:
+            data["errors"] = "\n".join(result.errors) if result.errors else result.output
         return data

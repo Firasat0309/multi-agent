@@ -172,11 +172,16 @@ class LifecyclePlanBuilder:
             for fb in blueprint.file_blueprints
         }
 
+        from core.language import detect_language_from_blueprint
+        lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
+        compiled = bool(lang_profile.build_command)
+
         engine = LifecycleEngine(
             file_paths=file_paths,
             file_deps=file_deps,
             max_review_fixes=max_review_fixes,
             max_test_fixes=max_test_fixes,
+            compiled=compiled,
         )
 
         # Mark config/deploy/test files to skip testing

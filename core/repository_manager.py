@@ -543,27 +543,41 @@ class RepositoryManager:
         logger.info("Indexed %d files into repo index", file_count)
         return self._repo_index
 
-    def read_all_source_files(self) -> dict[str, str]:
-        """Read all source files in the workspace into a dict of path → content.
+    def read_source_files(self, paths: list[str]) -> dict[str, str]:
+        """Read a specific, bounded set of source files by relative path.
 
-        Useful for the repository analyzer agent which needs file contents
-        to produce module summaries.
+        Reads only the files listed in *paths* (workspace-relative), silently
+        skipping any that do not exist or cannot be decoded.  Use this instead
+        of the old ``read_all_source_files()`` to avoid bulk-loading the entire
+        repository into memory.
+        """
+        result: dict[str, str] = {}
+        for rel_path in paths:
+            content = self.read_file(rel_path)
+            if content is not None:
+                result[rel_path] = content
+        return result
+
+    def iter_source_files(self):
+        """Yield (rel_path, content) pairs for every source file in the workspace.
+
+        Streams files one at a time so the caller can stop early, apply a
+        budget cap, or process files without holding the full workspace in RAM.
+        Files inside common build/cache directories are skipped automatically.
         """
         skip_dirs = {
             ".git", "node_modules", "__pycache__", ".venv", "venv",
             "target", "build", "dist", ".idea", ".vscode",
         }
-        result: dict[str, str] = {}
         for ext in self._lang_profile.file_extensions:
             for src_file in self.workspace.rglob(f"*{ext}"):
                 if not src_file.is_file():
                     continue
-                if any(p in skip_dirs for p in src_file.parts):
+                if any(p in src_file.parts for p in skip_dirs):
                     continue
                 try:
                     content = src_file.read_text(encoding="utf-8")
                     rel_path = str(src_file.relative_to(self.workspace)).replace("\\", "/")
-                    result[rel_path] = content
+                    yield rel_path, content
                 except Exception:
                     pass
-        return result

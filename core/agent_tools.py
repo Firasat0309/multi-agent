@@ -9,14 +9,27 @@ from core.llm_client import ToolDefinition
 
 READ_FILE_TOOL = ToolDefinition(
     name="read_file",
-    description="Read the current content of a file in the workspace.",
+    description=(
+        "Read the content of a file in the workspace. "
+        "Files larger than 150 lines are returned in chunks — the response header "
+        "shows the total line count so you can request subsequent ranges with "
+        "start_line / end_line.  Omit both to read from line 1."
+    ),
     input_schema={
         "type": "object",
         "properties": {
             "path": {
                 "type": "string",
                 "description": "Workspace-relative path to the file (e.g. 'src/models/user.py').",
-            }
+            },
+            "start_line": {
+                "type": "integer",
+                "description": "1-based line to start reading from (inclusive). Defaults to 1.",
+            },
+            "end_line": {
+                "type": "integer",
+                "description": "1-based line to stop reading at (inclusive). Defaults to start_line + 149.",
+            },
         },
         "required": ["path"],
     },

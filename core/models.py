@@ -50,6 +50,9 @@ class TaskType(str, Enum):
     MODIFY_FILE = "modify_file"
     # ── Quality & validation task types ──
     GENERATE_INTEGRATION_TEST = "generate_integration_test"
+    DESIGN_ARCHITECTURE = "design_architecture"
+    CREATE_PLAN = "create_plan"
+    VERIFY_BUILD = "verify_build"
 
 
 class TaskStatus(str, Enum):
@@ -101,6 +104,7 @@ class AgentRole(str, Enum):
     REPO_ANALYZER = "repo_analyzer"
     CHANGE_PLANNER = "change_planner"
     INTEGRATION_TESTER = "integration_tester"
+    BUILD_VERIFIER = "build_verifier"
 
 
 @dataclass

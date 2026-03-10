@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
+
+# Files longer than this are served in chunks when no explicit range is given.
+# Matches the 100-line window used by most IDE agent loops; we use 150 to
+# reduce round-trips for typical class/function sizes.
+_READ_CHUNK_LINES = 150
 
 from core.agent_tools import ToolDefinition
 from core.language import get_language_profile
@@ -104,10 +110,16 @@ class BaseAgent(ABC):
                 )
                 return self._parse_agentic_result(context, response.content, files_written)
 
-            # Execute each tool call and gather results
+            # Execute all tool calls in this response concurrently.
+            # asyncio.gather preserves order, so tool_results aligns with
+            # the tool_use blocks in the assistant message.
+            async def _run_one(tc: ToolCall) -> str:
+                return await self._dispatch_tool(context, tc)
+
+            results = await asyncio.gather(*[_run_one(tc) for tc in response.tool_calls])
+
             tool_results: list[dict] = []
-            for tc in response.tool_calls:
-                result = await self._dispatch_tool(context, tc)
+            for tc, result in zip(response.tool_calls, results):
                 logger.debug(
                     "%s tool %s(%s) → %s",
                     self.__class__.__name__, tc.name,
@@ -178,11 +190,38 @@ class BaseAgent(ABC):
         path = inp.get("path", "")
         if not path:
             return "Error: 'path' is required"
-        # Security: async_read_file is scoped to workspace root
+
         content = await self.repo.async_read_file(path)
         if content is None:
             return f"File not found: {path}"
-        return content
+
+        lines = content.splitlines()
+        total = len(lines)
+
+        start_line: int | None = inp.get("start_line")
+        end_line: int | None = inp.get("end_line")
+
+        if start_line is None and end_line is None:
+            # No range requested — return full file for small files,
+            # or the first chunk with a navigation hint for large ones.
+            if total <= _READ_CHUNK_LINES:
+                return content
+            end_line = _READ_CHUNK_LINES
+            start_line = 1
+
+        # Clamp to valid 1-based range
+        start = max(1, int(start_line or 1))
+        if end_line is None:
+            end = min(total, start + _READ_CHUNK_LINES - 1)
+        else:
+            end = min(total, int(end_line))
+
+        chunk = lines[start - 1 : end]
+
+        header = f"[{path}  lines {start}–{end} of {total}]"
+        if end < total:
+            header += f"  — use start_line={end + 1} to continue"
+        return header + "\n" + "\n".join(chunk)
 
     async def _tool_write_file(self, inp: dict) -> str:
         path = inp.get("path", "")

@@ -13,6 +13,18 @@ from core.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 logger = logging.getLogger(__name__)
 
+
+def _blk(block: Any, key: str) -> Any:
+    """Read a field from a normalized content block (plain dict or SDK object).
+
+    Content blocks stored in message history can be either plain ``dict``
+    objects (our normalized internal format) or provider SDK objects that
+    expose the same fields as attributes.  This helper abstracts over both.
+    """
+    if isinstance(block, dict):
+        return block.get(key)
+    return getattr(block, key, None)
+
 # Per-million-token pricing in USD (update as providers publish new rates).
 # Keys match model IDs from VALID_MODELS; prefix-matching is used for aliases.
 MODEL_PRICING: dict[str, dict[str, float]] = {
@@ -526,35 +538,48 @@ class LLMClient:
         system_prompt: str = "",
         max_tokens: int = 8192,
     ) -> LLMResponseWithTools:
-        """Multi-turn tool-use call following the Claude tool_use pattern.
+        """Multi-turn tool-use call — supported for all three providers.
 
-        Only supported for the Anthropic provider.  Raises ``LLMClientError``
-        for other providers.
+        Messages use a normalized internal format (plain dicts matching the
+        Anthropic tool-use schema) so the same agentic loop in ``BaseAgent``
+        works regardless of which LLM is configured:
 
-        Args:
-            messages: Conversation history in Claude message format.
-            tools:    Tool definitions available to the model.
-            system_prompt: Optional system prompt.
-            max_tokens: Maximum tokens for the response.
+        * **Anthropic** — native tool_use blocks via the Messages API.
+        * **OpenAI** — native function-calling via the Chat Completions API.
+          Messages are translated to/from the OpenAI format internally.
+        * **Gemini** — structured-prompt simulation: tools are described in
+          the system prompt; the model signals a call via a JSON envelope
+          ``{"tool_call": {"name": ..., "input": {...}}}``.
 
-        Returns:
-            ``LLMResponseWithTools`` with ``stop_reason`` of either
-            ``"tool_use"`` (model wants to call tools) or ``"end_turn"``
-            (model is finished).
+        ``raw_content`` in the returned ``LLMResponseWithTools`` is always a
+        list of plain normalized dicts so it can be safely re-fed on the next
+        iteration without provider-specific objects in the history.
         """
-        if self.config.provider != LLMProvider.ANTHROPIC:
-            raise LLMClientError(
-                f"Tool-use is only supported with Anthropic provider "
-                f"(current: {self.config.provider.value})"
+        if self.config.provider == LLMProvider.ANTHROPIC:
+            return await self._anthropic_generate_with_tools(
+                messages, tools, system_prompt, max_tokens,
             )
+        if self.config.provider == LLMProvider.OPENAI:
+            return await self._openai_generate_with_tools(
+                messages, tools, system_prompt, max_tokens,
+            )
+        # Gemini — structured-prompt simulation
+        return await self._gemini_generate_with_tools(
+            messages, tools, system_prompt, max_tokens,
+        )
 
+    # ── Per-provider tool-use implementations ────────────────────────────────
+
+    async def _anthropic_generate_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[ToolDefinition],
+        system_prompt: str,
+        max_tokens: int,
+    ) -> LLMResponseWithTools:
         client = self._get_client()
         api_tools = [
-            {
-                "name": t.name,
-                "description": t.description,
-                "input_schema": t.input_schema,
-            }
+            {"name": t.name, "description": t.description, "input_schema": t.input_schema}
             for t in tools
         ]
 
@@ -570,10 +595,7 @@ class LLMClient:
             return client.messages.create(**kwargs)
 
         try:
-            async def _call_async() -> Any:
-                return await asyncio.to_thread(_sync)
-
-            response = await self._circuit.call(_call_async)
+            response = await self._circuit.call(lambda: asyncio.to_thread(_sync))
         except CircuitOpenError as exc:
             raise LLMClientError(str(exc)) from exc
 
@@ -581,20 +603,26 @@ class LLMClient:
         self.total_output_tokens += response.usage.output_tokens
         self._update_metrics(response.usage)
 
-        # Collect text blocks and tool_use blocks from the response
+        # Normalize SDK objects → plain dicts so history is always serialisable
+        # and can be re-fed to any provider without Anthropic SDK objects inside.
+        normalized: list[dict] = []
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
         for block in response.content:
-            if block.type == "text":
+            btype = getattr(block, "type", None)
+            if btype == "text":
                 text_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_calls.append(
-                    ToolCall(
-                        tool_use_id=block.id,
-                        name=block.name,
-                        input=block.input,
-                    )
-                )
+                normalized.append({"type": "text", "text": block.text})
+            elif btype == "tool_use":
+                tool_calls.append(ToolCall(
+                    tool_use_id=block.id, name=block.name, input=block.input,
+                ))
+                normalized.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                })
 
         return LLMResponseWithTools(
             content="\n".join(text_parts),
@@ -604,8 +632,261 @@ class LLMClient:
                 "input_tokens": response.usage.input_tokens,
                 "output_tokens": response.usage.output_tokens,
             },
-            raw_content=response.content,
+            raw_content=normalized,
         )
+
+    async def _openai_generate_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[ToolDefinition],
+        system_prompt: str,
+        max_tokens: int,
+    ) -> LLMResponseWithTools:
+        client = self._get_client()
+        oai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                },
+            }
+            for t in tools
+        ]
+        oai_messages = self._translate_messages_to_openai(messages, system_prompt)
+
+        def _sync() -> Any:
+            return client.chat.completions.create(
+                model=self.config.model,
+                max_tokens=max_tokens,
+                tools=oai_tools,
+                tool_choice="auto",
+                messages=oai_messages,
+            )
+
+        try:
+            response = await self._circuit.call(lambda: asyncio.to_thread(_sync))
+        except CircuitOpenError as exc:
+            raise LLMClientError(str(exc)) from exc
+
+        self.total_input_tokens += response.usage.prompt_tokens
+        self.total_output_tokens += response.usage.completion_tokens
+
+        choice = response.choices[0]
+        msg = choice.message
+        finish = choice.finish_reason  # "tool_calls" | "stop"
+
+        # Build normalized raw_content and ToolCall list
+        normalized: list[dict] = []
+        tool_calls: list[ToolCall] = []
+        text = msg.content or ""
+        if text:
+            normalized.append({"type": "text", "text": text})
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                try:
+                    inp = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    inp = {}
+                tool_calls.append(ToolCall(
+                    tool_use_id=tc.id, name=tc.function.name, input=inp,
+                ))
+                normalized.append({
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "input": inp,
+                })
+
+        stop_reason = "tool_use" if finish == "tool_calls" else "end_turn"
+        return LLMResponseWithTools(
+            content=text,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+            usage={
+                "input_tokens": response.usage.prompt_tokens,
+                "output_tokens": response.usage.completion_tokens,
+            },
+            raw_content=normalized,
+        )
+
+    async def _gemini_generate_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[ToolDefinition],
+        system_prompt: str,
+        max_tokens: int,
+    ) -> LLMResponseWithTools:
+        """Simulate tool use for Gemini via structured-prompt conventions.
+
+        The tools are described as a JSON schema block appended to the system
+        prompt.  The model is instructed to signal a tool call by responding
+        with ONLY ``{"tool_call": {"name": "...", "input": {...}}}``.  Any
+        other response is treated as a final text answer (``end_turn``).
+        """
+        tool_schema = json.dumps(
+            [{"name": t.name, "description": t.description, "parameters": t.input_schema}
+             for t in tools],
+            indent=2,
+        )
+        tool_instruction = (
+            "\n\nYou have access to these tools:\n"
+            f"```json\n{tool_schema}\n```\n\n"
+            "To call a tool, respond with ONLY this JSON (no other text):\n"
+            '{"tool_call": {"name": "<tool_name>", "input": {<arguments>}}}\n'
+            "Otherwise respond normally."
+        )
+        full_system = system_prompt + tool_instruction
+
+        # Flatten normalized messages into a plain conversation string for Gemini
+        conversation = self._flatten_messages_for_gemini(messages)
+
+        response = await self._gemini_generate(
+            self._get_client(), full_system, conversation,
+            self.config.temperature, max_tokens,
+        )
+        text = response.content.strip()
+
+        # Try to detect a tool-call JSON envelope
+        try:
+            start = text.find("{")
+            if start != -1:
+                data = json.loads(text[start:])
+                if "tool_call" in data:
+                    tc_data = data["tool_call"]
+                    tc = ToolCall(
+                        tool_use_id=f"gemini-{tc_data['name']}-0",
+                        name=tc_data["name"],
+                        input=tc_data.get("input", {}),
+                    )
+                    normalized = [{"type": "tool_use", "id": tc.tool_use_id,
+                                   "name": tc.name, "input": tc.input}]
+                    return LLMResponseWithTools(
+                        content="",
+                        tool_calls=[tc],
+                        stop_reason="tool_use",
+                        usage=response.usage,
+                        raw_content=normalized,
+                    )
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+        # Plain text response — end_turn
+        return LLMResponseWithTools(
+            content=text,
+            tool_calls=[],
+            stop_reason="end_turn",
+            usage=response.usage,
+            raw_content=[{"type": "text", "text": text}],
+        )
+
+    # ── Message format translation helpers ───────────────────────────────────
+
+    def _translate_messages_to_openai(
+        self,
+        messages: list[dict],
+        system_prompt: str = "",
+    ) -> list[dict]:
+        """Convert normalized internal messages to OpenAI Chat Completions format.
+
+        Internal normalized format uses Anthropic-style content blocks
+        (plain dicts with ``type`` keys).  Tool results live in
+        ``{"role": "user", "content": [{"type": "tool_result", ...}]}`` turns.
+        """
+        result: list[dict] = []
+        if system_prompt:
+            result.append({"role": "system", "content": system_prompt})
+
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+
+            if isinstance(content, str):
+                result.append({"role": role, "content": content})
+                continue
+
+            if not isinstance(content, list):
+                result.append({"role": role, "content": str(content)})
+                continue
+
+            tool_uses = [b for b in content if _blk(b, "type") == "tool_use"]
+            tool_results = [b for b in content if _blk(b, "type") == "tool_result"]
+            text_blocks = [b for b in content if _blk(b, "type") == "text"]
+
+            if role == "assistant" and tool_uses:
+                text = "\n".join(_blk(b, "text") for b in text_blocks) or None
+                oai_tool_calls = [
+                    {
+                        "id": _blk(b, "id"),
+                        "type": "function",
+                        "function": {
+                            "name": _blk(b, "name"),
+                            "arguments": json.dumps(_blk(b, "input") or {}),
+                        },
+                    }
+                    for b in tool_uses
+                ]
+                result.append({
+                    "role": "assistant",
+                    "content": text,
+                    "tool_calls": oai_tool_calls,
+                })
+            elif role == "user" and tool_results:
+                # Each tool result becomes a separate "tool" role message
+                for b in tool_results:
+                    raw = _blk(b, "content") or ""
+                    if isinstance(raw, list):
+                        raw = "\n".join(
+                            item.get("text", "") if isinstance(item, dict) else str(item)
+                            for item in raw
+                        )
+                    result.append({
+                        "role": "tool",
+                        "tool_call_id": _blk(b, "tool_use_id"),
+                        "content": str(raw),
+                    })
+            else:
+                # Plain user text or assistant text without tool calls
+                text = "\n".join(_blk(b, "text") for b in text_blocks)
+                result.append({"role": role, "content": text})
+
+        return result
+
+    def _flatten_messages_for_gemini(self, messages: list[dict]) -> str:
+        """Flatten normalized messages into a single prompt string for Gemini.
+
+        Gemini's multi-turn tool-use API requires a stateful chat session and
+        is not compatible with the stateless message-list pattern used here.
+        We flatten the conversation to a string so that the existing agentic
+        loop works without a redesign; the model sees the full context each
+        turn.
+        """
+        parts: list[str] = []
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            if isinstance(content, str):
+                parts.append(f"{role.upper()}: {content}")
+            elif isinstance(content, list):
+                for block in content:
+                    btype = _blk(block, "type")
+                    if btype == "text":
+                        parts.append(f"{role.upper()}: {_blk(block, 'text')}")
+                    elif btype == "tool_use":
+                        parts.append(
+                            f"TOOL_CALL: {_blk(block, 'name')} "
+                            f"args={json.dumps(_blk(block, 'input') or {})}"
+                        )
+                    elif btype == "tool_result":
+                        raw = _blk(block, "content") or ""
+                        if isinstance(raw, list):
+                            raw = "\n".join(
+                                item.get("text", "") if isinstance(item, dict) else str(item)
+                                for item in raw
+                            )
+                        parts.append(f"TOOL_RESULT: {raw}")
+        return "\n".join(parts)
 
     def _update_metrics(self, usage: Any) -> None:
         """No-op hook for subclasses / tests to observe token usage."""
