@@ -7,6 +7,8 @@ import logging
 from typing import Any
 
 from agents.base_agent import BaseAgent
+from core.ast_extractor import ASTExtractor
+from core.language import detect_language_from_blueprint
 from core.models import (
     AgentContext,
     AgentRole,
@@ -21,6 +23,11 @@ from core.models import (
 
 logger = logging.getLogger(__name__)
 
+# Maximum modules included in the repo context sent to the LLM.
+# Modules are ranked by keyword overlap with the user request so the most
+# relevant ones fill the budget rather than an arbitrary positional slice.
+_MAX_CONTEXT_MODULES = 60
+
 # Valid action type strings the LLM may return → enum mapping
 _ACTION_TYPE_MAP: dict[str, ChangeActionType] = {
     "add_function": ChangeActionType.ADD_FUNCTION,
@@ -32,6 +39,9 @@ _ACTION_TYPE_MAP: dict[str, ChangeActionType] = {
     "add_field": ChangeActionType.ADD_FIELD,
     "create_file": ChangeActionType.CREATE_FILE,
 }
+
+# Shared extractor — stateless aside from the parse cache.
+_ast_extractor = ASTExtractor()
 
 
 class ChangePlannerAgent(BaseAgent):
@@ -104,8 +114,7 @@ class ChangePlannerAgent(BaseAgent):
         """
         logger.info("Planning changes for request: %s", user_request[:100])
 
-        # Build context about the repository for the LLM
-        repo_context = self._build_repo_context(repo_analysis, file_contents)
+        repo_context = self._build_repo_context(repo_analysis, file_contents, user_request)
 
         prompt = (
             f"The user wants to modify an existing codebase.\n\n"
@@ -115,23 +124,35 @@ class ChangePlannerAgent(BaseAgent):
             f"and what to add/change in each file."
         )
 
-        response = await self.llm.generate(
-            system_prompt=self.system_prompt,
-            user_prompt=prompt,
-            max_tokens=8192,
-        )
-        self._metrics["llm_calls"] += 1
-        self._metrics["tokens_used"] += sum(response.usage.values())
+        # Use _call_llm so the max_tokens continuation loop fires if the JSON
+        # is truncated — direct llm.generate() bypasses that safety net.
+        raw = await self._call_llm(prompt)
 
-        data = self._parse_json(response.content)
+        data = self._parse_json(raw)
+        if not data:
+            logger.error(
+                "ChangePlannerAgent produced empty plan (JSON parse failed). "
+                "Raw response (first 500 chars): %s", raw[:500],
+            )
         return self._parse_change_plan(data)
 
     def _build_repo_context(
         self,
         analysis: RepoAnalysis,
         file_contents: dict[str, str] | None,
+        user_request: str = "",
     ) -> str:
-        """Build a compact text representation of the repository for LLM context."""
+        """Build a compact text representation of the repository for LLM context.
+
+        Modules are ranked by keyword overlap with *user_request* so the
+        capped list contains the most relevant modules rather than an
+        arbitrary positional slice of the full module list.
+
+        File contents are rendered as AST stubs (signatures only) when the
+        language is supported by tree-sitter, falling back to 4 000-char
+        truncation otherwise.  Stubs are 5-20× smaller than raw source and
+        provide richer structural information per token.
+        """
         lines: list[str] = []
 
         lines.append(f"Tech stack: {json.dumps(analysis.tech_stack)}")
@@ -141,8 +162,23 @@ class ChangePlannerAgent(BaseAgent):
         lines.append(f"Entry points: {analysis.entry_points}")
         lines.append("")
 
-        lines.append(f"Modules ({len(analysis.modules)} total):")
-        for m in analysis.modules:
+        # Rank modules by keyword overlap with the user request so that
+        # relevant modules appear first and survive the budget cap.
+        request_tokens = set(user_request.lower().split())
+
+        def _module_score(m: ModuleInfo) -> int:
+            symbols = " ".join([m.file] + m.classes + m.functions).lower()
+            return sum(1 for tok in request_tokens if tok in symbols)
+
+        ranked_modules = sorted(analysis.modules, key=_module_score, reverse=True)
+        shown = ranked_modules[:_MAX_CONTEXT_MODULES]
+        omitted = len(analysis.modules) - len(shown)
+
+        lines.append(
+            f"Modules ({len(analysis.modules)} total"
+            + (f", showing top {len(shown)} by relevance):" if omitted else "):")
+        )
+        for m in shown:
             funcs = ", ".join(m.functions[:10])
             classes = ", ".join(m.classes[:5])
             line = f"  - {m.file} [{m.layer}]"
@@ -151,21 +187,29 @@ class ChangePlannerAgent(BaseAgent):
             if funcs:
                 line += f" funcs=[{funcs}]"
             lines.append(line)
+        if omitted:
+            lines.append(f"  ... and {omitted} more modules omitted")
 
-        # If specific file contents provided, include them for precision
+        # File contents — prefer AST stubs over raw truncation.
         if file_contents:
             lines.append("")
-            lines.append("Key file contents:")
+            lines.append("Key file contents (AST stubs where available):")
+            lang_profile = detect_language_from_blueprint(analysis.tech_stack)
             total_chars = 0
             for path, content in file_contents.items():
                 if total_chars > 30_000:
+                    lines.append("  ... remaining files omitted (budget reached)")
                     break
-                truncated = content[:4000]
-                if len(content) > 4000:
-                    truncated += "\n# ... (truncated)"
+                stub = _ast_extractor.extract_stub(path, content, lang_profile.name)
+                if stub is not None:
+                    body = f"// AST stub (signatures only)\n{stub}"
+                else:
+                    body = content[:4_000]
+                    if len(content) > 4_000:
+                        body += "\n# ... (truncated)"
                 lines.append(f"\n--- {path} ---")
-                lines.append(truncated)
-                total_chars += len(truncated)
+                lines.append(body)
+                total_chars += len(body)
 
         return "\n".join(lines)
 
@@ -205,7 +249,12 @@ class ChangePlannerAgent(BaseAgent):
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
-        """Parse JSON from LLM output, handling fences."""
+        """Parse JSON from LLM output, handling markdown fences and truncation.
+
+        The fallback bracket-scan walks inward from the outermost ``{`` and
+        ``}`` so a truncated response that ends mid-array or mid-string is
+        rejected cleanly rather than parsed as a silently incomplete plan.
+        """
         text = text.strip()
         if text.startswith("```"):
             lines = text.split("\n")
@@ -216,12 +265,25 @@ class ChangePlannerAgent(BaseAgent):
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start != -1 and end > start:
-                try:
-                    return json.loads(text[start:end])
-                except json.JSONDecodeError:
-                    pass
-            logger.error("Could not parse change plan JSON: %s...", text[:200])
+            pass
+
+        # Walk inward: find outermost { … } pair where both ends parse cleanly.
+        # rfind("}") alone can match an interior "}" in truncated output,
+        # producing an incomplete but parse-successful fragment.
+        start = text.find("{")
+        if start == -1:
+            logger.error("No JSON object found in change plan response: %s...", text[:200])
             return {}
+
+        end = len(text)
+        while end > start:
+            end = text.rfind("}", start, end)
+            if end == -1:
+                break
+            try:
+                return json.loads(text[start:end + 1])
+            except json.JSONDecodeError:
+                pass  # try one character shorter
+
+        logger.error("Could not parse change plan JSON: %s...", text[:200])
+        return {}

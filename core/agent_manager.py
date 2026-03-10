@@ -18,6 +18,7 @@ from agents.test_agent import TestAgent
 from agents.writer_agent import WriterAgent
 from config.settings import Settings
 from core.context_builder import ContextBuilder
+from core.event_bus import AgentEvent, BusEventType, EventBus
 from core.file_lock_manager import FileLockManager
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient
@@ -72,6 +73,7 @@ class AgentManager:
         test_sandbox_id: str | None = None,
         dep_store: DependencyGraphStore | None = None,
         embedding_store: EmbeddingStore | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.settings = settings
         self.llm = llm_client
@@ -81,6 +83,7 @@ class AgentManager:
         self._lang = detect_language_from_blueprint(blueprint.tech_stack)
         self._dep_store = dep_store
         self._embedding_store = embedding_store
+        self._event_bus = event_bus
 
         # Two-tier terminal tools: build (network-capable) and test (isolated).
         # TestAgent gets the test terminal; all other agents that need a
@@ -250,6 +253,31 @@ class AgentManager:
                     self._metrics["tasks_completed"] += 1
                     record_task_completion(task.task_type.value, "completed", elapsed)
                     logger.info(f"Task {task.task_id} completed: {result.output}")
+                    # Incremental embedding update — keep vector index fresh
+                    # so subsequent agents' semantic searches see new content.
+                    if self._embedding_store and result.files_modified:
+                        for fp in result.files_modified:
+                            try:
+                                content = self.repo.read_file(fp)
+                                self._embedding_store.index_file(fp, content)
+                            except Exception:
+                                logger.debug("Embedding update skipped for %s", fp)
+                            if self._event_bus:
+                                await self._event_bus.publish(AgentEvent(
+                                    type=BusEventType.FILE_WRITTEN,
+                                    task_id=task.task_id,
+                                    task_type=task.task_type.value,
+                                    file_path=fp,
+                                    agent_name=agent_name,
+                                ))
+                    if self._event_bus:
+                        await self._event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_COMPLETED,
+                            task_id=task.task_id,
+                            task_type=task.task_type.value,
+                            file_path=task.file,
+                            agent_name=agent_name,
+                        ))
                     if self._live:
                         self._live.update_task(
                             task.task_id, task.description, "completed", agent_name,
@@ -276,6 +304,14 @@ class AgentManager:
         self._metrics["tasks_failed"] += 1
         record_task_completion(task.task_type.value, "failed", elapsed)
         logger.error(f"Task {task.task_id} failed after {task.max_retries} attempts")
+        if self._event_bus:
+            await self._event_bus.publish(AgentEvent(
+                type=BusEventType.TASK_FAILED,
+                task_id=task.task_id,
+                task_type=task.task_type.value,
+                file_path=task.file,
+                agent_name=agent_name,
+            ))
         if self._live:
             self._live.update_task(task.task_id, task.description, "failed", agent_name)
             self._live.log(f"[red]Failed:[/red] {task.description}")
@@ -477,21 +513,76 @@ class AgentManager:
                 if review_passed:
                     event_data = {"output": result.output}
                     engine.process_event(file_path, EventType.REVIEW_PASSED, event_data)
+                    if self._event_bus:
+                        await self._event_bus.publish(AgentEvent(
+                            type=BusEventType.REVIEW_PASSED,
+                            task_type=config["task_type"].value,
+                            file_path=file_path,
+                            agent_name=agent_name,
+                        ))
                 else:
                     event_data = {"findings": result.errors, "output": result.output}
                     engine.process_event(file_path, EventType.REVIEW_FAILED, event_data)
+                    if self._event_bus:
+                        await self._event_bus.publish(AgentEvent(
+                            type=BusEventType.REVIEW_FAILED,
+                            task_type=config["task_type"].value,
+                            file_path=file_path,
+                            agent_name=agent_name,
+                            data={"findings": result.errors},
+                        ))
                 self._metrics["tasks_completed"] += 1
             elif result.success:
                 self._metrics["tasks_completed"] += 1
                 event_data = self._extract_event_data(result, config["task_type"])
                 engine.process_event(file_path, config["success_event"], event_data)
                 logger.info("[%s] %s succeeded", file_path, phase.value)
+                # Incremental embedding update for lifecycle path
+                if self._embedding_store and result.files_modified:
+                    for fp in result.files_modified:
+                        try:
+                            content = self.repo.read_file(fp)
+                            self._embedding_store.index_file(fp, content)
+                        except Exception:
+                            logger.debug("Embedding update skipped for %s", fp)
+                        if self._event_bus:
+                            await self._event_bus.publish(AgentEvent(
+                                type=BusEventType.FILE_WRITTEN,
+                                task_type=config["task_type"].value,
+                                file_path=fp,
+                                agent_name=agent_name,
+                            ))
+                if self._event_bus:
+                    bus_type = (
+                        BusEventType.TEST_PASSED
+                        if config["task_type"] == TaskType.GENERATE_TEST
+                        else BusEventType.TASK_COMPLETED
+                    )
+                    await self._event_bus.publish(AgentEvent(
+                        type=bus_type,
+                        task_type=config["task_type"].value,
+                        file_path=file_path,
+                        agent_name=agent_name,
+                    ))
                 if self._live:
                     self._live.log(f"[green]Done:[/green] {config['description']}")
             else:
                 event_data = self._extract_event_data(result, config["task_type"])
                 engine.process_event(file_path, config["failure_event"], event_data)
                 logger.warning("[%s] %s failed: %s", file_path, phase.value, result.errors)
+                if self._event_bus:
+                    bus_type = (
+                        BusEventType.TEST_FAILED
+                        if config["task_type"] == TaskType.GENERATE_TEST
+                        else BusEventType.TASK_FAILED
+                    )
+                    await self._event_bus.publish(AgentEvent(
+                        type=bus_type,
+                        task_type=config["task_type"].value,
+                        file_path=file_path,
+                        agent_name=agent_name,
+                        data={"errors": result.errors},
+                    ))
                 if self._live:
                     self._live.log(
                         f"[yellow]Issue:[/yellow] {config['description']} — "

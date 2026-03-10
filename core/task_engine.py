@@ -325,16 +325,22 @@ class ModificationTaskGraphBuilder:
         graph = TaskGraph()
         file_task_map: dict[str, int] = {}  # file_path → last task_id for that file
 
-        # ── Pre-flight: conflict detection ────────────────────────────
+        # ── Pre-flight: conflict detection & resolution ───────────────
         conflicts = self._detect_conflicts(change_plan.changes)
         if conflicts:
             for conflict in conflicts:
-                logger.warning("Change conflict: %s", conflict)
-            # Surface conflicts as risk notes for downstream visibility
+                logger.warning("Change conflict detected: %s", conflict)
             change_plan.risk_notes.extend(conflicts)
 
+        # Merge changes that target the same symbol in the same file into a
+        # single MODIFY_FILE task.  Without this, the second task reads the
+        # file (with task 1's edits in place), asks the LLM to apply only
+        # its change, and writes the full file back — silently dropping task
+        # 1's changes if the LLM doesn't faithfully preserve them.
+        resolved_changes = self._merge_conflicting_changes(change_plan.changes)
+
         # ── Pre-flight: cycle detection & safe ordering ────────────────
-        ordered_changes = self._order_changes(change_plan.changes)
+        ordered_changes = self._order_changes(resolved_changes)
 
         # ── Phase 1: Modification tasks (graph-safe order) ────────────
         for change in ordered_changes:
@@ -343,6 +349,15 @@ class ModificationTaskGraphBuilder:
                 for d in change.depends_on
                 if d in file_task_map
             ]
+            # Implicit same-file chain: if a previous task already targets
+            # this file, make the new task depend on it.  This guarantees
+            # sequential execution even when the change plan omits the
+            # self-dependency in its explicit depends_on list.
+            if change.file in file_task_map:
+                prev_id = file_task_map[change.file]
+                if prev_id not in deps:
+                    deps.append(prev_id)
+
             impact_meta = self._get_impact_meta(change.file)
             task = Task(
                 task_id=self._alloc_id(),
@@ -531,6 +546,69 @@ class ModificationTaskGraphBuilder:
             targets.update(graph_tests)
 
         return targets
+
+    def _merge_conflicting_changes(
+        self, changes: list[ChangeAction]
+    ) -> list[ChangeAction]:
+        """Merge changes that target the same symbol in the same file.
+
+        Two changes with identical ``(file, class_name, function)`` keys are
+        collapsed into a single ``ChangeAction`` whose description combines
+        both intents.  The merged task is given to the agent once, so it can
+        apply all sub-changes in a single read-modify-write pass rather than
+        having the second pass overwrite (and potentially lose) the first's
+        edits.
+
+        Changes whose target key contains only blank fields — i.e. file-level
+        changes with no named symbol — are never merged because there is no
+        reliable way to determine whether they conflict.
+        """
+        # Preserve insertion order so the task graph stays deterministic.
+        seen: dict[tuple[str, str, str], list[ChangeAction]] = {}
+        for change in changes:
+            key = (change.file, change.class_name or "", change.function or "")
+            seen.setdefault(key, []).append(change)
+
+        merged: list[ChangeAction] = []
+        for (file, cls, fn), group in seen.items():
+            if len(group) == 1:
+                merged.append(group[0])
+                continue
+
+            # Blank-target changes (no class AND no function) stay separate —
+            # they likely touch different parts of the file.
+            if not cls and not fn:
+                merged.extend(group)
+                continue
+
+            # Merge: combine descriptions; union depends_on; keep first type.
+            combined_desc = "; ".join(
+                f"({i + 1}) {c.description}" for i, c in enumerate(group)
+            )
+            seen_deps: set[str] = set()
+            all_deps: list[str] = []
+            for c in group:
+                for d in c.depends_on:
+                    if d not in seen_deps:
+                        all_deps.append(d)
+                        seen_deps.add(d)
+
+            symbol = f"{cls}.{fn}" if fn else (cls or fn)
+            logger.info(
+                "Merging %d conflicting changes for '%s' in %s into one task",
+                len(group), symbol, file,
+            )
+            merged.append(ChangeAction(
+                type=group[0].type,
+                file=file,
+                description=combined_desc,
+                function=fn,
+                class_name=cls,
+                depends_on=all_deps,
+                details=group[0].details,
+            ))
+
+        return merged
 
     def _detect_conflicts(self, changes: list[ChangeAction]) -> list[str]:
         """Detect when multiple changes target the same function/class in the same file.
