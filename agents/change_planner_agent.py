@@ -248,7 +248,13 @@ class ChangePlannerAgent(BaseAgent):
         changes: list[ChangeAction] = []
         for c in data.get("changes", []):
             action_type_str = c.get("type", "add_function")
-            action_type = _ACTION_TYPE_MAP.get(action_type_str, ChangeActionType.ADD_FUNCTION)
+            action_type = _ACTION_TYPE_MAP.get(action_type_str)
+            if action_type is None:
+                logger.warning(
+                    "ChangePlannerAgent: unknown action type %r, defaulting to ADD_FUNCTION",
+                    action_type_str,
+                )
+                action_type = ChangeActionType.ADD_FUNCTION
             changes.append(ChangeAction(
                 type=action_type,
                 file=c.get("file", ""),

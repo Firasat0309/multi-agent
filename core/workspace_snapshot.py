@@ -110,6 +110,7 @@ class WorkspaceSnapshot:
     def get_changed_files(self) -> list[str]:
         """Return list of rel-paths that differ from the snapshot (added/modified/deleted)."""
         changed: list[str] = []
+        # Detect modified or deleted files (were in the original snapshot)
         for rel_path, orig_checksum in self._manifest.items():
             current_file = self.workspace / rel_path
             if not current_file.exists():
@@ -120,6 +121,12 @@ class WorkspaceSnapshot:
                     changed.append(rel_path)
             except OSError:
                 changed.append(rel_path)
+        # Detect newly created files (not present at snapshot time)
+        snapshot_paths = set(self._manifest.keys())
+        for src_file in self._iter_source_files():
+            rel_str = str(src_file.relative_to(self.workspace)).replace("\\", "/")
+            if rel_str not in snapshot_paths:
+                changed.append(rel_str)
         return changed
 
     def compute_diff_stats(self) -> dict[str, int]:
@@ -152,11 +159,18 @@ class WorkspaceSnapshot:
                 except OSError:
                     pass
 
-            # Simple line count diff (not a proper LCS diff, but fast and good enough)
-            orig_set = set(orig_lines)
-            new_set = set(new_lines)
-            total_removed += sum(1 for l in orig_lines if l not in new_set)
-            total_added += sum(1 for l in new_lines if l not in orig_set)
+            # Use difflib for a proper line-level diff so duplicate / moved
+            # lines are counted correctly (set comparison double-counts them).
+            import difflib
+            matcher = difflib.SequenceMatcher(None, orig_lines, new_lines, autojunk=False)
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag == "replace":
+                    total_removed += i2 - i1
+                    total_added += j2 - j1
+                elif tag == "delete":
+                    total_removed += i2 - i1
+                elif tag == "insert":
+                    total_added += j2 - j1
 
         return {"lines_added": total_added, "lines_removed": total_removed}
 

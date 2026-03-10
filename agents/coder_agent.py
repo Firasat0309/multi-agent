@@ -397,6 +397,14 @@ class CoderAgent(BaseAgent):
             "- Output only the code, no markdown fences or explanations"
         )
 
+    async def modify_file(self, context: AgentContext) -> TaskResult:
+        """Public entry-point for targeted file modification.
+
+        Alias kept so external callers (PatchAgent fallback) do not depend on
+        a private method name.  Delegates to ``_modify_file``.
+        """
+        return await self._modify_file(context)
+
     async def _modify_file(self, context: AgentContext) -> TaskResult:
         """Modify an existing file based on a change action.
 

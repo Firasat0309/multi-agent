@@ -158,6 +158,13 @@ class AgentManager:
                 stats = task_graph.get_stats()
                 if stats.get("in_progress", 0) == 0:
                     logger.error("Deadlock detected - no ready tasks and none in progress")
+                    # Mark abandoned PENDING/READY tasks as FAILED so stats
+                    # accurately reflect the incomplete run; without this the
+                    # pipeline success-check sees failed=0 and reports success.
+                    for t in task_graph.tasks.values():
+                        if t.status in (TaskStatus.PENDING, TaskStatus.READY):
+                            task_graph.mark_failed(t.task_id)
+                            self._metrics["tasks_failed"] += 1
                     break
                 await asyncio.sleep(0.5)
                 continue
@@ -202,10 +209,23 @@ class AgentManager:
             self._live.update_task(task.task_id, task.description, "in_progress")
             self._live.log(f"[cyan]Starting:[/cyan] {task.description}")
 
-        # For FIX_CODE tasks, pull review findings from the review task's result
+        # For FIX_CODE tasks, pull review findings from the review task's result.
+        # If the review passed, skip the fix entirely — no LLM call needed.
         if task.task_type == TaskType.FIX_CODE and "review_task_id" in task.metadata:
             review_task = task_graph.get_task(task.metadata["review_task_id"])
             if review_task and review_task.result:
+                if review_task.result.metrics.get("passed", False):
+                    logger.info(
+                        "FIX_CODE task %d skipped — review passed for %s",
+                        task.task_id, task.file,
+                    )
+                    task_graph.mark_completed(task.task_id)
+                    self._metrics["tasks_completed"] += 1
+                    if self._live:
+                        self._live.update_task(
+                            task.task_id, task.description, "completed",
+                        )
+                    return
                 task.metadata["review_errors"] = review_task.result.errors
                 task.metadata["review_output"] = review_task.result.output
 

@@ -214,8 +214,12 @@ class EnhancePipeline:
                 # generating two tasks for the same file.
                 already_in_changes = any(c.file == nf.path for c in change_plan.changes)
                 if not already_in_changes:
+                    # Use ADD_FUNCTION (generic "add something") rather than
+                    # CREATE_FILE, since the file already exists — PatchAgent
+                    # receives change_type as a hint in its prompt and
+                    # CREATE_FILE on an existing file is contradictory.
                     change_plan.changes.append(ChangeAction(
-                        type=ChangeActionType.CREATE_FILE,
+                        type=ChangeActionType.ADD_FUNCTION,
                         file=nf.path,
                         description=nf.purpose,
                     ))
