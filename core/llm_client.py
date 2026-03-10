@@ -9,8 +9,52 @@ from dataclasses import dataclass
 from typing import Any
 
 from config.settings import LLMConfig, LLMProvider
+from core.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 logger = logging.getLogger(__name__)
+
+# Per-million-token pricing in USD (update as providers publish new rates).
+# Keys match model IDs from VALID_MODELS; prefix-matching is used for aliases.
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    # Anthropic
+    "claude-sonnet-4-20250514": {"input": 3.00,  "output": 15.00},
+    "claude-3-5-sonnet-20241022": {"input": 3.00,  "output": 15.00},
+    "claude-3-5-haiku-20241022":  {"input": 0.80,  "output": 4.00},
+    "claude-3-opus-20240229":     {"input": 15.00, "output": 75.00},
+    "claude-3-sonnet-20240229":   {"input": 3.00,  "output": 15.00},
+    # OpenAI
+    "gpt-4o":               {"input": 2.50,  "output": 10.00},
+    "gpt-4-turbo":          {"input": 10.00, "output": 30.00},
+    "gpt-4-turbo-preview":  {"input": 10.00, "output": 30.00},
+    "gpt-4":                {"input": 30.00, "output": 60.00},
+    "gpt-3.5-turbo":        {"input": 0.50,  "output": 1.50},
+    # Google Gemini
+    "gemini-2.0-flash":     {"input": 0.075, "output": 0.30},
+    "gemini-1.5-pro":       {"input": 3.50,  "output": 10.50},
+    "gemini-1.5-flash":     {"input": 0.075, "output": 0.30},
+    "gemini-pro":           {"input": 0.50,  "output": 1.50},
+}
+
+
+def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Estimate USD cost for a given model and token counts.
+
+    Uses prefix matching so ``claude-sonnet-4-20250514`` and any future
+    variants still resolve to a price.  Returns 0.0 for unknown models.
+    """
+    pricing = MODEL_PRICING.get(model)
+    if pricing is None:
+        # Prefix match — e.g. future "claude-sonnet-4-20260101" hits "claude-sonnet-4-"
+        for key, val in MODEL_PRICING.items():
+            if model.startswith(key.rsplit("-", 1)[0]):
+                pricing = val
+                break
+    if pricing is None:
+        return 0.0
+    return (
+        input_tokens  * pricing["input"]  / 1_000_000
+        + output_tokens * pricing["output"] / 1_000_000
+    )
 
 
 @dataclass
@@ -60,6 +104,10 @@ class LLMClient:
     def __init__(self, config: LLMConfig):
         self.config = config
         self._client: Any = None
+        self._circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
+        # Cumulative token counters for cost tracking across the client's lifetime
+        self.total_input_tokens: int = 0
+        self.total_output_tokens: int = 0
         self._validate_config()
 
     def _validate_config(self) -> None:
@@ -146,20 +194,29 @@ class LLMClient:
         _max_attempts = 4
         _base_delay = 2.0  # seconds; doubles each attempt (2 → 4 → 8 → …)
 
+        async def _generate_once() -> LLMResponse:
+            if self.config.provider == LLMProvider.ANTHROPIC:
+                return await self._anthropic_generate(
+                    client, system_prompt, user_prompt, temp, tokens
+                )
+            elif self.config.provider == LLMProvider.GEMINI:
+                return await self._gemini_generate(
+                    client, system_prompt, user_prompt, temp, tokens
+                )
+            else:
+                return await self._openai_generate(
+                    client, system_prompt, user_prompt, temp, tokens
+                )
+
         for attempt in range(_max_attempts):
             try:
-                if self.config.provider == LLMProvider.ANTHROPIC:
-                    return await self._anthropic_generate(
-                        client, system_prompt, user_prompt, temp, tokens
-                    )
-                elif self.config.provider == LLMProvider.GEMINI:
-                    return await self._gemini_generate(
-                        client, system_prompt, user_prompt, temp, tokens
-                    )
-                else:
-                    return await self._openai_generate(
-                        client, system_prompt, user_prompt, temp, tokens
-                    )
+                response = await self._circuit.call(_generate_once)
+                # Accumulate lifetime token counts for cost reporting
+                self.total_input_tokens += response.usage.get("input_tokens", 0)
+                self.total_output_tokens += response.usage.get("output_tokens", 0)
+                return response
+            except CircuitOpenError as e:
+                raise LLMClientError(str(e)) from e
             except LLMClientError:
                 # Config / auth errors are never retried — surface immediately.
                 raise
@@ -342,6 +399,62 @@ class LLMClient:
             model=self.config.model,
             stop_reason=response.candidates[0].finish_reason.name if response.candidates else "",
         )
+
+    async def generate_streaming(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        on_chunk: Any | None = None,
+        max_tokens: int | None = None,
+    ) -> LLMResponse:
+        """Stream response chunks, calling *on_chunk(text)* for each delta.
+
+        Falls back to a regular ``generate()`` call for providers that do not
+        support streaming (Gemini, OpenAI in the current driver set).  Anthropic
+        uses the native streaming API.
+
+        Args:
+            on_chunk: Optional callable receiving each text delta as a string.
+                      Called synchronously from the stream-reading thread.
+        """
+        tokens = max_tokens if max_tokens is not None else self.config.max_tokens
+        client = self._get_client()
+
+        if self.config.provider == LLMProvider.ANTHROPIC:
+            import anthropic
+
+            collected: list[str] = []
+            usage: dict[str, int] = {}
+
+            def _stream_sync() -> None:
+                with client.messages.stream(
+                    model=self.config.model,
+                    max_tokens=tokens,
+                    temperature=self.config.temperature,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                ) as stream:
+                    for text in stream.text_stream:
+                        collected.append(text)
+                        if on_chunk is not None:
+                            on_chunk(text)
+                    final = stream.get_final_message()
+                    usage["input_tokens"] = final.usage.input_tokens
+                    usage["output_tokens"] = final.usage.output_tokens
+
+            await asyncio.to_thread(_stream_sync)
+            content = "".join(collected)
+            self.total_input_tokens += usage.get("input_tokens", 0)
+            self.total_output_tokens += usage.get("output_tokens", 0)
+            return LLMResponse(
+                content=content,
+                usage=usage,
+                model=self.config.model,
+                stop_reason="end_turn",
+            )
+
+        # Non-Anthropic providers: fall back to non-streaming generate
+        return await self.generate(system_prompt, user_prompt, max_tokens=max_tokens)
 
     async def generate_json(
         self,

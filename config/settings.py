@@ -101,12 +101,30 @@ class Settings:
         )
 
 
-# Singleton
+# ── CLI convenience singleton ─────────────────────────────────────────────────
+# Internal components (Pipeline, AgentManager, …) receive settings via their
+# constructors and MUST NOT call get_settings() directly.  This function exists
+# solely for:
+#   1. The CLI entry-point (core/cli.py) — one call at startup.
+#   2. The FastAPI server (core/api.py) — one call to read base env config.
+# Never import this in library code; always thread settings through constructors.
+
 _settings: Settings | None = None
 
 
 def get_settings() -> Settings:
+    """Return the process-wide Settings built from environment variables.
+
+    Cached after the first call.  Do not use inside library code — pass
+    settings explicitly via constructors instead (dependency injection).
+    """
     global _settings
     if _settings is None:
         _settings = Settings.from_env()
     return _settings
+
+
+def reset_settings() -> None:
+    """Clear the cached singleton — useful in tests that need fresh config."""
+    global _settings
+    _settings = None

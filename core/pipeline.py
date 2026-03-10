@@ -17,11 +17,13 @@ from config.settings import Settings
 from core.agent_manager import AgentManager
 from core.language import detect_language_from_blueprint
 from core.live_console import LiveConsole, LiveConsoleHandler
-from core.llm_client import LLMClient, LLMConfigError
-from core.models import RepositoryBlueprint, ChangePlan, RepoAnalysis
+from core.llm_client import LLMClient, LLMConfigError, calculate_cost
+from core.models import RepositoryBlueprint, ChangePlan, RepoAnalysis, TokenCost
 from core.plan_approver import PlanApprover, PlanPendingApprovalError
 from core.observability import record_task_completion, start_metrics_server, setup_tracing
 from core.repository_manager import RepositoryManager
+from core.run_reporter import RunReporter
+from core.sandbox_orchestrator import SandboxOrchestrator, SandboxUnavailableError
 from core.state_machine import LifecycleEngine
 from core.task_engine import TaskGraph, ModificationTaskGraphBuilder
 from core.workspace_snapshot import WorkspaceSnapshot
@@ -44,6 +46,7 @@ class PipelineResult:
     metrics: dict[str, Any] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
+    token_cost: TokenCost | None = None
 
 
 class Pipeline:
@@ -373,15 +376,16 @@ class Pipeline:
         logger.info(f"Stats: {stats}")
         logger.info(f"Elapsed: {elapsed:.1f}s | Workspace: {self.settings.workspace_dir}")
 
-        # Write structured activity report
-        self._write_run_report(
-            workspace=self.settings.workspace_dir,
+        # Build cost summary and write report
+        token_cost = self._build_token_cost()
+        RunReporter(self.settings.workspace_dir).write_run_report(
             prompt=user_prompt,
             blueprint=blueprint,
             task_graph=task_graph,
             stats=stats,
             elapsed=elapsed,
             success=success,
+            token_cost=token_cost,
         )
 
         self._stop_file_logging(file_handler)
@@ -395,54 +399,22 @@ class Pipeline:
             metrics=exec_result.get("metrics", {}),
             errors=errors,
             elapsed_seconds=elapsed,
+            token_cost=token_cost,
         )
 
-    def _write_run_report(
-        self,
-        workspace: Path,
-        prompt: str,
-        blueprint: Any,
-        task_graph: TaskGraph,
-        stats: dict[str, int],
-        elapsed: float,
-        success: bool,
-    ) -> None:
-        """Write a structured JSON report of the entire run to workspace/run_report.json."""
-        import json
-        from datetime import datetime, timezone
-
-        task_entries = []
-        for task in task_graph.tasks.values():
-            entry: dict[str, Any] = {
-                "id": task.task_id,
-                "type": task.task_type.value,
-                "file": task.file,
-                "description": task.description,
-                "status": task.status.value,
-                "retries": task.retry_count,
-            }
-            if task.result:
-                entry["output"] = task.result.output
-                entry["errors"] = task.result.errors
-                entry["files_modified"] = task.result.files_modified
-                entry["metrics"] = task.result.metrics
-            task_entries.append(entry)
-
-        report: dict[str, Any] = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "success": success,
-            "elapsed_seconds": round(elapsed, 2),
-            "prompt": prompt,
-            "project": blueprint.name if blueprint else "",
-            "language": blueprint.tech_stack.get("language", "") if blueprint else "",
-            "architecture_style": blueprint.architecture_style if blueprint else "",
-            "task_stats": stats,
-            "tasks": task_entries,
-        }
-
-        report_path = workspace / "run_report.json"
-        report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-        logger.info(f"Activity report written to {report_path}")
+    def _build_token_cost(self) -> TokenCost:
+        """Build a TokenCost from the LLM client's cumulative counters."""
+        cost = calculate_cost(
+            self.llm.config.model,
+            self.llm.total_input_tokens,
+            self.llm.total_output_tokens,
+        )
+        return TokenCost(
+            input_tokens=self.llm.total_input_tokens,
+            output_tokens=self.llm.total_output_tokens,
+            model=self.llm.config.model,
+            cost_usd=cost,
+        )
 
     def _index_workspace(self, repo_manager: RepositoryManager) -> None:
         """Index all generated files into memory stores."""
@@ -802,9 +774,9 @@ class Pipeline:
         logger.info(f"Stats: {stats}")
         logger.info(f"Elapsed: {elapsed:.1f}s | Workspace: {self.settings.workspace_dir}")
 
-        # Write modification report
-        self._write_modify_report(
-            workspace=self.settings.workspace_dir,
+        # Build cost summary and write report
+        token_cost = self._build_token_cost()
+        RunReporter(self.settings.workspace_dir).write_modify_report(
             prompt=user_prompt,
             change_plan=change_plan,
             task_graph=task_graph,
@@ -813,6 +785,7 @@ class Pipeline:
             success=success,
             changed_files=changed_files,
             diff_stats=diff_stats,
+            token_cost=token_cost,
         )
 
         self._stop_file_logging(file_handler)
@@ -828,71 +801,6 @@ class Pipeline:
             metrics=exec_result.get("metrics", {}),
             errors=errors,
             elapsed_seconds=elapsed,
+            token_cost=token_cost,
         )
 
-    def _write_modify_report(
-        self,
-        workspace: Path,
-        prompt: str,
-        change_plan: ChangePlan,
-        task_graph: TaskGraph,
-        stats: dict[str, int],
-        elapsed: float,
-        success: bool,
-        changed_files: list[str] | None = None,
-        diff_stats: dict[str, int] | None = None,
-    ) -> None:
-        """Write a structured JSON report for a modification run."""
-        import json
-        from datetime import datetime, timezone
-
-        task_entries = []
-        for task in task_graph.tasks.values():
-            entry: dict[str, Any] = {
-                "id": task.task_id,
-                "type": task.task_type.value,
-                "file": task.file,
-                "description": task.description,
-                "status": task.status.value,
-            }
-            if task.result:
-                entry["output"] = task.result.output
-                entry["errors"] = task.result.errors
-                entry["files_modified"] = task.result.files_modified
-            task_entries.append(entry)
-
-        change_entries = [
-            {
-                "type": c.type.value,
-                "file": c.file,
-                "description": c.description,
-                "function": c.function,
-                "class_name": c.class_name,
-            }
-            for c in change_plan.changes
-        ]
-
-        report: dict[str, Any] = {
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "mode": "enhance",
-            "success": success,
-            "elapsed_seconds": round(elapsed, 2),
-            "prompt": prompt,
-            "change_plan": {
-                "summary": change_plan.summary,
-                "changes": change_entries,
-                "new_files": [nf.path for nf in change_plan.new_files],
-                "risk_notes": change_plan.risk_notes,
-            },
-            "diff_summary": {
-                "files_modified": changed_files or [],
-                "lines_added": (diff_stats or {}).get("lines_added", 0),
-                "lines_removed": (diff_stats or {}).get("lines_removed", 0),
-            },
-            "task_stats": stats,
-            "tasks": task_entries,
-        }
-
-        report_path = workspace / "modify_report.json"
-        report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-        logger.info(f"Modification report written to {report_path}")

@@ -94,6 +94,34 @@ class LiveConsole:
             self._agent_log = self._agent_log[-self._max_log_lines:]
         self._refresh()
 
+    def stream_task_output(self, task_id: int, chunk: str) -> None:
+        """Append a streaming chunk to a task's live output display.
+
+        Called by agents using ``generate_streaming()`` to show partial LLM
+        output as it arrives, so the user sees progress on large files.
+        The last ``_MAX_STREAM_PREVIEW`` characters are shown in the log panel.
+        """
+        key = f"_stream_{task_id}"
+        current: str = self._tasks.get(task_id, {}).get("stream_preview", "")
+        combined = (current + chunk)[-self._MAX_STREAM_PREVIEW:]
+        if task_id in self._tasks:
+            self._tasks[task_id]["stream_preview"] = combined
+        # Show the last line of the streaming preview in the agent log
+        last_line = combined.rsplit("\n", 1)[-1].strip()
+        if last_line:
+            elapsed = time.monotonic() - self._start_time if self._start_time else 0
+            entry = f"[dim]{elapsed:6.1f}s[/dim]  [dim cyan]⋯ {last_line[:80]}[/dim cyan]"
+            # Replace the last stream entry rather than accumulate
+            if self._agent_log and "⋯" in self._agent_log[-1]:
+                self._agent_log[-1] = entry
+            else:
+                self._agent_log.append(entry)
+                if len(self._agent_log) > self._max_log_lines:
+                    self._agent_log = self._agent_log[-self._max_log_lines:]
+            self._refresh()
+
+    _MAX_STREAM_PREVIEW: int = 400
+
     def _refresh(self) -> None:
         if self._live:
             self._live.update(self._render())

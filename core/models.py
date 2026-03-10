@@ -225,6 +225,16 @@ class ChangePlan:
 # ── Review Models ─────────────────────────────────────────────────────────────
 
 
+@dataclass
+class TokenCost:
+    """Aggregated token usage and estimated USD cost for one pipeline run."""
+
+    input_tokens: int
+    output_tokens: int
+    model: str
+    cost_usd: float  # Calculated from MODEL_PRICING in llm_client.py
+
+
 class ReviewLevel(str, Enum):
     FILE = "file"
     MODULE = "module"
