@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from core.language import LanguageProfile, detect_language_from_blueprint, PYTHON
+from core.import_validator import ImportValidator
 from core.models import FileIndex, RepositoryBlueprint, RepositoryIndex
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,7 @@ class RepositoryManager:
         self.docs_dir = workspace_dir / "docs"
         self._repo_index = RepositoryIndex()
         self._lang_profile: LanguageProfile = PYTHON
+        self._import_validator = ImportValidator()
 
     @property
     def src_dir(self) -> Path:
@@ -155,6 +157,17 @@ class RepositoryManager:
 
         # Update repo index
         self._index_file(rel_path, content)
+
+        # Validate imports immediately after write — surface broken imports
+        # before they reach test time.  Non-blocking: warnings only.
+        known_files = {f.path for f in self._repo_index.files}
+        broken = self._import_validator.validate(
+            rel_path, content, known_files, self._lang_profile
+        )
+        if broken:
+            logger.warning(
+                "Broken imports detected in %s: %s", rel_path, broken
+            )
 
         logger.info(f"Wrote {rel_path} ({len(content)} bytes)")
         return file_path

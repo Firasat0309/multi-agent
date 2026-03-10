@@ -10,12 +10,14 @@ from typing import Any, TYPE_CHECKING
 from agents.base_agent import BaseAgent
 from agents.coder_agent import CoderAgent
 from agents.deploy_agent import DeployAgent
+from agents.patch_agent import PatchAgent
 from agents.reviewer_agent import ReviewerAgent
 from agents.security_agent import SecurityAgent
 from agents.test_agent import TestAgent
 from agents.writer_agent import WriterAgent
 from config.settings import Settings
 from core.context_builder import ContextBuilder
+from core.file_lock_manager import FileLockManager
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient
 from core.observability import record_agent_end, record_agent_start, record_task_completion
@@ -49,7 +51,7 @@ TASK_AGENT_MAP: dict[TaskType, type[BaseAgent]] = {
     TaskType.GENERATE_DEPLOY: DeployAgent,
     TaskType.GENERATE_DOCS: WriterAgent,
     TaskType.FIX_CODE: CoderAgent,
-    TaskType.MODIFY_FILE: CoderAgent,
+    TaskType.MODIFY_FILE: PatchAgent,   # surgical patch; falls back to CoderAgent on failure
 }
 
 
@@ -104,6 +106,7 @@ class AgentManager:
             "total_time": 0.0,
             "agent_metrics": {},
         }
+        self._file_locks = FileLockManager()
 
     def _create_agent(self, task_type: TaskType) -> BaseAgent:
         agent_cls = TASK_AGENT_MAP.get(task_type)
@@ -189,6 +192,16 @@ class AgentManager:
                 task.metadata["review_errors"] = review_task.result.errors
                 task.metadata["review_output"] = review_task.result.output
 
+        # Acquire a per-file lock for write tasks to prevent concurrent
+        # modifications to the same file from racing.  Read-only tasks
+        # (REVIEW_*, SECURITY_SCAN) also acquire the lock so they never read
+        # a file while it is being written by another agent.
+        file_lock = (
+            self._file_locks.lock_for(task.file)
+            if task.file and task.file != "*"
+            else None
+        )
+
         for attempt in range(task.max_retries):
             # Rebuild context on EVERY attempt so the agent sees the current
             # state of the filesystem, not a stale snapshot from before the
@@ -214,7 +227,11 @@ class AgentManager:
 
                 record_agent_start()
                 try:
-                    result = await agent.execute(context)
+                    if file_lock:
+                        async with file_lock:
+                            result = await agent.execute(context)
+                    else:
+                        result = await agent.execute(context)
                 finally:
                     record_agent_end()
 

@@ -23,6 +23,7 @@ from core.observability import record_task_completion, start_metrics_server, set
 from core.repository_manager import RepositoryManager
 from core.state_machine import LifecycleEngine
 from core.task_engine import TaskGraph, ModificationTaskGraphBuilder
+from core.workspace_snapshot import WorkspaceSnapshot
 from memory.dependency_graph import DependencyGraphStore
 from memory.embedding_store import EmbeddingStore
 from memory.repo_index import RepoIndexStore
@@ -716,8 +717,25 @@ class Pipeline:
             embedding_store=embedding_store,
         )
 
+        # ── Snapshot → execute → commit (or auto-restore on failure) ──────
+        changed_files: list[str] = []
+        diff_stats: dict[str, int] = {"lines_added": 0, "lines_removed": 0}
         try:
-            exec_result = await agent_manager.execute_graph(task_graph)
+            async with WorkspaceSnapshot(self.settings.workspace_dir) as snap:
+                try:
+                    exec_result = await agent_manager.execute_graph(task_graph)
+                    changed_files = snap.get_changed_files()
+                    diff_stats = snap.compute_diff_stats()
+                    snap.commit()
+                except Exception:
+                    logger.error("Modification failed — restoring workspace from snapshot")
+                    raise
+                finally:
+                    if sandbox_manager:
+                        try:
+                            await sandbox_manager.destroy_all()
+                        except Exception:
+                            logger.warning("Sandbox teardown failed (non-critical)")
         except Exception as e:
             logger.exception("Modification execution failed")
             if self._live:
@@ -731,12 +749,6 @@ class Pipeline:
                 errors=[f"Modification execution failed: {e}"],
                 elapsed_seconds=time.monotonic() - start_time,
             )
-        finally:
-            if sandbox_manager:
-                try:
-                    await sandbox_manager.destroy_all()
-                except Exception:
-                    logger.warning("Sandbox teardown failed (non-critical)")
 
         if self._live:
             self._live.complete_phase("Code Modification & Review")
@@ -771,6 +783,8 @@ class Pipeline:
             stats=stats,
             elapsed=elapsed,
             success=success,
+            changed_files=changed_files,
+            diff_stats=diff_stats,
         )
 
         self._stop_file_logging(file_handler)
@@ -797,6 +811,8 @@ class Pipeline:
         stats: dict[str, int],
         elapsed: float,
         success: bool,
+        changed_files: list[str] | None = None,
+        diff_stats: dict[str, int] | None = None,
     ) -> None:
         """Write a structured JSON report for a modification run."""
         import json
@@ -839,6 +855,11 @@ class Pipeline:
                 "changes": change_entries,
                 "new_files": [nf.path for nf in change_plan.new_files],
                 "risk_notes": change_plan.risk_notes,
+            },
+            "diff_summary": {
+                "files_modified": changed_files or [],
+                "lines_added": (diff_stats or {}).get("lines_added", 0),
+                "lines_removed": (diff_stats or {}).get("lines_removed", 0),
             },
             "task_stats": stats,
             "tasks": task_entries,

@@ -90,6 +90,7 @@ class AgentRole(str, Enum):
     ARCHITECT = "architect"
     PLANNER = "planner"
     CODER = "coder"
+    PATCH_AGENT = "patch_agent"
     REVIEWER = "reviewer"
     TESTER = "tester"
     SECURITY = "security"
@@ -174,6 +175,15 @@ class RepoAnalysis:
     architecture_style: str = ""
     entry_points: list[str] = field(default_factory=list)
     summary: str = ""
+
+
+@dataclass
+class FilePatch:
+    """A unified diff patch for a single file."""
+    file_path: str
+    original_checksum: str   # SHA-1 of file before patch — for safety check
+    unified_diff: str        # Standard unified diff format
+    description: str         # Human-readable description of change
 
 
 class ChangeActionType(str, Enum):
