@@ -12,9 +12,15 @@ logger = logging.getLogger(__name__)
 class EmbeddingStore:
     """Semantic vector store for code chunks using ChromaDB."""
 
-    def __init__(self, persist_dir: str = ".chroma", collection_name: str = "code") -> None:
+    def __init__(
+        self,
+        persist_dir: str = ".chroma",
+        collection_name: str = "code",
+        embedding_model: str = "all-MiniLM-L6-v2",
+    ) -> None:
         self._persist_dir = persist_dir
         self._collection_name = collection_name
+        self._embedding_model = embedding_model
         self._client: Any = None
         self._collection: Any = None
 
@@ -23,13 +29,35 @@ class EmbeddingStore:
             return
         try:
             import chromadb
+            from chromadb.utils.embedding_functions import (
+                SentenceTransformerEmbeddingFunction,
+            )
+
             # chromadb >= 0.4 uses PersistentClient; the old Settings-based
             # constructor was removed.
             self._client = chromadb.PersistentClient(path=self._persist_dir)
-            self._collection = self._client.get_or_create_collection(
-                name=self._collection_name,
-                metadata={"hnsw:space": "cosine"},
-            )
+
+            # Use the configured embedding model so collection semantics stay
+            # consistent across runs and match the user's hardware budget.
+            try:
+                ef = SentenceTransformerEmbeddingFunction(
+                    model_name=self._embedding_model
+                )
+            except Exception as e:
+                logger.warning(
+                    "Could not load embedding model '%s' (%s); falling back to ChromaDB default",
+                    self._embedding_model, e,
+                )
+                ef = None  # chromadb will use its built-in default
+
+            kwargs: dict[str, Any] = {
+                "name": self._collection_name,
+                "metadata": {"hnsw:space": "cosine"},
+            }
+            if ef is not None:
+                kwargs["embedding_function"] = ef
+
+            self._collection = self._client.get_or_create_collection(**kwargs)
         except ImportError:
             logger.warning("chromadb not installed, vector memory disabled")
             self._client = None

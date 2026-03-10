@@ -298,7 +298,8 @@ class Pipeline:
         # review) know transitive impact without a full filesystem rescan.
         run_dep_store = DependencyGraphStore(self.settings.workspace_dir)
         run_embedding_store = EmbeddingStore(
-            persist_dir=self.settings.memory.chroma_persist_dir
+            persist_dir=self.settings.memory.chroma_persist_dir,
+            embedding_model=self.settings.memory.embedding_model,
         )
 
         agent_manager = AgentManager(
@@ -446,15 +447,25 @@ class Pipeline:
         index_store = RepoIndexStore(self.settings.workspace_dir)
         dep_store = DependencyGraphStore(self.settings.workspace_dir)
         embedding_store = EmbeddingStore(
-            persist_dir=self.settings.memory.chroma_persist_dir
+            persist_dir=self.settings.memory.chroma_persist_dir,
+            embedding_model=self.settings.memory.embedding_model,
         )
 
-        for file_info in repo_manager.get_repo_index().files:
+        repo_index = repo_manager.get_repo_index()
+        known_files = {f.path for f in repo_index.files}
+        lang = repo_manager._lang_profile
+
+        for file_info in repo_index.files:
             index_store.update_file(file_info)
 
-            # Update dependency graph
+            # Update dependency graph — resolve raw import strings to file paths
+            # so that graph queries (impact analysis, ordering) work correctly.
             for imp in file_info.imports:
-                dep_store.add_dependency(file_info.path, imp)
+                resolved = lang.resolve_import_to_path(imp, known_files)
+                if resolved:
+                    dep_store.add_dependency(file_info.path, resolved)
+                else:
+                    logger.debug("Unresolved import '%s' in %s", imp, file_info.path)
 
             # Index embeddings
             content = repo_manager.read_file(file_info.path)
@@ -549,15 +560,21 @@ class Pipeline:
         # run) are available to the change planner, task builder, and all agents.
         dep_store = DependencyGraphStore(self.settings.workspace_dir)
         embedding_store = EmbeddingStore(
-            persist_dir=self.settings.memory.chroma_persist_dir
+            persist_dir=self.settings.memory.chroma_persist_dir,
+            embedding_model=self.settings.memory.embedding_model,
         )
 
         # Sync the in-memory graph from the freshly scanned repo index so the
         # graph always reflects the current state on disk, not just prior runs.
         repo_index = repo_manager.get_repo_index()
+        known_files = {f.path for f in repo_index.files}
         for file_info in repo_index.files:
             for imp in file_info.imports:
-                dep_store.add_dependency(file_info.path, imp)
+                resolved = lang_profile.resolve_import_to_path(imp, known_files)
+                if resolved:
+                    dep_store.add_dependency(file_info.path, resolved)
+                else:
+                    logger.debug("Unresolved import '%s' in %s", imp, file_info.path)
         dep_store.save()
         logger.info(
             "Memory stores loaded: dep_graph=%d nodes, chroma_dir=%s",

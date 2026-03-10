@@ -133,49 +133,88 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
-        """Generate a completion from the LLM."""
+        """Generate a completion from the LLM with exponential backoff retry.
+
+        Retries up to 3 extra times (4 total) on transient errors such as
+        rate-limit (429) and server-side overload (500/503).  Non-retryable
+        errors (auth, bad model) surface immediately.
+        """
         client = self._get_client()
         temp = temperature if temperature is not None else self.config.temperature
         tokens = max_tokens if max_tokens is not None else self.config.max_tokens
 
-        try:
-            if self.config.provider == LLMProvider.ANTHROPIC:
-                return await self._anthropic_generate(client, system_prompt, user_prompt, temp, tokens)
-            elif self.config.provider == LLMProvider.GEMINI:
-                return await self._gemini_generate(client, system_prompt, user_prompt, temp, tokens)
-            else:
-                return await self._openai_generate(client, system_prompt, user_prompt, temp, tokens)
-        except LLMClientError:
-            # Re-raise LLM-specific errors (including LLMConfigError)
-            raise
-        except Exception as e:
-            error_msg = str(e)
-            error_type = type(e).__name__
-            
-            # Handle provider-specific errors
-            if "401" in error_msg or "Unauthorized" in error_msg or "Unauthenticated" in error_type:
-                raise LLMConfigError(
-                    f"❌ Authentication failed for {self.config.provider.value}\n\n"
-                    f"Your API key may be invalid or expired.\n"
-                    f"Please check your {self.config.provider.value.upper()}_API_KEY environment variable."
+        _max_attempts = 4
+        _base_delay = 2.0  # seconds; doubles each attempt (2 → 4 → 8 → …)
+
+        for attempt in range(_max_attempts):
+            try:
+                if self.config.provider == LLMProvider.ANTHROPIC:
+                    return await self._anthropic_generate(
+                        client, system_prompt, user_prompt, temp, tokens
+                    )
+                elif self.config.provider == LLMProvider.GEMINI:
+                    return await self._gemini_generate(
+                        client, system_prompt, user_prompt, temp, tokens
+                    )
+                else:
+                    return await self._openai_generate(
+                        client, system_prompt, user_prompt, temp, tokens
+                    )
+            except LLMClientError:
+                # Config / auth errors are never retried — surface immediately.
+                raise
+            except Exception as e:
+                error_msg = str(e)
+                error_type = type(e).__name__
+
+                # Classify as retryable (rate-limit / transient server error)
+                is_rate_limit = (
+                    "429" in error_msg
+                    or "rate_limit" in error_msg.lower()
+                    or "ratelimit" in error_msg.lower()
+                    or "too many requests" in error_msg.lower()
+                )
+                is_transient = is_rate_limit or any(
+                    token in error_msg for token in ("500", "502", "503", "overloaded")
+                )
+
+                if is_transient and attempt < _max_attempts - 1:
+                    delay = _base_delay * (2 ** attempt)
+                    logger.warning(
+                        "LLM %s on attempt %d/%d — retrying in %.1fs: %s",
+                        "rate-limit" if is_rate_limit else "transient error",
+                        attempt + 1, _max_attempts,
+                        delay, error_msg[:120],
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Permanent or exhausted — translate to domain errors
+                if "401" in error_msg or "Unauthorized" in error_msg or "Unauthenticated" in error_type:
+                    raise LLMConfigError(
+                        f"❌ Authentication failed for {self.config.provider.value}\n\n"
+                        f"Your API key may be invalid or expired.\n"
+                        f"Please check your {self.config.provider.value.upper()}_API_KEY environment variable."
+                    ) from e
+                elif "NotFound" in error_type or "404" in error_msg or "not found" in error_msg.lower():
+                    raise LLMConfigError(
+                        f"❌ Model '{self.config.model}' not found or no longer available\n\n"
+                        f"Valid models for {self.config.provider.value}:\n"
+                        f"  {', '.join(self.VALID_MODELS.get(self.config.provider, []))}\n\n"
+                        f"Use: codegen \"prompt\" --provider {self.config.provider.value} --model <valid-model>"
+                    ) from e
+                elif "is not supported" in error_msg.lower():
+                    raise LLMConfigError(
+                        f"❌ Model '{self.config.model}' is not supported for this operation\n\n"
+                        f"Try a different model: {', '.join(self.VALID_MODELS.get(self.config.provider, []))}"
+                    ) from e
+
+                raise LLMClientError(
+                    f"Failed to generate with {self.config.provider.value}: {e}"
                 ) from e
-            elif "NotFound" in error_type or "404" in error_msg or "not found" in error_msg.lower():
-                raise LLMConfigError(
-                    f"❌ Model '{self.config.model}' not found or no longer available\n\n"
-                    f"Valid models for {self.config.provider.value}:\n"
-                    f"  {', '.join(self.VALID_MODELS.get(self.config.provider, []))}\n\n"
-                    f"Use: codegen \"prompt\" --provider {self.config.provider.value} --model <valid-model>"
-                ) from e
-            elif "is not supported" in error_msg.lower():
-                raise LLMConfigError(
-                    f"❌ Model '{self.config.model}' is not supported for this operation\n\n"
-                    f"Try a different model: {', '.join(self.VALID_MODELS.get(self.config.provider, []))}"
-                ) from e
-            
-            # Catch unhandled errors and re-raise as LLMClientError
-            raise LLMClientError(
-                f"Failed to generate with {self.config.provider.value}: {e}"
-            ) from e
+
+        # Unreachable — the loop always returns or raises inside.
+        raise LLMClientError("generate: retry loop exhausted without result")
 
     async def _anthropic_generate(
         self, client: Any, system: str, user: str, temperature: float, max_tokens: int

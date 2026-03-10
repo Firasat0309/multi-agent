@@ -6,6 +6,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -118,11 +120,35 @@ class RepositoryManager:
             return self.workspace / rel_path
         return root / rel_path
 
+    @staticmethod
+    def _write_atomic(file_path: Path, content: str) -> None:
+        """Write *content* to *file_path* atomically via a temp-file + rename.
+
+        Prevents half-written files from being seen by concurrent readers or
+        by agents that re-scan the workspace after a crash / KeyboardInterrupt.
+        On Windows, ``os.replace`` is used (atomic on NTFS for same-volume
+        moves) instead of ``Path.rename`` which can raise if the destination
+        already exists.
+        """
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=file_path.parent, prefix=".~", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            os.replace(tmp_path, file_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
     def write_file(self, rel_path: str, content: str) -> Path:
         """Write a file to the source root and update index (sync version)."""
         file_path = self._resolve_write_path(self.src_dir, rel_path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
+        self._write_atomic(file_path, content)
 
         # Ensure __init__.py exists in all parent packages (Python only)
         self._ensure_init_files(file_path)
@@ -145,8 +171,7 @@ class RepositoryManager:
     def write_test_file(self, rel_path: str, content: str) -> Path:
         """Write a test file to the test root."""
         file_path = self._resolve_write_path(self.test_dir, rel_path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
+        self._write_atomic(file_path, content)
         self._ensure_init_files(file_path)
         logger.info(f"Wrote test {rel_path}")
         return file_path
@@ -158,8 +183,7 @@ class RepositoryManager:
     def write_deploy_file(self, rel_path: str, content: str) -> Path:
         """Write a deployment file."""
         file_path = self.deploy_dir / rel_path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
+        self._write_atomic(file_path, content)
         logger.info(f"Wrote deploy artifact {rel_path}")
         return file_path
 
@@ -170,8 +194,7 @@ class RepositoryManager:
     def write_doc_file(self, rel_path: str, content: str) -> Path:
         """Write a documentation file."""
         file_path = self.docs_dir / rel_path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
+        self._write_atomic(file_path, content)
         logger.info(f"Wrote doc {rel_path}")
         return file_path
 

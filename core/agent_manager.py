@@ -316,10 +316,17 @@ class AgentManager:
         # ── Phase 2: Global DAG ──────────────────────────────────────
         logger.info("All file lifecycles terminal — running global DAG")
 
-        # Mark the sentinel task (ID 1) as completed to unblock the global DAG
-        sentinel = global_graph.get_task(1)
+        # Mark the sentinel task as completed to unblock the global DAG.
+        # Look it up by metadata tag rather than hard-coding ID=1 so the lookup
+        # remains correct even if the task graph changes ordering.
+        sentinel = next(
+            (t for t in global_graph.tasks.values() if t.metadata.get("sentinel")),
+            None,
+        )
         if sentinel:
             global_graph.mark_completed(sentinel.task_id)
+        else:
+            logger.warning("Sentinel task not found in global DAG — global phases may stall")
 
         # Reuse the existing graph executor for the global tasks
         await self.execute_graph(global_graph)

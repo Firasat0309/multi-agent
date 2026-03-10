@@ -347,6 +347,7 @@ class LifecyclePlanBuilder:
             file="*",
             description="[sentinel] All per-file lifecycles completed",
             dependencies=[],
+            metadata={"sentinel": True},
         )
         global_graph.add_task(lifecycle_done)
 

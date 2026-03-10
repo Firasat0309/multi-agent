@@ -6,7 +6,8 @@
       "Bash(python:*)",
       "Bash(python3:*)",
       "Bash(grep:*)",
-      "Bash(pip list:*)"
+      "Bash(pip list:*)",
+      "Bash(read f:*)"
     ]
   }
 }
