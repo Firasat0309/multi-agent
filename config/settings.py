@@ -80,7 +80,6 @@ class Settings:
         default_factory=lambda: ["file", "module", "architecture"]
     )
     allow_host_execution: bool = False  # Must be True to run without Docker
-    enable_lifecycle: bool = True  # Use event-sourced lifecycle engine (vs legacy DAG)
     require_plan_approval: bool = False  # If True, pause for human review after change planning
 
     @classmethod

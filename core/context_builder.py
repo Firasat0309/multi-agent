@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -35,6 +36,18 @@ _MAX_SEMANTIC_HITS = 3
 _ast_extractor = ASTExtractor()
 
 
+# ── Context priority model ───────────────────────────────────────────────────
+
+@dataclass
+class ContextFile:
+    """A candidate file for inclusion in an agent's context window."""
+    path: str
+    content: str
+    priority: int           # 1=target file, 2=direct dep, 3=semantic hit, 4=module review
+    relevance_score: float  # 0.0–1.0 (higher is more relevant); from semantic distance
+    is_stub: bool           # True when content is an AST stub rather than full source
+
+
 class ContextBuilder:
     """Builds focused context for agents, avoiding full-repo dumps."""
 
@@ -53,14 +66,10 @@ class ContextBuilder:
         self._embedding_store = embedding_store
 
     def build(self, task: Task) -> AgentContext:
-        """Build context for a specific task."""
+        """Build context for a specific task using priority-ordered file collection."""
         file_bp = self._find_blueprint(task.file)
-        related = self._collect_related_files(task, file_bp)
+        related = self._collect_ranked(task, file_bp)
         dep_info = self._build_dependency_info(task.file)
-
-        # Augment related files with semantically similar code via vector search.
-        # This finds files that are conceptually related even if not explicitly imported.
-        self._enrich_with_semantic_hits(task, related)
 
         return AgentContext(
             task=task,
@@ -77,91 +86,153 @@ class ContextBuilder:
                 return fb
         return None
 
+    def _collect_ranked(
+        self, task: Task, file_bp: FileBlueprint | None
+    ) -> dict[str, str]:
+        """Collect context files in relevance order, stopping at budget.
+
+        Priority ordering:
+          1. Target file (full source, always included first)
+          2. Direct imports of the target (AST stubs)
+          3. Semantic search hits (AST stubs, ordered by distance)
+          4. Module review files (AST stubs, ordered by dep layer)
+
+        Within the same priority tier, files are sorted by descending
+        ``relevance_score`` so the most pertinent content is always included
+        before the budget runs out.
+        """
+        candidates: list[ContextFile] = []
+        lang = detect_language_from_blueprint(self.blueprint.tech_stack)
+
+        # ── Priority 1: target file in full ──────────────────────────────────
+        target_full_paths: set[str] = set()
+        if task.task_type in (
+            TaskType.REVIEW_FILE, TaskType.GENERATE_TEST, TaskType.FIX_CODE
+        ):
+            target_full_paths.add(task.file)
+
+        for p in target_full_paths:
+            content = self._read_file(p)
+            if content is not None:
+                candidates.append(ContextFile(
+                    path=p,
+                    content=content,
+                    priority=1,
+                    relevance_score=1.0,
+                    is_stub=False,
+                ))
+
+        # ── Priority 2: direct blueprint dependencies (AST stubs) ────────────
+        if file_bp:
+            for dep_path in file_bp.depends_on:
+                content = self._read_file(dep_path)
+                if content is None:
+                    continue
+                file_index = self.repo_index.get_file(dep_path)
+                checksum = file_index.checksum if file_index else ""
+                stub = _ast_extractor.extract_stub(dep_path, content, lang.name, checksum)
+                if stub is not None:
+                    body = f"// AST stub (signatures only)\n{stub}"
+                    logger.debug(
+                        "AST stub for %s (%d→%d chars, %.0f%% reduction)",
+                        dep_path, len(content), len(stub),
+                        (1 - len(stub) / len(content)) * 100 if content else 0,
+                    )
+                    candidates.append(ContextFile(
+                        path=dep_path, content=body,
+                        priority=2, relevance_score=0.9, is_stub=True,
+                    ))
+                else:
+                    trunc = content[:8_000] + "\n# ... (truncated)" if len(content) > 8_000 else content
+                    candidates.append(ContextFile(
+                        path=dep_path, content=trunc,
+                        priority=2, relevance_score=0.9, is_stub=False,
+                    ))
+
+        # ── Priority 3: semantic search hits ─────────────────────────────────
+        if self._embedding_store is not None:
+            try:
+                hits = self._embedding_store.search(
+                    task.description,
+                    n_results=_MAX_SEMANTIC_HITS + 10,
+                )
+                already = {c.path for c in candidates}
+                sem_added = 0
+                for hit in hits:
+                    if sem_added >= _MAX_SEMANTIC_HITS:
+                        break
+                    fp = hit.get("file", "")
+                    if not fp or fp in already:
+                        continue
+                    content = self._read_file(fp)
+                    if content is None:
+                        continue
+                    file_index = self.repo_index.get_file(fp)
+                    checksum = file_index.checksum if file_index else ""
+                    stub = _ast_extractor.extract_stub(fp, content, lang.name, checksum)
+                    body = (
+                        f"// Semantic match\n{stub}"
+                        if stub is not None
+                        else content[:4_000] + ("\n# ... (truncated)" if len(content) > 4_000 else "")
+                    )
+                    dist = hit.get("distance", 0.5)
+                    score = max(0.0, 1.0 - dist)
+                    candidates.append(ContextFile(
+                        path=fp, content=body,
+                        priority=3, relevance_score=score, is_stub=stub is not None,
+                    ))
+                    already.add(fp)
+                    sem_added += 1
+            except Exception:
+                logger.debug("Semantic search failed (non-critical)", exc_info=True)
+
+        # ── Priority 4: module review files ──────────────────────────────────
+        if task.task_type in (TaskType.REVIEW_MODULE, TaskType.REVIEW_ARCHITECTURE):
+            already = {c.path for c in candidates}
+            for fb in self.blueprint.file_blueprints[:_MAX_REVIEW_FILES]:
+                if fb.path in already:
+                    continue
+                content = self._read_file(fb.path)
+                if content is None:
+                    continue
+                file_index = self.repo_index.get_file(fb.path)
+                checksum = file_index.checksum if file_index else ""
+                stub = _ast_extractor.extract_stub(fb.path, content, lang.name, checksum)
+                body = (
+                    f"// AST stub (signatures only)\n{stub}"
+                    if stub is not None
+                    else (content[:8_000] + "\n# ... (truncated)" if len(content) > 8_000 else content)
+                )
+                candidates.append(ContextFile(
+                    path=fb.path, content=body,
+                    priority=4, relevance_score=0.5, is_stub=stub is not None,
+                ))
+
+        # ── Sort: (priority asc, relevance_score desc) ───────────────────────
+        candidates.sort(key=lambda c: (c.priority, -c.relevance_score))
+
+        # ── Fill budget ───────────────────────────────────────────────────────
+        result: dict[str, str] = {}
+        total = 0
+        for cf in candidates:
+            if cf.path in result:
+                continue  # already included (e.g. target file appears as dep too)
+            if total + len(cf.content) > _MAX_CONTEXT_CHARS:
+                logger.debug(
+                    "Context budget reached (%d chars), skipping %s (priority=%d)",
+                    total, cf.path, cf.priority,
+                )
+                continue
+            result[cf.path] = cf.content
+            total += len(cf.content)
+
+        return result
+
     def _collect_related_files(
         self, task: Task, file_bp: FileBlueprint | None
     ) -> dict[str, str]:
-        """Read only the files this task depends on, respecting token budget.
-
-        For dependency files (not the task's own target), we use AST-extracted
-        stubs when the language is supported by tree-sitter.  This gives the
-        LLM the public API surface (class/method/field signatures) without
-        implementation bodies — typically a 5-10x context reduction.
-
-        The target file itself is always included in full so the agent has
-        complete source when reviewing, testing, or fixing it.
-        """
-        related: dict[str, str] = {}
-        paths_to_read: set[str] = set()
-
-        # Files that should be included as AST stubs (dependencies)
-        dependency_paths: set[str] = set()
-        # Files that MUST be included in full (target file being worked on)
-        full_source_paths: set[str] = set()
-
-        if file_bp:
-            dependency_paths.update(file_bp.depends_on)
-
-        # For review/fix/test tasks, read the target file in full
-        if task.task_type in (TaskType.REVIEW_FILE, TaskType.GENERATE_TEST, TaskType.FIX_CODE):
-            full_source_paths.add(task.file)
-
-        # For module/architecture review, read files up to the cap
-        if task.task_type in (TaskType.REVIEW_MODULE, TaskType.REVIEW_ARCHITECTURE):
-            for fb in self.blueprint.file_blueprints[:_MAX_REVIEW_FILES]:
-                full_source_paths.add(fb.path)
-
-        # Detect language for AST extraction
-        lang = detect_language_from_blueprint(self.blueprint.tech_stack)
-
-        # Process full-source files first (highest priority)
-        total_chars = 0
-        for p in full_source_paths:
-            if total_chars >= _MAX_CONTEXT_CHARS:
-                break
-            content = self._read_file(p)
-            if content is not None:
-                if len(content) > 8_000:
-                    content = content[:8_000] + "\n# ... (truncated)"
-                related[p] = content
-                total_chars += len(content)
-
-        # Process dependency files — use AST stubs where possible
-        for p in dependency_paths:
-            if p in related:
-                continue  # already included as full source
-            if total_chars >= _MAX_CONTEXT_CHARS:
-                logger.debug(
-                    "Context budget reached (%d chars), skipping remaining files", total_chars
-                )
-                break
-            content = self._read_file(p)
-            if content is None:
-                continue
-
-            # Try AST stub extraction — much more compact than raw source
-            file_index = self.repo_index.get_file(p)
-            checksum = file_index.checksum if file_index else ""
-            stub = _ast_extractor.extract_stub(
-                p, content, lang.name, checksum=checksum,
-            )
-
-            if stub is not None:
-                # Stub is typically 5-10x smaller than full source
-                related[p] = f"// AST stub (signatures only)\n{stub}"
-                total_chars += len(stub)
-                logger.debug(
-                    "Using AST stub for %s (%d→%d chars, %.0f%% reduction)",
-                    p, len(content), len(stub),
-                    (1 - len(stub) / len(content)) * 100 if content else 0,
-                )
-            else:
-                # Fallback: raw truncation for unsupported languages
-                if len(content) > 8_000:
-                    content = content[:8_000] + "\n# ... (truncated)"
-                related[p] = content
-                total_chars += len(content)
-
-        return related
+        """Legacy method — delegates to ``_collect_ranked``."""
+        return self._collect_ranked(task, file_bp)
 
     def _read_file(self, rel_path: str) -> str | None:
         # Search across all language source roots — order matters: most specific first

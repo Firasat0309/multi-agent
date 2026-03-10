@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 
+from core.agent_tools import ToolDefinition
 from core.language import get_language_profile
-from core.llm_client import LLMClient, LLMResponse
+from core.llm_client import LLMClient, LLMResponse, ToolCall
 from core.models import AgentContext, AgentRole, Task, TaskResult
 from core.repository_manager import RepositoryManager
 
@@ -43,6 +45,204 @@ class BaseAgent(ABC):
             "Never invent files or dependencies outside the blueprint.\n"
             "Output only the requested content with no extra commentary."
         )
+
+    # ── Agentic tool-use loop ─────────────────────────────────────────────────
+
+    @property
+    def tools(self) -> list[ToolDefinition]:
+        """Tools available to this agent.  Override in subclasses to add tools."""
+        return []
+
+    def _build_prompt(self, context: AgentContext) -> str:
+        """Build the initial user message for the agentic loop.
+
+        Subclasses should override this to produce a task-specific prompt.
+        """
+        return self._format_context(context)
+
+    async def execute_agentic(self, context: AgentContext) -> TaskResult:
+        """Tool-use loop: agent may request reads, searches, and writes.
+
+        The loop continues until the LLM returns ``stop_reason == "end_turn"``
+        or ``max_iterations`` is reached.  Each tool call is dispatched via
+        ``_dispatch_tool()`` and the result is fed back in the next turn.
+        """
+        if not self.tools:
+            # No tools registered — fall back to single-shot call
+            content = await self._call_llm(self._build_prompt(context))
+            return self._parse_agentic_result(context, content, [])
+
+        messages: list[dict] = [
+            {"role": "user", "content": self._build_prompt(context)}
+        ]
+        files_written: list[str] = []
+        max_iterations = 10
+
+        for iteration in range(max_iterations):
+            response = await self.llm.generate_with_tools(
+                messages=messages,
+                tools=self.tools,
+                system_prompt=self.system_prompt,
+            )
+            self._metrics["llm_calls"] += 1
+            self._metrics["tokens_used"] += sum(response.usage.values())
+
+            if response.stop_reason == "end_turn":
+                return self._parse_agentic_result(context, response.content, files_written)
+
+            if not response.tool_calls:
+                # Model returned a non-tool_use stop that isn't "end_turn" — treat as done
+                logger.warning(
+                    "%s agentic loop: unexpected stop_reason=%r with no tool calls (iteration %d)",
+                    self.__class__.__name__, response.stop_reason, iteration,
+                )
+                return self._parse_agentic_result(context, response.content, files_written)
+
+            # Execute each tool call and gather results
+            tool_results: list[dict] = []
+            for tc in response.tool_calls:
+                result = await self._dispatch_tool(context, tc)
+                logger.debug(
+                    "%s tool %s(%s) → %s",
+                    self.__class__.__name__, tc.name,
+                    list(tc.input.keys()), result[:120] if result else "",
+                )
+                if tc.name == "write_file" and not result.startswith("Error"):
+                    written_path = tc.input.get("path", "")
+                    if written_path:
+                        files_written.append(written_path)
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": tc.tool_use_id,
+                    "content": result,
+                })
+
+            # Extend the conversation: assistant turn (with tool_use blocks) + user turn (results)
+            messages.append({"role": "assistant", "content": response.raw_content})
+            messages.append({"role": "user", "content": tool_results})
+
+        raise RuntimeError(
+            f"{self.__class__.__name__} exceeded max_iterations ({max_iterations}) "
+            "without completing the agentic loop"
+        )
+
+    def _parse_agentic_result(
+        self,
+        context: AgentContext,
+        final_text: str,
+        files_written: list[str],
+    ) -> TaskResult:
+        """Convert the agentic loop outcome to a TaskResult.
+
+        Subclasses may override to add domain-specific validation.
+        """
+        return TaskResult(
+            success=True,
+            output=(final_text[:500] if final_text else "Agentic task completed"),
+            files_modified=files_written,
+            metrics=self.get_metrics(),
+        )
+
+    async def _dispatch_tool(self, context: AgentContext, tc: ToolCall) -> str:
+        """Dispatch a tool call to the appropriate handler.
+
+        Returns a string result for the LLM.  Exceptions are caught and
+        returned as error strings so the model can retry or adapt.
+        """
+        handlers = {
+            "read_file":       self._tool_read_file,
+            "write_file":      self._tool_write_file,
+            "search_code":     self._tool_search_code,
+            "find_definition": self._tool_find_definition,
+            "list_files":      self._tool_list_files,
+            "apply_patch":     self._tool_apply_patch,
+        }
+        handler = handlers.get(tc.name)
+        if handler is None:
+            return f"Error: unknown tool '{tc.name}'"
+        try:
+            return await handler(tc.input)
+        except Exception as exc:
+            logger.warning("Tool %s raised: %s", tc.name, exc)
+            return f"Error: {exc}"
+
+    # ── Tool handlers ─────────────────────────────────────────────────────────
+
+    async def _tool_read_file(self, inp: dict) -> str:
+        path = inp.get("path", "")
+        if not path:
+            return "Error: 'path' is required"
+        # Security: async_read_file is scoped to workspace root
+        content = await self.repo.async_read_file(path)
+        if content is None:
+            return f"File not found: {path}"
+        return content
+
+    async def _tool_write_file(self, inp: dict) -> str:
+        path = inp.get("path", "")
+        content = inp.get("content", "")
+        if not path:
+            return "Error: 'path' is required"
+        # Security: async_write_file is scoped to workspace root
+        await self.repo.async_write_file(path, content)
+        return f"Written {len(content)} bytes to {path}"
+
+    async def _tool_search_code(self, inp: dict) -> str:
+        from tools.code_search import CodeSearch
+        query = inp.get("query", "")
+        file_pattern = inp.get("file_pattern", "**/*")
+        if not query:
+            return "Error: 'query' is required"
+        searcher = CodeSearch(self.repo.workspace)
+        results = searcher.search(query, file_pattern=file_pattern, max_results=20)
+        if not results:
+            return f"No results for: {query}"
+        return "\n".join(f"{r.file}:{r.line}: {r.content}" for r in results[:20])
+
+    async def _tool_find_definition(self, inp: dict) -> str:
+        from tools.code_search import CodeSearch
+        symbol = inp.get("symbol", "")
+        if not symbol:
+            return "Error: 'symbol' is required"
+        searcher = CodeSearch(self.repo.workspace)
+        results = searcher.find_definition(symbol)
+        if not results:
+            return f"No definition found for: {symbol}"
+        return "\n".join(f"{r.file}:{r.line}: {r.content}" for r in results[:10])
+
+    async def _tool_list_files(self, inp: dict) -> str:
+        directory = inp.get("directory", "")
+        pattern = inp.get("pattern", "**/*")
+        base = self.repo.workspace
+        if directory:
+            # Security: resolve to prevent path traversal outside workspace
+            target = (base / directory).resolve()
+            if not str(target).startswith(str(base.resolve())):
+                return "Error: access denied (path escapes workspace)"
+            base = target
+        if not base.exists():
+            return f"Directory not found: {directory or '.'}"
+        files = sorted(
+            str(p.relative_to(self.repo.workspace))
+            for p in base.rglob(pattern)
+            if p.is_file()
+        )
+        return "\n".join(files[:200]) if files else "No files found"
+
+    async def _tool_apply_patch(self, inp: dict) -> str:
+        from tools.file_tools import FileTools, PatchError
+        path = inp.get("path", "")
+        patch = inp.get("patch", "")
+        if not path or not patch:
+            return "Error: 'path' and 'patch' are required"
+        ft = FileTools(self.repo.workspace)
+        try:
+            # apply_patch may not exist on older FileTools — fall back
+            if hasattr(ft, "apply_patch"):
+                return ft.apply_patch(path, patch)
+            return "Error: apply_patch is not available in this installation"
+        except PatchError as exc:
+            return f"Patch failed: {exc}"
 
     # Maximum number of continuation requests when the LLM hits max_tokens.
     # Prevents infinite loops if the model keeps producing at-limit output.

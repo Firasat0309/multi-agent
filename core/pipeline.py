@@ -180,11 +180,7 @@ class Pipeline:
         if self._live:
             self._live.set_phase("Task Planning", "running")
 
-        use_lifecycle = self.settings.enable_lifecycle
-        logger.info(
-            "[Phase 2] Building %s...",
-            "lifecycle plan" if use_lifecycle else "task graph",
-        )
+        logger.info("[Phase 2] Building lifecycle plan...")
         planner = PlannerAgent(llm_client=self.llm, repo_manager=repo_manager)
 
         lifecycle_engine: LifecycleEngine | None = None
@@ -192,11 +188,8 @@ class Pipeline:
         global_graph: TaskGraph | None = None
 
         try:
-            if use_lifecycle:
-                lifecycle_engine, global_graph = await planner.create_lifecycle_plan(blueprint)
-                task_graph = global_graph  # used for reporting / live display
-            else:
-                task_graph = await planner.create_task_graph(blueprint)
+            lifecycle_engine, global_graph = await planner.create_lifecycle_plan(blueprint)
+            task_graph = global_graph  # used for reporting / live display
         except LLMConfigError as e:
             logger.error(str(e))
             if self._live:
@@ -222,11 +215,10 @@ class Pipeline:
 
         assert task_graph is not None
         logger.info(f"Task graph: {len(task_graph.tasks)} tasks")
-        if use_lifecycle and lifecycle_engine:
-            logger.info(
-                "Lifecycle engine: %d files, global DAG: %d tasks",
-                len(lifecycle_engine.get_stats()), len(task_graph.tasks),
-            )
+        logger.info(
+            "Lifecycle engine: %d files, global DAG: %d tasks",
+            len(lifecycle_engine.get_stats()), len(task_graph.tasks),
+        )
 
         if self._live:
             self._live.complete_phase("Task Planning")
@@ -321,12 +313,9 @@ class Pipeline:
         )
 
         try:
-            if use_lifecycle and lifecycle_engine and global_graph:
-                exec_result = await agent_manager.execute_with_lifecycle(
-                    lifecycle_engine, global_graph,
-                )
-            else:
-                exec_result = await agent_manager.execute_graph(task_graph)
+            exec_result = await agent_manager.execute_with_lifecycle(
+                lifecycle_engine, global_graph,
+            )
         except Exception as e:
             logger.exception("Task execution failed")
             if self._live:

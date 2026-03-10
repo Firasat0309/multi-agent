@@ -65,6 +65,34 @@ class LLMResponse:
     stop_reason: str = ""
 
 
+# ── Tool-use dataclasses ──────────────────────────────────────────────────────
+
+@dataclass
+class ToolDefinition:
+    """Describes a tool the LLM may call (JSON Schema input)."""
+    name: str
+    description: str
+    input_schema: dict  # JSON Schema object
+
+
+@dataclass
+class ToolCall:
+    """A single tool invocation requested by the LLM."""
+    tool_use_id: str
+    name: str
+    input: dict
+
+
+@dataclass
+class LLMResponseWithTools:
+    """Response from a tool-use enabled generate call."""
+    content: str                  # concatenated text blocks (may be empty)
+    tool_calls: list[ToolCall]    # tool_use blocks from the response
+    stop_reason: str              # "tool_use" | "end_turn"
+    usage: dict
+    raw_content: list             # raw content block list for multi-turn messages
+
+
 class LLMClientError(Exception):
     """Base exception for LLM client errors."""
     pass
@@ -490,3 +518,94 @@ class LLMClient:
                     pass
             logger.error(f"Could not parse JSON from LLM response: {text[:200]}")
             return {}
+
+    async def generate_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[ToolDefinition],
+        system_prompt: str = "",
+        max_tokens: int = 8192,
+    ) -> LLMResponseWithTools:
+        """Multi-turn tool-use call following the Claude tool_use pattern.
+
+        Only supported for the Anthropic provider.  Raises ``LLMClientError``
+        for other providers.
+
+        Args:
+            messages: Conversation history in Claude message format.
+            tools:    Tool definitions available to the model.
+            system_prompt: Optional system prompt.
+            max_tokens: Maximum tokens for the response.
+
+        Returns:
+            ``LLMResponseWithTools`` with ``stop_reason`` of either
+            ``"tool_use"`` (model wants to call tools) or ``"end_turn"``
+            (model is finished).
+        """
+        if self.config.provider != LLMProvider.ANTHROPIC:
+            raise LLMClientError(
+                f"Tool-use is only supported with Anthropic provider "
+                f"(current: {self.config.provider.value})"
+            )
+
+        client = self._get_client()
+        api_tools = [
+            {
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.input_schema,
+            }
+            for t in tools
+        ]
+
+        def _sync() -> Any:
+            kwargs: dict[str, Any] = dict(
+                model=self.config.model,
+                max_tokens=max_tokens,
+                tools=api_tools,
+                messages=messages,
+            )
+            if system_prompt:
+                kwargs["system"] = system_prompt
+            return client.messages.create(**kwargs)
+
+        try:
+            async def _call_async() -> Any:
+                return await asyncio.to_thread(_sync)
+
+            response = await self._circuit.call(_call_async)
+        except CircuitOpenError as exc:
+            raise LLMClientError(str(exc)) from exc
+
+        self.total_input_tokens += response.usage.input_tokens
+        self.total_output_tokens += response.usage.output_tokens
+        self._update_metrics(response.usage)
+
+        # Collect text blocks and tool_use blocks from the response
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        for block in response.content:
+            if block.type == "text":
+                text_parts.append(block.text)
+            elif block.type == "tool_use":
+                tool_calls.append(
+                    ToolCall(
+                        tool_use_id=block.id,
+                        name=block.name,
+                        input=block.input,
+                    )
+                )
+
+        return LLMResponseWithTools(
+            content="\n".join(text_parts),
+            tool_calls=tool_calls,
+            stop_reason=response.stop_reason,
+            usage={
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            },
+            raw_content=response.content,
+        )
+
+    def _update_metrics(self, usage: Any) -> None:
+        """No-op hook for subclasses / tests to observe token usage."""

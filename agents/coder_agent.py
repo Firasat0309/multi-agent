@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from agents.base_agent import BaseAgent
+from core.agent_tools import CODER_TOOLS, ToolDefinition
 from core.language import get_language_profile, LanguageProfile
 from core.models import AgentContext, AgentRole, ChangeAction, ChangeActionType, TaskResult, TaskType
 
@@ -65,6 +66,10 @@ def _config_format(path: str) -> str | None:
 class CoderAgent(BaseAgent):
     role = AgentRole.CODER
 
+    @property
+    def tools(self) -> list[ToolDefinition]:
+        return CODER_TOOLS
+
     def _get_source_system_prompt(self, language: str) -> str:
         profile = get_language_profile(language)
         return (
@@ -96,6 +101,50 @@ class CoderAgent(BaseAgent):
     def system_prompt(self) -> str:
         return self._get_source_system_prompt("python")
 
+    def _build_prompt(self, context: AgentContext) -> str:
+        """Initial user message for the agentic GENERATE_FILE loop."""
+        fb = context.file_blueprint
+        if fb is None:
+            return self._format_context(context)
+        lang = fb.language or context.blueprint.tech_stack.get("language", "python")
+        profile = get_language_profile(lang)
+        return (
+            f"{self._format_context(context)}\n\n"
+            f"Generate the complete {profile.display_name} file for: {fb.path}\n"
+            f"Purpose: {fb.purpose}\n"
+            f"Layer: {fb.layer}\n"
+            f"Must export: {', '.join(fb.exports) if fb.exports else 'appropriate classes/functions'}\n\n"
+            f"Use the available tools to:\n"
+            f"1. Read any dependency files you need to understand their interfaces\n"
+            f"2. Search for usage patterns or symbol definitions if needed\n"
+            f"3. Write the complete, working {profile.display_name} code via write_file\n\n"
+            f"Output ONLY the code to write_file — no markdown fences, no explanations."
+        )
+
+    def _parse_agentic_result(
+        self,
+        context: AgentContext,
+        final_text: str,
+        files_written: list[str],
+    ) -> TaskResult:
+        fb = context.file_blueprint
+        if fb and fb.path not in files_written:
+            logger.warning(
+                "CoderAgent agentic loop finished but %s was not written via write_file tool; "
+                "checking %d written files: %s",
+                fb.path, len(files_written), files_written,
+            )
+        out = (
+            f"Generated {fb.path} via agentic loop ({len(files_written)} file(s) written)"
+            if fb else "Agentic generation completed"
+        )
+        return TaskResult(
+            success=True,
+            output=out,
+            files_modified=files_written,
+            metrics=self.get_metrics(),
+        )
+
     async def execute(self, context: AgentContext) -> TaskResult:
         """Generate, fix, or modify code for the assigned file."""
         if context.task.task_type == TaskType.FIX_CODE:
@@ -115,8 +164,10 @@ class CoderAgent(BaseAgent):
 
         if fmt:
             return await self._generate_config(context, fmt)
-        else:
-            return await self._generate_source(context)
+
+        # Source files: use the agentic tool-use loop so the agent can
+        # read dependency interfaces and write the file directly.
+        return await self.execute_agentic(context)
 
     async def _generate_source(self, context: AgentContext) -> TaskResult:
         """Generate source code for a programming language file."""

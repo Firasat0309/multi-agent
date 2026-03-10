@@ -1,13 +1,12 @@
 """Task DAG engine with topological execution ordering.
 
-Two execution modes:
-  1. **Legacy DAG** — ``TaskGraphBuilder.build_from_blueprint()`` creates a static
-     graph with pre-baked FIX_CODE tasks.  Used when lifecycle mode is disabled.
-  2. **Lifecycle + global DAG** — ``LifecyclePlanBuilder.build()`` creates:
-     - A ``LifecycleEngine`` for per-file Generate→Review→Fix→Test cycles
-     - A slim ``TaskGraph`` for global phases (security, module review, deploy, docs)
-     The per-file lifecycle is event-driven; the global DAG runs after all files
-     reach a terminal state.
+Execution model: **Lifecycle + global DAG** — ``LifecyclePlanBuilder.build()`` creates:
+  - A ``LifecycleEngine`` for per-file Generate→Review→Fix→Test cycles
+  - A slim ``TaskGraph`` for global phases (security, module review, deploy, docs)
+  The per-file lifecycle is event-driven; the global DAG runs after all files
+  reach a terminal state.
+
+``TaskGraphBuilder`` is retained for modification workflows only.
 """
 
 from __future__ import annotations
@@ -111,7 +110,12 @@ class TaskGraph:
 
 
 class TaskGraphBuilder:
-    """Builds a task graph from a repository blueprint."""
+    """Task graph builder for modification workflows.
+
+    ``build_from_blueprint()`` has been removed — use ``LifecyclePlanBuilder``
+    for new-project generation.  This class is kept for ``ModificationTaskGraphBuilder``
+    which still uses it internally for helper utilities.
+    """
 
     def __init__(self) -> None:
         self._next_id = 1
@@ -120,163 +124,6 @@ class TaskGraphBuilder:
         tid = self._next_id
         self._next_id += 1
         return tid
-
-    def build_from_blueprint(self, blueprint: RepositoryBlueprint) -> TaskGraph:
-        graph = TaskGraph()
-        file_task_map: dict[str, int] = {}
-
-        # Pre-validate: warn about depends_on references to files not in the blueprint
-        known_paths = {fb.path for fb in blueprint.file_blueprints}
-        for fb in blueprint.file_blueprints:
-            for dep_path in fb.depends_on:
-                if dep_path not in known_paths:
-                    logger.warning(
-                        f"Blueprint: {fb.path} depends on '{dep_path}' which is "
-                        f"not in the blueprint — dependency will be ignored"
-                    )
-
-        # Phase 1: Generate code files (respecting dependency order)
-        for fb in blueprint.file_blueprints:
-            deps = [file_task_map[d] for d in fb.depends_on if d in file_task_map]
-            task = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.GENERATE_FILE,
-                file=fb.path,
-                description=f"Generate {fb.path}: {fb.purpose}",
-                dependencies=deps,
-            )
-            graph.add_task(task)
-            file_task_map[fb.path] = task.task_id
-
-        # Phase 2: File-level reviews
-        review_tasks: list[int] = []
-        review_task_map: dict[str, int] = {}
-        for fb in blueprint.file_blueprints:
-            gen_task_id = file_task_map[fb.path]
-            task = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.REVIEW_FILE,
-                file=fb.path,
-                description=f"Review {fb.path}",
-                dependencies=[gen_task_id],
-            )
-            graph.add_task(task)
-            review_tasks.append(task.task_id)
-            review_task_map[fb.path] = task.task_id
-
-        # Phase 2.5: Fix code based on review findings
-        fix_task_map: dict[str, int] = {}
-        for fb in blueprint.file_blueprints:
-            review_task_id = review_task_map[fb.path]
-            fix_task = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.FIX_CODE,
-                file=fb.path,
-                description=f"Fix {fb.path} based on review",
-                dependencies=[review_task_id],
-                metadata={"review_task_id": review_task_id},
-            )
-            graph.add_task(fix_task)
-            fix_task_map[fb.path] = fix_task.task_id
-
-        # Phase 3: Generate tests
-        # IMPORTANT: Each test task depends on ALL fix tasks, not just its own.
-        # For compiled languages (Java, Go, Rust, C#), the test command compiles
-        # the entire project.  If UserService.java hasn't been generated yet when
-        # UserTest runs `mvn test`, compilation fails and the fix loop wastes all
-        # attempts on errors from files that don't exist yet.
-        # By depending on all fix tasks, we guarantee every source file is written
-        # and review-fixed before ANY test task begins.
-        all_fix_ids = list(fix_task_map.values())
-        test_tasks: list[int] = []
-        for fb in blueprint.file_blueprints:
-            if fb.layer in ("test", "config", "deploy"):
-                continue
-            task = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.GENERATE_TEST,
-                file=fb.path,
-                description=f"Generate tests for {fb.path}",
-                dependencies=all_fix_ids,
-            )
-            graph.add_task(task)
-            test_tasks.append(task.task_id)
-
-        # Phase 4: Security scan (after all fixes applied)
-        all_gen_ids = list(fix_task_map.values())
-        sec_task = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.SECURITY_SCAN,
-            file="*",
-            description="Security scan of entire codebase",
-            dependencies=all_gen_ids,
-        )
-        graph.add_task(sec_task)
-
-        # Phase 5: Module-level review (after all per-file fixes)
-        all_fix_ids = list(fix_task_map.values())
-        mod_review = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.REVIEW_MODULE,
-            file="*",
-            description="Module consistency review",
-            dependencies=all_fix_ids,
-        )
-        graph.add_task(mod_review)
-
-        # Phase 5.5: Module-level fix — fix cross-file consistency issues
-        # Each source file gets a fix task that sees the module review findings
-        mod_fix_ids: list[int] = []
-        for fb in blueprint.file_blueprints:
-            if fb.layer in ("config", "deploy"):
-                continue
-            mod_fix = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.FIX_CODE,
-                file=fb.path,
-                description=f"Fix {fb.path} based on module review",
-                dependencies=[mod_review.task_id],
-                metadata={"review_task_id": mod_review.task_id},
-            )
-            graph.add_task(mod_fix)
-            mod_fix_ids.append(mod_fix.task_id)
-
-        # Phase 6: Architecture review (after module fixes + security)
-        arch_review = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.REVIEW_ARCHITECTURE,
-            file="*",
-            description="Architecture review for dependency cycles and layer violations",
-            dependencies=mod_fix_ids + [sec_task.task_id],
-        )
-        graph.add_task(arch_review)
-
-        # Phase 7: Deployment artifacts
-        deploy_task = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.GENERATE_DEPLOY,
-            file="deploy/",
-            description="Generate Dockerfile and Kubernetes manifests",
-            dependencies=[arch_review.task_id],
-        )
-        graph.add_task(deploy_task)
-
-        # Phase 8: Documentation
-        docs_task = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.GENERATE_DOCS,
-            file="docs/",
-            description="Generate README, changelog, API docs",
-            dependencies=[arch_review.task_id],
-        )
-        graph.add_task(docs_task)
-
-        errors = graph.validate()
-        if errors:
-            raise ValueError(f"Task graph validation failed: {errors}")
-
-        logger.info(f"Built task graph with {len(graph.tasks)} tasks")
-        return graph
 
 
 class LifecyclePlanBuilder:

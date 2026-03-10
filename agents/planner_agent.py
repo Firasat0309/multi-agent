@@ -9,7 +9,7 @@ from core.llm_client import LLMClient
 from core.models import AgentContext, AgentRole, RepositoryBlueprint, TaskResult
 from core.repository_manager import RepositoryManager
 from core.state_machine import LifecycleEngine
-from core.task_engine import TaskGraph, TaskGraphBuilder, LifecyclePlanBuilder
+from core.task_engine import TaskGraph, LifecyclePlanBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -18,21 +18,17 @@ class PlannerAgent(BaseAgent):
     role = AgentRole.PLANNER
 
     async def execute(self, context: AgentContext) -> TaskResult:
-        """Not used directly - use create_task_graph instead."""
-        return TaskResult(success=False, errors=["Use create_task_graph() method"])
+        """Not used directly - use create_lifecycle_plan instead."""
+        return TaskResult(success=False, errors=["Use create_lifecycle_plan() method"])
 
     async def create_task_graph(self, blueprint: RepositoryBlueprint) -> TaskGraph:
-        """Build the legacy task DAG from the repository blueprint."""
-        logger.info(f"Building task graph for {len(blueprint.file_blueprints)} files")
+        """Build the task graph via the lifecycle plan builder.
 
-        builder = TaskGraphBuilder()
-        graph = builder.build_from_blueprint(blueprint)
-
-        order = graph.get_execution_order()
-        logger.info(f"Task execution order: {order}")
-        logger.info(f"Task stats: {graph.get_stats()}")
-
-        return graph
+        Delegates to ``create_lifecycle_plan()`` and returns the global task
+        graph.  Kept for backward compatibility with code that calls this method.
+        """
+        _, global_graph = await self.create_lifecycle_plan(blueprint)
+        return global_graph
 
     async def create_lifecycle_plan(
         self,
