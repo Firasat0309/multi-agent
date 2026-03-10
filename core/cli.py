@@ -129,7 +129,125 @@ def status(workspace: str) -> None:
     console.print(table)
 
 
-def _display_result(result: PipelineResult) -> None:
+@cli.command()
+@click.argument("prompt")
+@click.option("--workspace", "-w", required=True, help="Existing project directory to modify")
+@click.option("--model", "-m", default="claude-sonnet-4-20250514", help="LLM model")
+@click.option("--provider", "-p", default="anthropic", help="LLM provider")
+@click.option("--sandbox", "-s", default="docker", help="Sandbox type (docker/local)")
+@click.option("--max-agents", default=4, help="Max concurrent agents")
+@click.option("--no-interactive", is_flag=True, default=False, help="Disable live display")
+@click.option(
+    "--allow-host-execution",
+    is_flag=True,
+    default=False,
+    help="Allow running without Docker isolation",
+)
+def enhance(
+    prompt: str,
+    workspace: str,
+    model: str,
+    provider: str,
+    sandbox: str,
+    max_agents: int,
+    no_interactive: bool,
+    allow_host_execution: bool,
+) -> None:
+    """Modify an existing project based on a natural language prompt.
+
+    Unlike 'generate' which creates a new project from scratch, 'enhance'
+    analyzes an existing codebase and makes targeted modifications:
+
+    \b
+    1. Scans the repository to understand structure & dependencies
+    2. Plans the minimal set of changes needed
+    3. Applies targeted edits (not full file rewrites)
+    4. Runs tests and reviews on the changes
+
+    Example:
+        python -m core.cli enhance "Add password reset feature" -w ./my-project
+    """
+    ws = Path(workspace)
+    if not ws.exists():
+        console.print(f"[red]Workspace not found: {workspace}[/red]")
+        sys.exit(1)
+
+    try:
+        settings = Settings(
+            workspace_dir=ws,
+            llm=LLMConfig(
+                provider=LLMProvider(provider),
+                model=model,
+            ),
+            sandbox=SandboxConfig(sandbox_type=SandboxType(sandbox)),
+            max_concurrent_agents=max_agents,
+            allow_host_execution=allow_host_execution or sandbox == "local",
+        )
+
+        pipeline = Pipeline(settings, interactive=not no_interactive)
+    except LLMConfigError as e:
+        console.print(Panel(
+            f"[bold red]{str(e)}[/bold red]",
+            title="❌ Configuration Error",
+            border_style="red",
+        ))
+        sys.exit(1)
+    except ValueError as e:
+        console.print(Panel(
+            f"[bold red]Invalid configuration: {e}[/bold red]\n\n"
+            f"Valid providers: anthropic, openai, gemini\n"
+            f"Valid sandbox types: docker, local",
+            title="❌ Configuration Error",
+            border_style="red",
+        ))
+        sys.exit(1)
+
+    result = asyncio.run(pipeline.enhance(prompt))
+    _display_enhance_result(result)
+
+    sys.exit(0 if result.success else 1)
+
+
+def _display_enhance_result(result: PipelineResult) -> None:
+    """Display modification pipeline results."""
+    if result.success:
+        console.print(Panel.fit(
+            "[bold green]Modification completed successfully![/bold green]",
+            title="✅ Enhanced",
+        ))
+    else:
+        console.print(Panel.fit(
+            "[bold red]Modification completed with issues[/bold red]",
+            title="⚠️  Warning",
+        ))
+
+    table = Table(title="Modification Results")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="white")
+
+    table.add_row("Workspace", str(result.workspace_path))
+    table.add_row("Elapsed", f"{result.elapsed_seconds:.1f}s")
+
+    if result.change_plan:
+        table.add_row("Summary", result.change_plan.summary)
+        table.add_row("Files modified", str(len(result.change_plan.changes)))
+        table.add_row("New files", str(len(result.change_plan.new_files)))
+        if result.change_plan.risk_notes:
+            table.add_row("Risks", "\n".join(result.change_plan.risk_notes[:3]))
+
+    if result.repo_analysis:
+        table.add_row("Modules analyzed", str(len(result.repo_analysis.modules)))
+
+    for status_name, count in result.task_stats.items():
+        table.add_row(f"Tasks ({status_name})", str(count))
+
+    if result.errors:
+        error_text = "\n".join(result.errors[:3])
+        if len(result.errors) > 3:
+            error_text += f"\n... and {len(result.errors) - 3} more"
+        table.add_row("Errors", error_text)
+
+    console.print(table)
     """Display pipeline results in a formatted table."""
     if result.success:
         console.print(Panel.fit(

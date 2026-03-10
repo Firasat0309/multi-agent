@@ -9,8 +9,64 @@ from dataclasses import dataclass
 from typing import Any
 
 from config.settings import LLMConfig, LLMProvider
+from core.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 logger = logging.getLogger(__name__)
+
+
+def _blk(block: Any, key: str) -> Any:
+    """Read a field from a normalized content block (plain dict or SDK object).
+
+    Content blocks stored in message history can be either plain ``dict``
+    objects (our normalized internal format) or provider SDK objects that
+    expose the same fields as attributes.  This helper abstracts over both.
+    """
+    if isinstance(block, dict):
+        return block.get(key)
+    return getattr(block, key, None)
+
+# Per-million-token pricing in USD (update as providers publish new rates).
+# Keys match model IDs from VALID_MODELS; prefix-matching is used for aliases.
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    # Anthropic
+    "claude-sonnet-4-20250514": {"input": 3.00,  "output": 15.00},
+    "claude-3-5-sonnet-20241022": {"input": 3.00,  "output": 15.00},
+    "claude-3-5-haiku-20241022":  {"input": 0.80,  "output": 4.00},
+    "claude-3-opus-20240229":     {"input": 15.00, "output": 75.00},
+    "claude-3-sonnet-20240229":   {"input": 3.00,  "output": 15.00},
+    # OpenAI
+    "gpt-4o":               {"input": 2.50,  "output": 10.00},
+    "gpt-4-turbo":          {"input": 10.00, "output": 30.00},
+    "gpt-4-turbo-preview":  {"input": 10.00, "output": 30.00},
+    "gpt-4":                {"input": 30.00, "output": 60.00},
+    "gpt-3.5-turbo":        {"input": 0.50,  "output": 1.50},
+    # Google Gemini
+    "gemini-2.0-flash":     {"input": 0.075, "output": 0.30},
+    "gemini-1.5-pro":       {"input": 3.50,  "output": 10.50},
+    "gemini-1.5-flash":     {"input": 0.075, "output": 0.30},
+    "gemini-pro":           {"input": 0.50,  "output": 1.50},
+}
+
+
+def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Estimate USD cost for a given model and token counts.
+
+    Uses prefix matching so ``claude-sonnet-4-20250514`` and any future
+    variants still resolve to a price.  Returns 0.0 for unknown models.
+    """
+    pricing = MODEL_PRICING.get(model)
+    if pricing is None:
+        # Prefix match — e.g. future "claude-sonnet-4-20260101" hits "claude-sonnet-4-"
+        for key, val in MODEL_PRICING.items():
+            if model.startswith(key.rsplit("-", 1)[0]):
+                pricing = val
+                break
+    if pricing is None:
+        return 0.0
+    return (
+        input_tokens  * pricing["input"]  / 1_000_000
+        + output_tokens * pricing["output"] / 1_000_000
+    )
 
 
 @dataclass
@@ -19,6 +75,34 @@ class LLMResponse:
     usage: dict[str, int]
     model: str
     stop_reason: str = ""
+
+
+# ── Tool-use dataclasses ──────────────────────────────────────────────────────
+
+@dataclass
+class ToolDefinition:
+    """Describes a tool the LLM may call (JSON Schema input)."""
+    name: str
+    description: str
+    input_schema: dict  # JSON Schema object
+
+
+@dataclass
+class ToolCall:
+    """A single tool invocation requested by the LLM."""
+    tool_use_id: str
+    name: str
+    input: dict
+
+
+@dataclass
+class LLMResponseWithTools:
+    """Response from a tool-use enabled generate call."""
+    content: str                  # concatenated text blocks (may be empty)
+    tool_calls: list[ToolCall]    # tool_use blocks from the response
+    stop_reason: str              # "tool_use" | "end_turn"
+    usage: dict
+    raw_content: list             # raw content block list for multi-turn messages
 
 
 class LLMClientError(Exception):
@@ -60,6 +144,10 @@ class LLMClient:
     def __init__(self, config: LLMConfig):
         self.config = config
         self._client: Any = None
+        self._circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
+        # Cumulative token counters for cost tracking across the client's lifetime
+        self.total_input_tokens: int = 0
+        self.total_output_tokens: int = 0
         self._validate_config()
 
     def _validate_config(self) -> None:
@@ -133,49 +221,97 @@ class LLMClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
-        """Generate a completion from the LLM."""
+        """Generate a completion from the LLM with exponential backoff retry.
+
+        Retries up to 3 extra times (4 total) on transient errors such as
+        rate-limit (429) and server-side overload (500/503).  Non-retryable
+        errors (auth, bad model) surface immediately.
+        """
         client = self._get_client()
         temp = temperature if temperature is not None else self.config.temperature
         tokens = max_tokens if max_tokens is not None else self.config.max_tokens
 
-        try:
+        _max_attempts = 4
+        _base_delay = 2.0  # seconds; doubles each attempt (2 → 4 → 8 → …)
+
+        async def _generate_once() -> LLMResponse:
             if self.config.provider == LLMProvider.ANTHROPIC:
-                return await self._anthropic_generate(client, system_prompt, user_prompt, temp, tokens)
+                return await self._anthropic_generate(
+                    client, system_prompt, user_prompt, temp, tokens
+                )
             elif self.config.provider == LLMProvider.GEMINI:
-                return await self._gemini_generate(client, system_prompt, user_prompt, temp, tokens)
+                return await self._gemini_generate(
+                    client, system_prompt, user_prompt, temp, tokens
+                )
             else:
-                return await self._openai_generate(client, system_prompt, user_prompt, temp, tokens)
-        except LLMClientError:
-            # Re-raise LLM-specific errors (including LLMConfigError)
-            raise
-        except Exception as e:
-            error_msg = str(e)
-            error_type = type(e).__name__
-            
-            # Handle provider-specific errors
-            if "401" in error_msg or "Unauthorized" in error_msg or "Unauthenticated" in error_type:
-                raise LLMConfigError(
-                    f"❌ Authentication failed for {self.config.provider.value}\n\n"
-                    f"Your API key may be invalid or expired.\n"
-                    f"Please check your {self.config.provider.value.upper()}_API_KEY environment variable."
+                return await self._openai_generate(
+                    client, system_prompt, user_prompt, temp, tokens
+                )
+
+        for attempt in range(_max_attempts):
+            try:
+                response = await self._circuit.call(_generate_once)
+                # Accumulate lifetime token counts for cost reporting
+                self.total_input_tokens += response.usage.get("input_tokens", 0)
+                self.total_output_tokens += response.usage.get("output_tokens", 0)
+                return response
+            except CircuitOpenError as e:
+                raise LLMClientError(str(e)) from e
+            except LLMClientError:
+                # Config / auth errors are never retried — surface immediately.
+                raise
+            except Exception as e:
+                error_msg = str(e)
+                error_type = type(e).__name__
+
+                # Classify as retryable (rate-limit / transient server error)
+                is_rate_limit = (
+                    "429" in error_msg
+                    or "rate_limit" in error_msg.lower()
+                    or "ratelimit" in error_msg.lower()
+                    or "too many requests" in error_msg.lower()
+                )
+                is_transient = is_rate_limit or any(
+                    token in error_msg for token in ("500", "502", "503", "overloaded")
+                )
+
+                if is_transient and attempt < _max_attempts - 1:
+                    delay = _base_delay * (2 ** attempt)
+                    logger.warning(
+                        "LLM %s on attempt %d/%d — retrying in %.1fs: %s",
+                        "rate-limit" if is_rate_limit else "transient error",
+                        attempt + 1, _max_attempts,
+                        delay, error_msg[:120],
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Permanent or exhausted — translate to domain errors
+                if "401" in error_msg or "Unauthorized" in error_msg or "Unauthenticated" in error_type:
+                    raise LLMConfigError(
+                        f"❌ Authentication failed for {self.config.provider.value}\n\n"
+                        f"Your API key may be invalid or expired.\n"
+                        f"Please check your {self.config.provider.value.upper()}_API_KEY environment variable."
+                    ) from e
+                elif "NotFound" in error_type or "404" in error_msg or "not found" in error_msg.lower():
+                    raise LLMConfigError(
+                        f"❌ Model '{self.config.model}' not found or no longer available\n\n"
+                        f"Valid models for {self.config.provider.value}:\n"
+                        f"  {', '.join(self.VALID_MODELS.get(self.config.provider, []))}\n\n"
+                        f"Use: codegen \"prompt\" --provider {self.config.provider.value} --model <valid-model>"
+                    ) from e
+                elif "is not supported" in error_msg.lower():
+                    raise LLMConfigError(
+                        f"❌ Model '{self.config.model}' is not supported for this operation\n\n"
+                        f"Try a different model: {', '.join(self.VALID_MODELS.get(self.config.provider, []))}"
+                    ) from e
+
+                raise LLMClientError(
+                    f"Failed to generate with {self.config.provider.value}: {e}"
                 ) from e
-            elif "NotFound" in error_type or "404" in error_msg or "not found" in error_msg.lower():
-                raise LLMConfigError(
-                    f"❌ Model '{self.config.model}' not found or no longer available\n\n"
-                    f"Valid models for {self.config.provider.value}:\n"
-                    f"  {', '.join(self.VALID_MODELS.get(self.config.provider, []))}\n\n"
-                    f"Use: codegen \"prompt\" --provider {self.config.provider.value} --model <valid-model>"
-                ) from e
-            elif "is not supported" in error_msg.lower():
-                raise LLMConfigError(
-                    f"❌ Model '{self.config.model}' is not supported for this operation\n\n"
-                    f"Try a different model: {', '.join(self.VALID_MODELS.get(self.config.provider, []))}"
-                ) from e
-            
-            # Catch unhandled errors and re-raise as LLMClientError
-            raise LLMClientError(
-                f"Failed to generate with {self.config.provider.value}: {e}"
-            ) from e
+
+        # Unreachable — the loop always returns or raises inside.
+        raise LLMClientError("generate: retry loop exhausted without result")
 
     async def _anthropic_generate(
         self, client: Any, system: str, user: str, temperature: float, max_tokens: int
@@ -304,6 +440,62 @@ class LLMClient:
             stop_reason=response.candidates[0].finish_reason.name if response.candidates else "",
         )
 
+    async def generate_streaming(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        on_chunk: Any | None = None,
+        max_tokens: int | None = None,
+    ) -> LLMResponse:
+        """Stream response chunks, calling *on_chunk(text)* for each delta.
+
+        Falls back to a regular ``generate()`` call for providers that do not
+        support streaming (Gemini, OpenAI in the current driver set).  Anthropic
+        uses the native streaming API.
+
+        Args:
+            on_chunk: Optional callable receiving each text delta as a string.
+                      Called synchronously from the stream-reading thread.
+        """
+        tokens = max_tokens if max_tokens is not None else self.config.max_tokens
+        client = self._get_client()
+
+        if self.config.provider == LLMProvider.ANTHROPIC:
+            import anthropic
+
+            collected: list[str] = []
+            usage: dict[str, int] = {}
+
+            def _stream_sync() -> None:
+                with client.messages.stream(
+                    model=self.config.model,
+                    max_tokens=tokens,
+                    temperature=self.config.temperature,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": user_prompt}],
+                ) as stream:
+                    for text in stream.text_stream:
+                        collected.append(text)
+                        if on_chunk is not None:
+                            on_chunk(text)
+                    final = stream.get_final_message()
+                    usage["input_tokens"] = final.usage.input_tokens
+                    usage["output_tokens"] = final.usage.output_tokens
+
+            await asyncio.to_thread(_stream_sync)
+            content = "".join(collected)
+            self.total_input_tokens += usage.get("input_tokens", 0)
+            self.total_output_tokens += usage.get("output_tokens", 0)
+            return LLMResponse(
+                content=content,
+                usage=usage,
+                model=self.config.model,
+                stop_reason="end_turn",
+            )
+
+        # Non-Anthropic providers: fall back to non-streaming generate
+        return await self.generate(system_prompt, user_prompt, max_tokens=max_tokens)
+
     async def generate_json(
         self,
         system_prompt: str,
@@ -338,3 +530,363 @@ class LLMClient:
                     pass
             logger.error(f"Could not parse JSON from LLM response: {text[:200]}")
             return {}
+
+    async def generate_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[ToolDefinition],
+        system_prompt: str = "",
+        max_tokens: int = 8192,
+    ) -> LLMResponseWithTools:
+        """Multi-turn tool-use call — supported for all three providers.
+
+        Messages use a normalized internal format (plain dicts matching the
+        Anthropic tool-use schema) so the same agentic loop in ``BaseAgent``
+        works regardless of which LLM is configured:
+
+        * **Anthropic** — native tool_use blocks via the Messages API.
+        * **OpenAI** — native function-calling via the Chat Completions API.
+          Messages are translated to/from the OpenAI format internally.
+        * **Gemini** — structured-prompt simulation: tools are described in
+          the system prompt; the model signals a call via a JSON envelope
+          ``{"tool_call": {"name": ..., "input": {...}}}``.
+
+        ``raw_content`` in the returned ``LLMResponseWithTools`` is always a
+        list of plain normalized dicts so it can be safely re-fed on the next
+        iteration without provider-specific objects in the history.
+        """
+        if self.config.provider == LLMProvider.ANTHROPIC:
+            return await self._anthropic_generate_with_tools(
+                messages, tools, system_prompt, max_tokens,
+            )
+        if self.config.provider == LLMProvider.OPENAI:
+            return await self._openai_generate_with_tools(
+                messages, tools, system_prompt, max_tokens,
+            )
+        # Gemini — structured-prompt simulation
+        return await self._gemini_generate_with_tools(
+            messages, tools, system_prompt, max_tokens,
+        )
+
+    # ── Per-provider tool-use implementations ────────────────────────────────
+
+    async def _anthropic_generate_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[ToolDefinition],
+        system_prompt: str,
+        max_tokens: int,
+    ) -> LLMResponseWithTools:
+        client = self._get_client()
+        api_tools = [
+            {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+            for t in tools
+        ]
+
+        def _sync() -> Any:
+            kwargs: dict[str, Any] = dict(
+                model=self.config.model,
+                max_tokens=max_tokens,
+                tools=api_tools,
+                messages=messages,
+            )
+            if system_prompt:
+                kwargs["system"] = system_prompt
+            return client.messages.create(**kwargs)
+
+        try:
+            response = await self._circuit.call(lambda: asyncio.to_thread(_sync))
+        except CircuitOpenError as exc:
+            raise LLMClientError(str(exc)) from exc
+
+        self.total_input_tokens += response.usage.input_tokens
+        self.total_output_tokens += response.usage.output_tokens
+        self._update_metrics(response.usage)
+
+        # Normalize SDK objects → plain dicts so history is always serialisable
+        # and can be re-fed to any provider without Anthropic SDK objects inside.
+        normalized: list[dict] = []
+        text_parts: list[str] = []
+        tool_calls: list[ToolCall] = []
+        for block in response.content:
+            btype = getattr(block, "type", None)
+            if btype == "text":
+                text_parts.append(block.text)
+                normalized.append({"type": "text", "text": block.text})
+            elif btype == "tool_use":
+                tool_calls.append(ToolCall(
+                    tool_use_id=block.id, name=block.name, input=block.input,
+                ))
+                normalized.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                })
+
+        return LLMResponseWithTools(
+            content="\n".join(text_parts),
+            tool_calls=tool_calls,
+            stop_reason=response.stop_reason,
+            usage={
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            },
+            raw_content=normalized,
+        )
+
+    async def _openai_generate_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[ToolDefinition],
+        system_prompt: str,
+        max_tokens: int,
+    ) -> LLMResponseWithTools:
+        client = self._get_client()
+        oai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                },
+            }
+            for t in tools
+        ]
+        oai_messages = self._translate_messages_to_openai(messages, system_prompt)
+
+        def _sync() -> Any:
+            return client.chat.completions.create(
+                model=self.config.model,
+                max_tokens=max_tokens,
+                tools=oai_tools,
+                tool_choice="auto",
+                messages=oai_messages,
+            )
+
+        try:
+            response = await self._circuit.call(lambda: asyncio.to_thread(_sync))
+        except CircuitOpenError as exc:
+            raise LLMClientError(str(exc)) from exc
+
+        self.total_input_tokens += response.usage.prompt_tokens
+        self.total_output_tokens += response.usage.completion_tokens
+
+        choice = response.choices[0]
+        msg = choice.message
+        finish = choice.finish_reason  # "tool_calls" | "stop"
+
+        # Build normalized raw_content and ToolCall list
+        normalized: list[dict] = []
+        tool_calls: list[ToolCall] = []
+        text = msg.content or ""
+        if text:
+            normalized.append({"type": "text", "text": text})
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                try:
+                    inp = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    inp = {}
+                tool_calls.append(ToolCall(
+                    tool_use_id=tc.id, name=tc.function.name, input=inp,
+                ))
+                normalized.append({
+                    "type": "tool_use",
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "input": inp,
+                })
+
+        stop_reason = "tool_use" if finish == "tool_calls" else "end_turn"
+        return LLMResponseWithTools(
+            content=text,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+            usage={
+                "input_tokens": response.usage.prompt_tokens,
+                "output_tokens": response.usage.completion_tokens,
+            },
+            raw_content=normalized,
+        )
+
+    async def _gemini_generate_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[ToolDefinition],
+        system_prompt: str,
+        max_tokens: int,
+    ) -> LLMResponseWithTools:
+        """Simulate tool use for Gemini via structured-prompt conventions.
+
+        The tools are described as a JSON schema block appended to the system
+        prompt.  The model is instructed to signal a tool call by responding
+        with ONLY ``{"tool_call": {"name": "...", "input": {...}}}``.  Any
+        other response is treated as a final text answer (``end_turn``).
+        """
+        tool_schema = json.dumps(
+            [{"name": t.name, "description": t.description, "parameters": t.input_schema}
+             for t in tools],
+            indent=2,
+        )
+        tool_instruction = (
+            "\n\nYou have access to these tools:\n"
+            f"```json\n{tool_schema}\n```\n\n"
+            "To call a tool, respond with ONLY this JSON (no other text):\n"
+            '{"tool_call": {"name": "<tool_name>", "input": {<arguments>}}}\n'
+            "Otherwise respond normally."
+        )
+        full_system = system_prompt + tool_instruction
+
+        # Flatten normalized messages into a plain conversation string for Gemini
+        conversation = self._flatten_messages_for_gemini(messages)
+
+        response = await self._gemini_generate(
+            self._get_client(), full_system, conversation,
+            self.config.temperature, max_tokens,
+        )
+        text = response.content.strip()
+
+        # Try to detect a tool-call JSON envelope
+        try:
+            start = text.find("{")
+            if start != -1:
+                data = json.loads(text[start:])
+                if "tool_call" in data:
+                    tc_data = data["tool_call"]
+                    tc = ToolCall(
+                        tool_use_id=f"gemini-{tc_data['name']}-0",
+                        name=tc_data["name"],
+                        input=tc_data.get("input", {}),
+                    )
+                    normalized = [{"type": "tool_use", "id": tc.tool_use_id,
+                                   "name": tc.name, "input": tc.input}]
+                    return LLMResponseWithTools(
+                        content="",
+                        tool_calls=[tc],
+                        stop_reason="tool_use",
+                        usage=response.usage,
+                        raw_content=normalized,
+                    )
+        except (json.JSONDecodeError, KeyError, TypeError):
+            pass
+
+        # Plain text response — end_turn
+        return LLMResponseWithTools(
+            content=text,
+            tool_calls=[],
+            stop_reason="end_turn",
+            usage=response.usage,
+            raw_content=[{"type": "text", "text": text}],
+        )
+
+    # ── Message format translation helpers ───────────────────────────────────
+
+    def _translate_messages_to_openai(
+        self,
+        messages: list[dict],
+        system_prompt: str = "",
+    ) -> list[dict]:
+        """Convert normalized internal messages to OpenAI Chat Completions format.
+
+        Internal normalized format uses Anthropic-style content blocks
+        (plain dicts with ``type`` keys).  Tool results live in
+        ``{"role": "user", "content": [{"type": "tool_result", ...}]}`` turns.
+        """
+        result: list[dict] = []
+        if system_prompt:
+            result.append({"role": "system", "content": system_prompt})
+
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+
+            if isinstance(content, str):
+                result.append({"role": role, "content": content})
+                continue
+
+            if not isinstance(content, list):
+                result.append({"role": role, "content": str(content)})
+                continue
+
+            tool_uses = [b for b in content if _blk(b, "type") == "tool_use"]
+            tool_results = [b for b in content if _blk(b, "type") == "tool_result"]
+            text_blocks = [b for b in content if _blk(b, "type") == "text"]
+
+            if role == "assistant" and tool_uses:
+                text = "\n".join(_blk(b, "text") for b in text_blocks) or None
+                oai_tool_calls = [
+                    {
+                        "id": _blk(b, "id"),
+                        "type": "function",
+                        "function": {
+                            "name": _blk(b, "name"),
+                            "arguments": json.dumps(_blk(b, "input") or {}),
+                        },
+                    }
+                    for b in tool_uses
+                ]
+                result.append({
+                    "role": "assistant",
+                    "content": text,
+                    "tool_calls": oai_tool_calls,
+                })
+            elif role == "user" and tool_results:
+                # Each tool result becomes a separate "tool" role message
+                for b in tool_results:
+                    raw = _blk(b, "content") or ""
+                    if isinstance(raw, list):
+                        raw = "\n".join(
+                            item.get("text", "") if isinstance(item, dict) else str(item)
+                            for item in raw
+                        )
+                    result.append({
+                        "role": "tool",
+                        "tool_call_id": _blk(b, "tool_use_id"),
+                        "content": str(raw),
+                    })
+            else:
+                # Plain user text or assistant text without tool calls
+                text = "\n".join(_blk(b, "text") for b in text_blocks)
+                result.append({"role": role, "content": text})
+
+        return result
+
+    def _flatten_messages_for_gemini(self, messages: list[dict]) -> str:
+        """Flatten normalized messages into a single prompt string for Gemini.
+
+        Gemini's multi-turn tool-use API requires a stateful chat session and
+        is not compatible with the stateless message-list pattern used here.
+        We flatten the conversation to a string so that the existing agentic
+        loop works without a redesign; the model sees the full context each
+        turn.
+        """
+        parts: list[str] = []
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            if isinstance(content, str):
+                parts.append(f"{role.upper()}: {content}")
+            elif isinstance(content, list):
+                for block in content:
+                    btype = _blk(block, "type")
+                    if btype == "text":
+                        parts.append(f"{role.upper()}: {_blk(block, 'text')}")
+                    elif btype == "tool_use":
+                        parts.append(
+                            f"TOOL_CALL: {_blk(block, 'name')} "
+                            f"args={json.dumps(_blk(block, 'input') or {})}"
+                        )
+                    elif btype == "tool_result":
+                        raw = _blk(block, "content") or ""
+                        if isinstance(raw, list):
+                            raw = "\n".join(
+                                item.get("text", "") if isinstance(item, dict) else str(item)
+                                for item in raw
+                            )
+                        parts.append(f"TOOL_RESULT: {raw}")
+        return "\n".join(parts)
+
+    def _update_metrics(self, usage: Any) -> None:
+        """No-op hook for subclasses / tests to observe token usage."""

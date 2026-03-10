@@ -80,7 +80,7 @@ class Settings:
         default_factory=lambda: ["file", "module", "architecture"]
     )
     allow_host_execution: bool = False  # Must be True to run without Docker
-    enable_lifecycle: bool = True  # Use event-sourced lifecycle engine (vs legacy DAG)
+    require_plan_approval: bool = False  # If True, pause for human review after change planning
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -100,12 +100,18 @@ class Settings:
         )
 
 
-# Singleton
-_settings: Settings | None = None
+# ── CLI / API entry-point helper ──────────────────────────────────────────────
+# Call this ONLY at process entry points (CLI startup, FastAPI lifespan).
+# Internal components receive a Settings instance via their constructors —
+# never call get_settings() from library code.
 
 
 def get_settings() -> Settings:
-    global _settings
-    if _settings is None:
-        _settings = Settings.from_env()
-    return _settings
+    """Build and return a fresh Settings from environment variables.
+
+    Intentionally NOT cached: each call reads the current environment so
+    there is no global mutable state and no need to reset between tests.
+    Entry points (CLI, API) should call this once and pass the result
+    through constructors everywhere else.
+    """
+    return Settings.from_env()

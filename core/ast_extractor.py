@@ -10,8 +10,8 @@ Architecture:
   - Languages without a tree-sitter grammar fall back to raw truncation
   - Results are cached per (path, checksum) to avoid re-parsing unchanged files
 
-Currently supported: **Java**
-Planned: Python, Go, TypeScript, Rust, C#
+Currently supported: **Java**, **Python**
+Planned: Go, TypeScript, Rust, C#
 """
 
 from __future__ import annotations
@@ -39,10 +39,9 @@ def _get_parser(language: str) -> Any | None:
         if language == "java":
             import tree_sitter_java as ts_java
             lang = tree_sitter.Language(ts_java.language())
-        # Future languages go here:
-        # elif language == "python":
-        #     import tree_sitter_python as ts_python
-        #     lang = tree_sitter.Language(ts_python.language())
+        elif language == "python":
+            import tree_sitter_python as ts_python
+            lang = tree_sitter.Language(ts_python.language())
         else:
             _PARSERS[language] = None
             return None
@@ -82,7 +81,7 @@ class MethodSignature:
 class TypeSignature:
     """A class, interface, enum, or record."""
     name: str
-    kind: str                     # "class" | "interface" | "enum" | "record"
+    kind: str                     # "class" | "interface" | "enum" | "record" | "module"
     modifiers: str = ""
     annotations: list[str] = field(default_factory=list)
     extends: str = ""             # superclass or extends clause
@@ -91,6 +90,7 @@ class TypeSignature:
     methods: list[MethodSignature] = field(default_factory=list)
     enum_constants: list[str] = field(default_factory=list)
     record_components: str = ""   # e.g. "(String name, String email)"
+    docstring: str = ""           # Python: class-level docstring
 
 
 @dataclass
@@ -109,6 +109,65 @@ class FileSignature:
         depends on this file: package, imports, type signatures, public method
         signatures, and field types.  Implementation bodies are omitted.
         """
+        if self.language == "python":
+            return self._to_python_stub()
+        return self._to_java_stub()
+
+    def _to_python_stub(self) -> str:
+        """Python-style stub: ``def func(...) -> ret: ...`` syntax."""
+        lines: list[str] = []
+
+        if self.imports:
+            for imp in self.imports:
+                lines.append(imp)
+            lines.append("")
+
+        for t in self.types:
+            if t.kind == "module":
+                # Module-level functions — no enclosing class
+                for m in t.methods:
+                    for ann in m.annotations:
+                        lines.append(ann)
+                    sig = f"def {m.name}{m.parameters}"
+                    if m.return_type:
+                        sig += f" -> {m.return_type}"
+                    lines.append(sig + ": ...")
+                    lines.append("")
+                continue
+
+            # Class definition header
+            if t.extends or t.implements:
+                bases = ([t.extends] if t.extends else []) + list(t.implements)
+                header = f"class {t.name}({', '.join(bases)}):"
+            else:
+                header = f"class {t.name}:"
+            lines.append(header)
+
+            # Class docstring
+            if t.docstring:
+                # Render as triple-quoted docstring, indented
+                first_line = t.docstring.split("\n")[0].strip().strip("\"'")
+                lines.append(f'    """{first_line}"""')
+                lines.append("")
+
+            if not t.methods:
+                lines.append("    ...")
+            else:
+                for m in t.methods:
+                    for ann in m.annotations:
+                        lines.append(f"    {ann}")
+                    sig = f"    def {m.name}{m.parameters}"
+                    if m.return_type:
+                        sig += f" -> {m.return_type}"
+                    lines.append(sig + ": ...")
+                    lines.append("")
+
+            lines.append("")
+
+        return "\n".join(lines).strip() + "\n"
+
+    def _to_java_stub(self) -> str:
+        """Java-style stub (original implementation)."""
         lines: list[str] = []
 
         if self.package:
@@ -207,6 +266,8 @@ class ASTExtractor:
 
         if lang == "java":
             sig = _extract_java(parser, file_path, source_code)
+        elif lang == "python":
+            sig = _extract_python(parser, file_path, source_code)
         else:
             return None
 
@@ -452,4 +513,180 @@ def _extract_java(parser: Any, file_path: str, source_code: str) -> FileSignatur
         package=package,
         imports=imports,
         types=types,
+    )
+
+
+# ── Python extraction ────────────────────────────────────────────────────────
+
+def _extract_python(parser: Any, file_path: str, source_code: str) -> FileSignature:
+    """Extract public API signatures from a Python source file.
+
+    Captures:
+    - Module-level imports (import / from … import)
+    - Class definitions with bases and class-level docstring
+    - Method signatures (name, full parameter list with annotations, return type)
+    - Module-level function signatures
+    - Decorators (@property, @staticmethod, @classmethod, @abstractmethod, …)
+
+    Does NOT capture:
+    - Function/method bodies
+    - Private methods (prefix ``__``) except ``__init__``
+    - Module-level variables (only imports)
+    """
+    source = source_code.encode("utf-8")
+    tree = parser.parse(source)
+    root = tree.root_node
+
+    imports: list[str] = []
+    types: list[TypeSignature] = []
+    module_functions: list[MethodSignature] = []
+
+    for node in root.children:
+        if node.type in ("import_statement", "import_from_statement"):
+            imports.append(_node_text(node, source).strip())
+        elif node.type == "class_definition":
+            t = _extract_python_class(node, source)
+            if t is not None:
+                types.append(t)
+        elif node.type == "decorated_definition":
+            decorators, inner = _split_decorated(node, source)
+            if inner is None:
+                continue
+            if inner.type == "class_definition":
+                t = _extract_python_class(inner, source, decorators)
+                if t is not None:
+                    types.append(t)
+            elif inner.type == "function_definition":
+                m = _extract_python_function(inner, source, decorators)
+                if m is not None and not _is_private_method(m.name):
+                    module_functions.append(m)
+        elif node.type == "function_definition":
+            m = _extract_python_function(node, source)
+            if m is not None and not _is_private_method(m.name):
+                module_functions.append(m)
+
+    # Wrap module-level functions in a synthetic TypeSignature
+    if module_functions:
+        types.insert(
+            0,
+            TypeSignature(name="", kind="module", methods=module_functions),
+        )
+
+    return FileSignature(
+        path=file_path,
+        language="python",
+        imports=imports,
+        types=types,
+    )
+
+
+def _is_private_method(name: str) -> bool:
+    """Return True for dunder methods other than ``__init__``."""
+    return name.startswith("__") and name != "__init__"
+
+
+def _split_decorated(
+    node: Any, source: bytes
+) -> tuple[list[str], Any | None]:
+    """Split a ``decorated_definition`` into (decorators, inner_definition)."""
+    decorators: list[str] = []
+    inner = None
+    for child in node.children:
+        if child.type == "decorator":
+            decorators.append(_node_text(child, source).strip())
+        elif child.type in ("class_definition", "function_definition"):
+            inner = child
+    return decorators, inner
+
+
+def _extract_python_class(
+    node: Any,
+    source: bytes,
+    class_decorators: list[str] | None = None,
+) -> TypeSignature | None:
+    """Extract a Python class definition into a ``TypeSignature``."""
+    name = ""
+    bases: list[str] = []
+    docstring = ""
+    methods: list[MethodSignature] = []
+
+    for child in node.children:
+        if child.type == "identifier":
+            name = _node_text(child, source)
+        elif child.type == "argument_list":
+            # Base classes — filter out punctuation tokens
+            for arg in child.children:
+                if arg.type not in (",", "(", ")"):
+                    bases.append(_node_text(arg, source).strip())
+        elif child.type == "block":
+            first_checked = False
+            for stmt in child.children:
+                # First expression_statement may be the class docstring
+                if not first_checked and stmt.type == "expression_statement":
+                    first_checked = True
+                    for sub in stmt.children:
+                        if sub.type in ("string", "concatenated_string"):
+                            raw = _node_text(sub, source).strip()
+                            # Unwrap triple quotes
+                            for q in ('"""', "'''", '"', "'"):
+                                if raw.startswith(q) and raw.endswith(q) and len(raw) > 2 * len(q):
+                                    raw = raw[len(q):-len(q)]
+                                    break
+                            docstring = raw.strip().split("\n")[0]
+                            break
+                    continue
+
+                if stmt.type == "function_definition":
+                    m = _extract_python_function(stmt, source)
+                    if m is not None and not _is_private_method(m.name):
+                        methods.append(m)
+                elif stmt.type == "decorated_definition":
+                    decs, inner = _split_decorated(stmt, source)
+                    if inner and inner.type == "function_definition":
+                        m = _extract_python_function(inner, source, decs)
+                        if m is not None and not _is_private_method(m.name):
+                            methods.append(m)
+
+    if not name:
+        return None
+
+    return TypeSignature(
+        name=name,
+        kind="class",
+        annotations=class_decorators or [],
+        extends=bases[0] if bases else "",
+        implements=bases[1:] if len(bases) > 1 else [],
+        methods=methods,
+        docstring=docstring,
+    )
+
+
+def _extract_python_function(
+    node: Any,
+    source: bytes,
+    decorators: list[str] | None = None,
+) -> MethodSignature | None:
+    """Extract a Python function/method definition into a ``MethodSignature``."""
+    name = ""
+    parameters = ""
+    return_type = ""
+
+    for child in node.children:
+        t = child.type
+        if t == "identifier":
+            name = _node_text(child, source)
+        elif t == "parameters":
+            parameters = _node_text(child, source)
+        elif t == "type":
+            # The ``->`` return annotation lives here
+            return_type = _node_text(child, source)
+
+    if not name:
+        return None
+
+    return MethodSignature(
+        name=name,
+        return_type=return_type,
+        parameters=parameters,
+        annotations=decorators or [],
     )

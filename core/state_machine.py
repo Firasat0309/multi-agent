@@ -37,6 +37,7 @@ class FilePhase(Enum):
     GENERATING = "generating"     # CoderAgent producing the file
     REVIEWING = "reviewing"       # ReviewerAgent checking the file
     FIXING = "fixing"             # CoderAgent fixing based on review or test feedback
+    BUILDING = "building"         # compiler/type-checker verification
     TESTING = "testing"           # TestAgent generating/running tests
     PASSED = "passed"             # terminal: file completed successfully
     FAILED = "failed"             # terminal: exhausted retries
@@ -50,6 +51,8 @@ class EventType(Enum):
     REVIEW_PASSED = "review_passed"
     REVIEW_FAILED = "review_failed"
     FIX_APPLIED = "fix_applied"
+    BUILD_PASSED = "build_passed"
+    BUILD_FAILED = "build_failed"
     TEST_PASSED = "test_passed"
     TEST_FAILED = "test_failed"
     RETRIES_EXHAUSTED = "retries_exhausted"
@@ -82,8 +85,10 @@ class Event:
 _TRANSITIONS: dict[tuple[FilePhase, EventType], FilePhase] = {
     (FilePhase.PENDING, EventType.DEPS_MET): FilePhase.GENERATING,
     (FilePhase.GENERATING, EventType.CODE_GENERATED): FilePhase.REVIEWING,
-    (FilePhase.REVIEWING, EventType.REVIEW_PASSED): FilePhase.TESTING,
+    (FilePhase.REVIEWING, EventType.REVIEW_PASSED): FilePhase.BUILDING,
     (FilePhase.REVIEWING, EventType.REVIEW_FAILED): FilePhase.FIXING,
+    (FilePhase.BUILDING, EventType.BUILD_PASSED): FilePhase.TESTING,
+    (FilePhase.BUILDING, EventType.BUILD_FAILED): FilePhase.FIXING,
     (FilePhase.TESTING, EventType.TEST_PASSED): FilePhase.PASSED,
     (FilePhase.TESTING, EventType.TEST_FAILED): FilePhase.FIXING,
 }
@@ -126,6 +131,8 @@ class FileLifecycle:
         self.review_findings: list[str] = []
         self.review_output: str = ""
         self.test_errors: str = ""
+        self.build_fix_count: int = 0
+        self.build_errors: str = ""
         self.tests_generated: bool = False
 
         # Append-only event log
@@ -177,6 +184,8 @@ class FileLifecycle:
                 self._test_fix_target = (
                     "source" if self._test_fix_target == "test" else "test"
                 )
+            elif self.fix_trigger == "build":
+                self.phase = FilePhase.BUILDING
             else:
                 raise ValueError(
                     f"FIX_APPLIED with unknown fix_trigger={self.fix_trigger!r} "
@@ -222,6 +231,20 @@ class FileLifecycle:
                 logger.warning(
                     "%s: test fix limit (%d) reached — marking passed with warnings",
                     self.file_path, self.max_test_fixes,
+                )
+
+        elif event_type == EventType.BUILD_FAILED:
+            self.build_fix_count += 1
+            self.fix_trigger = "build"
+            self.build_errors = data.get("errors", "")
+
+            if self.build_fix_count > self.max_review_fixes:
+                # Accept as-is after too many build fix attempts
+                new_phase = FilePhase.PASSED
+                self.fix_trigger = ""
+                logger.warning(
+                    "%s: build fix limit (%d) reached — proceeding anyway",
+                    self.file_path, self.max_review_fixes,
                 )
 
         elif event_type == EventType.REVIEW_PASSED:
@@ -277,10 +300,12 @@ class LifecycleEngine:
         *,
         max_review_fixes: int = 2,
         max_test_fixes: int = 3,
+        compiled: bool = False,
     ) -> None:
         self._lifecycles: dict[str, FileLifecycle] = {}
         self._deps = file_deps
         self._skip_testing: set[str] = set()
+        self._compiled = compiled
 
         for path in file_paths:
             self._lifecycles[path] = FileLifecycle(
@@ -315,7 +340,12 @@ class LifecycleEngine:
         lc = self._lifecycles[file_path]
         new_phase = lc.process_event(event_type, data)
 
-        # If review passed and file should skip testing → auto-pass
+        # Non-compiled languages (Python etc.) skip the BUILDING phase
+        if new_phase == FilePhase.BUILDING and not self._compiled:
+            new_phase = lc.process_event(EventType.BUILD_PASSED)
+            logger.info("[%s] build step skipped (interpreted language)", file_path)
+
+        # Config/deploy files skip testing
         if new_phase == FilePhase.TESTING and file_path in self._skip_testing:
             new_phase = lc.process_event(EventType.TEST_PASSED)
             logger.info("[%s] testing skipped (config/deploy layer)", file_path)

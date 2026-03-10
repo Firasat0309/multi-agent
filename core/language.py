@@ -45,6 +45,125 @@ class LanguageProfile:
             result = result.removesuffix(ext)
         return result.replace("/", self.module_separator)
 
+    def resolve_import_to_path(
+        self, import_str: str, known_files: set[str]
+    ) -> str | None:
+        """Convert an import statement string to a workspace-relative file path.
+
+        Resolves the mixed-node-type problem where the dependency graph was
+        populated with raw import strings (e.g. ``"services.user"``) instead of
+        resolved file paths (e.g. ``"services/user.py"``).  Only returns a path
+        that actually exists in ``known_files`` so the graph stays clean.
+
+        Each language section extracts the module identifier from the import
+        statement and maps it to the most likely file path.  Relative imports
+        and wildcard imports are skipped (return ``None``) because they cannot
+        be resolved without a full module-resolution pass.
+        """
+        cleaned = import_str.strip().rstrip(";")
+
+        if self.name == "python":
+            # Skip relative imports — too ambiguous without package context
+            if re.match(r"^from\s+\.", cleaned):
+                return None
+            m = re.match(r"^from\s+([\w.]+)\s+import", cleaned)
+            if m:
+                module = m.group(1)
+            else:
+                m = re.match(r"^import\s+([\w.]+)", cleaned)
+                if not m:
+                    return None
+                # "import os.path" → use "os.path", not "os"
+                module = m.group(1).split(",")[0].strip()
+            candidate = module.replace(".", "/") + ".py"
+            if candidate in known_files:
+                return candidate
+            # Package import: "from services import user" → services/__init__.py
+            init_candidate = module.replace(".", "/") + "/__init__.py"
+            if init_candidate in known_files:
+                return init_candidate
+            return None
+
+        elif self.name == "java":
+            # "import com.example.services.UserService;" → "com/example/.../UserService.java"
+            m = re.match(r"^import\s+(?:static\s+)?([\w.]+?)(?:\.\*)?$", cleaned)
+            if not m:
+                return None
+            fqn = m.group(1)
+            candidate = fqn.replace(".", "/") + ".java"
+            if candidate in known_files:
+                return candidate
+            # Try common Java source roots
+            for prefix in ("src/main/java/", "src/"):
+                if (prefix + candidate) in known_files:
+                    return prefix + candidate
+            # Fallback: match by class name only (last segment)
+            class_name = fqn.split(".")[-1]
+            for path in known_files:
+                if path.endswith(f"/{class_name}.java") or path == f"{class_name}.java":
+                    return path
+            return None
+
+        elif self.name == "go":
+            # `"github.com/app/services"` → services/services.go or services/*.go
+            m = re.match(r'^["\s]*([\w./\-]+)["\s]*$', cleaned)
+            if not m:
+                return None
+            import_path = m.group(1).strip('"').strip("'")
+            last_seg = import_path.split("/")[-1]
+            for candidate in (f"{last_seg}/{last_seg}.go", f"{last_seg}/main.go"):
+                if candidate in known_files:
+                    return candidate
+            # Any .go file in that directory
+            for path in known_files:
+                if f"/{last_seg}/" in f"/{path}" or path.startswith(f"{last_seg}/"):
+                    return path
+            return None
+
+        elif self.name == "typescript":
+            # `import { X } from './services/user'` → services/user.ts
+            m = re.match(r"""^import.*from\s+['"]([^'"]+)['"]""", cleaned)
+            if not m:
+                m = re.match(r"""^import\s+['"]([^'"]+)['"]""", cleaned)
+            if not m:
+                return None
+            module_path = m.group(1).lstrip("./").lstrip("../")
+            for ext in (".ts", ".tsx", ".js", ".jsx"):
+                if (module_path + ext) in known_files:
+                    return module_path + ext
+            if (module_path + "/index.ts") in known_files:
+                return module_path + "/index.ts"
+            return None
+
+        elif self.name == "rust":
+            # "use crate::services::user;" → services/user.rs
+            m = re.match(r"^use\s+(?:crate|super|self)::([\w:]+?)(?:::\{.*\})?$", cleaned)
+            if not m:
+                m = re.match(r"^use\s+([\w:]+?)(?:::\{.*\})?$", cleaned)
+            if not m:
+                return None
+            path = m.group(1).replace("::", "/")
+            if (path + ".rs") in known_files:
+                return path + ".rs"
+            # Last segment may be a type, not a module — try without it
+            parts = path.rsplit("/", 1)
+            if len(parts) > 1 and (parts[0] + ".rs") in known_files:
+                return parts[0] + ".rs"
+            return None
+
+        elif self.name == "csharp":
+            # "using Company.App.Services;" → Services.cs or Services/*.cs
+            m = re.match(r"^using\s+(?:static\s+)?([A-Za-z][\w.]+)$", cleaned)
+            if not m:
+                return None
+            last_seg = m.group(1).split(".")[-1]
+            for path in known_files:
+                if path.endswith(f"/{last_seg}.cs") or path == f"{last_seg}.cs":
+                    return path
+            return None
+
+        return None
+
 
 # ── Built-in profiles ────────────────────────────────────────────────────────
 
@@ -231,3 +350,23 @@ def detect_language_from_blueprint(tech_stack: dict[str, str]) -> LanguageProfil
         return get_language_profile(framework)
 
     return PYTHON
+
+
+def detect_language_from_extensions(ext_counts: dict[str, int]) -> LanguageProfile:
+    """Detect the primary language from a map of file-extension counts.
+
+    Picks the language whose extensions have the highest total file count.
+    Falls back to Python when no recognisable extensions are found.
+    """
+    # Map each profile's extensions to accumulated counts
+    lang_scores: dict[str, int] = {}
+    for profile in (PYTHON, JAVA, GO, TYPESCRIPT, RUST, CSHARP):
+        score = sum(ext_counts.get(ext, 0) for ext in profile.file_extensions)
+        if score > 0:
+            lang_scores[profile.name] = score
+
+    if not lang_scores:
+        return PYTHON
+
+    best = max(lang_scores, key=lambda k: lang_scores[k])
+    return LANGUAGE_PROFILES[best]

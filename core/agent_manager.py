@@ -7,15 +7,22 @@ import logging
 import time
 from typing import Any, TYPE_CHECKING
 
+from agents.architect_agent import ArchitectAgent
 from agents.base_agent import BaseAgent
+from agents.build_verifier_agent import BuildVerifierAgent
 from agents.coder_agent import CoderAgent
 from agents.deploy_agent import DeployAgent
+from agents.integration_test_agent import IntegrationTestAgent
+from agents.patch_agent import PatchAgent
 from agents.reviewer_agent import ReviewerAgent
 from agents.security_agent import SecurityAgent
 from agents.test_agent import TestAgent
+from agents.planner_agent import PlannerAgent
 from agents.writer_agent import WriterAgent
 from config.settings import Settings
 from core.context_builder import ContextBuilder
+from core.event_bus import AgentEvent, BusEventType, EventBus
+from core.file_lock_manager import FileLockManager
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient
 from core.observability import record_agent_end, record_agent_start, record_task_completion
@@ -32,6 +39,8 @@ from tools.terminal_tools import TerminalTools
 
 if TYPE_CHECKING:
     from core.live_console import LiveConsole
+    from memory.dependency_graph import DependencyGraphStore
+    from memory.embedding_store import EmbeddingStore
     from sandbox.sandbox_runner import SandboxManager
 
 logger = logging.getLogger(__name__)
@@ -47,6 +56,11 @@ TASK_AGENT_MAP: dict[TaskType, type[BaseAgent]] = {
     TaskType.GENERATE_DEPLOY: DeployAgent,
     TaskType.GENERATE_DOCS: WriterAgent,
     TaskType.FIX_CODE: CoderAgent,
+    TaskType.MODIFY_FILE: PatchAgent,                            # surgical patch
+    TaskType.GENERATE_INTEGRATION_TEST: IntegrationTestAgent,
+    TaskType.DESIGN_ARCHITECTURE: ArchitectAgent,
+    TaskType.CREATE_PLAN: PlannerAgent,
+    TaskType.VERIFY_BUILD: BuildVerifierAgent,
 }
 
 
@@ -63,6 +77,9 @@ class AgentManager:
         sandbox_manager: SandboxManager | None = None,
         build_sandbox_id: str | None = None,
         test_sandbox_id: str | None = None,
+        dep_store: DependencyGraphStore | None = None,
+        embedding_store: EmbeddingStore | None = None,
+        event_bus: EventBus | None = None,
     ) -> None:
         self.settings = settings
         self.llm = llm_client
@@ -70,6 +87,9 @@ class AgentManager:
         self.blueprint = blueprint
         self._live = live_console
         self._lang = detect_language_from_blueprint(blueprint.tech_stack)
+        self._dep_store = dep_store
+        self._embedding_store = embedding_store
+        self._event_bus = event_bus
 
         # Two-tier terminal tools: build (network-capable) and test (isolated).
         # TestAgent gets the test terminal; all other agents that need a
@@ -97,21 +117,28 @@ class AgentManager:
             "total_time": 0.0,
             "agent_metrics": {},
         }
+        self._file_locks = FileLockManager()
 
     def _create_agent(self, task_type: TaskType) -> BaseAgent:
         agent_cls = TASK_AGENT_MAP.get(task_type)
         if agent_cls is None:
             raise ValueError(f"No agent registered for task type: {task_type}")
 
-        # TestAgent → test terminal (no-network sandbox for generated tests).
+        # TestAgent / IntegrationTestAgent → test terminal (no-network sandbox).
         # SecurityAgent → build terminal (bandit needs the full env).
-        if agent_cls is TestAgent:
+        if agent_cls in (TestAgent, IntegrationTestAgent):
             return agent_cls(
                 llm_client=self.llm,
                 repo_manager=self.repo,
                 terminal=self.test_terminal,
             )
         if agent_cls is SecurityAgent:
+            return agent_cls(
+                llm_client=self.llm,
+                repo_manager=self.repo,
+                terminal=self.build_terminal,
+            )
+        if agent_cls is BuildVerifierAgent:
             return agent_cls(
                 llm_client=self.llm,
                 repo_manager=self.repo,
@@ -182,6 +209,16 @@ class AgentManager:
                 task.metadata["review_errors"] = review_task.result.errors
                 task.metadata["review_output"] = review_task.result.output
 
+        # Acquire a per-file lock for write tasks to prevent concurrent
+        # modifications to the same file from racing.  Read-only tasks
+        # (REVIEW_*, SECURITY_SCAN) also acquire the lock so they never read
+        # a file while it is being written by another agent.
+        file_lock = (
+            self._file_locks.lock_for(task.file)
+            if task.file and task.file != "*"
+            else None
+        )
+
         for attempt in range(task.max_retries):
             # Rebuild context on EVERY attempt so the agent sees the current
             # state of the filesystem, not a stale snapshot from before the
@@ -190,6 +227,8 @@ class AgentManager:
                 workspace_dir=self.repo.workspace,
                 blueprint=self.blueprint,
                 repo_index=self.repo.get_repo_index(),
+                dep_store=self._dep_store,
+                embedding_store=self._embedding_store,
             )
             context = context_builder.build(task)
 
@@ -205,7 +244,11 @@ class AgentManager:
 
                 record_agent_start()
                 try:
-                    result = await agent.execute(context)
+                    if file_lock:
+                        async with file_lock:
+                            result = await agent.execute(context)
+                    else:
+                        result = await agent.execute(context)
                 finally:
                     record_agent_end()
 
@@ -222,6 +265,31 @@ class AgentManager:
                     self._metrics["tasks_completed"] += 1
                     record_task_completion(task.task_type.value, "completed", elapsed)
                     logger.info(f"Task {task.task_id} completed: {result.output}")
+                    # Incremental embedding update — keep vector index fresh
+                    # so subsequent agents' semantic searches see new content.
+                    if self._embedding_store and result.files_modified:
+                        for fp in result.files_modified:
+                            try:
+                                content = self.repo.read_file(fp)
+                                self._embedding_store.index_file(fp, content)
+                            except Exception:
+                                logger.debug("Embedding update skipped for %s", fp)
+                            if self._event_bus:
+                                await self._event_bus.publish(AgentEvent(
+                                    type=BusEventType.FILE_WRITTEN,
+                                    task_id=task.task_id,
+                                    task_type=task.task_type.value,
+                                    file_path=fp,
+                                    agent_name=agent_name,
+                                ))
+                    if self._event_bus:
+                        await self._event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_COMPLETED,
+                            task_id=task.task_id,
+                            task_type=task.task_type.value,
+                            file_path=task.file,
+                            agent_name=agent_name,
+                        ))
                     if self._live:
                         self._live.update_task(
                             task.task_id, task.description, "completed", agent_name,
@@ -248,6 +316,14 @@ class AgentManager:
         self._metrics["tasks_failed"] += 1
         record_task_completion(task.task_type.value, "failed", elapsed)
         logger.error(f"Task {task.task_id} failed after {task.max_retries} attempts")
+        if self._event_bus:
+            await self._event_bus.publish(AgentEvent(
+                type=BusEventType.TASK_FAILED,
+                task_id=task.task_id,
+                task_type=task.task_type.value,
+                file_path=task.file,
+                agent_name=agent_name,
+            ))
         if self._live:
             self._live.update_task(task.task_id, task.description, "failed", agent_name)
             self._live.log(f"[red]Failed:[/red] {task.description}")
@@ -307,10 +383,17 @@ class AgentManager:
         # ── Phase 2: Global DAG ──────────────────────────────────────
         logger.info("All file lifecycles terminal — running global DAG")
 
-        # Mark the sentinel task (ID 1) as completed to unblock the global DAG
-        sentinel = global_graph.get_task(1)
+        # Mark the sentinel task as completed to unblock the global DAG.
+        # Look it up by metadata tag rather than hard-coding ID=1 so the lookup
+        # remains correct even if the task graph changes ordering.
+        sentinel = next(
+            (t for t in global_graph.tasks.values() if t.metadata.get("sentinel")),
+            None,
+        )
         if sentinel:
             global_graph.mark_completed(sentinel.task_id)
+        else:
+            logger.warning("Sentinel task not found in global DAG — global phases may stall")
 
         # Reuse the existing graph executor for the global tasks
         await self.execute_graph(global_graph)
@@ -384,6 +467,12 @@ class AgentManager:
                 "failure_event": EventType.RETRIES_EXHAUSTED,
                 "description": f"Fix {file_path} ({lc.fix_trigger} issues)",
             },
+            FilePhase.BUILDING: {
+                "task_type": TaskType.VERIFY_BUILD,
+                "success_event": EventType.BUILD_PASSED,
+                "failure_event": EventType.BUILD_FAILED,
+                "description": f"Verify build for {file_path}",
+            },
             FilePhase.TESTING: {
                 "task_type": TaskType.GENERATE_TEST,
                 "success_event": EventType.TEST_PASSED,
@@ -414,6 +503,8 @@ class AgentManager:
             workspace_dir=self.repo.workspace,
             blueprint=self.blueprint,
             repo_index=self.repo.get_repo_index(),
+            dep_store=self._dep_store,
+            embedding_store=self._embedding_store,
         )
         context = context_builder.build(task)
 
@@ -440,21 +531,76 @@ class AgentManager:
                 if review_passed:
                     event_data = {"output": result.output}
                     engine.process_event(file_path, EventType.REVIEW_PASSED, event_data)
+                    if self._event_bus:
+                        await self._event_bus.publish(AgentEvent(
+                            type=BusEventType.REVIEW_PASSED,
+                            task_type=config["task_type"].value,
+                            file_path=file_path,
+                            agent_name=agent_name,
+                        ))
                 else:
                     event_data = {"findings": result.errors, "output": result.output}
                     engine.process_event(file_path, EventType.REVIEW_FAILED, event_data)
+                    if self._event_bus:
+                        await self._event_bus.publish(AgentEvent(
+                            type=BusEventType.REVIEW_FAILED,
+                            task_type=config["task_type"].value,
+                            file_path=file_path,
+                            agent_name=agent_name,
+                            data={"findings": result.errors},
+                        ))
                 self._metrics["tasks_completed"] += 1
             elif result.success:
                 self._metrics["tasks_completed"] += 1
                 event_data = self._extract_event_data(result, config["task_type"])
                 engine.process_event(file_path, config["success_event"], event_data)
                 logger.info("[%s] %s succeeded", file_path, phase.value)
+                # Incremental embedding update for lifecycle path
+                if self._embedding_store and result.files_modified:
+                    for fp in result.files_modified:
+                        try:
+                            content = self.repo.read_file(fp)
+                            self._embedding_store.index_file(fp, content)
+                        except Exception:
+                            logger.debug("Embedding update skipped for %s", fp)
+                        if self._event_bus:
+                            await self._event_bus.publish(AgentEvent(
+                                type=BusEventType.FILE_WRITTEN,
+                                task_type=config["task_type"].value,
+                                file_path=fp,
+                                agent_name=agent_name,
+                            ))
+                if self._event_bus:
+                    bus_type = (
+                        BusEventType.TEST_PASSED
+                        if config["task_type"] == TaskType.GENERATE_TEST
+                        else BusEventType.TASK_COMPLETED
+                    )
+                    await self._event_bus.publish(AgentEvent(
+                        type=bus_type,
+                        task_type=config["task_type"].value,
+                        file_path=file_path,
+                        agent_name=agent_name,
+                    ))
                 if self._live:
                     self._live.log(f"[green]Done:[/green] {config['description']}")
             else:
                 event_data = self._extract_event_data(result, config["task_type"])
                 engine.process_event(file_path, config["failure_event"], event_data)
                 logger.warning("[%s] %s failed: %s", file_path, phase.value, result.errors)
+                if self._event_bus:
+                    bus_type = (
+                        BusEventType.TEST_FAILED
+                        if config["task_type"] == TaskType.GENERATE_TEST
+                        else BusEventType.TASK_FAILED
+                    )
+                    await self._event_bus.publish(AgentEvent(
+                        type=bus_type,
+                        task_type=config["task_type"].value,
+                        file_path=file_path,
+                        agent_name=agent_name,
+                        data={"errors": result.errors},
+                    ))
                 if self._live:
                     self._live.log(
                         f"[yellow]Issue:[/yellow] {config['description']} — "
@@ -478,6 +624,9 @@ class AgentManager:
             meta["test_errors"] = lc.test_errors
             meta["fix_trigger"] = "test"
             meta["test_fix_target"] = lc.test_fix_target
+        elif lc.fix_trigger == "build":
+            meta["build_errors"] = lc.build_errors
+            meta["fix_trigger"] = "build"
         return meta
 
     @staticmethod
@@ -487,4 +636,6 @@ class AgentManager:
         if task_type == TaskType.GENERATE_TEST:
             if not result.success:
                 data["errors"] = "\n".join(result.errors) if result.errors else result.output
+        if task_type == TaskType.VERIFY_BUILD:
+            data["errors"] = "\n".join(result.errors) if result.errors else result.output
         return data

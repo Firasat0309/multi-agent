@@ -1,25 +1,27 @@
 """Task DAG engine with topological execution ordering.
 
-Two execution modes:
-  1. **Legacy DAG** — ``TaskGraphBuilder.build_from_blueprint()`` creates a static
-     graph with pre-baked FIX_CODE tasks.  Used when lifecycle mode is disabled.
-  2. **Lifecycle + global DAG** — ``LifecyclePlanBuilder.build()`` creates:
-     - A ``LifecycleEngine`` for per-file Generate→Review→Fix→Test cycles
-     - A slim ``TaskGraph`` for global phases (security, module review, deploy, docs)
-     The per-file lifecycle is event-driven; the global DAG runs after all files
-     reach a terminal state.
+Execution model: **Lifecycle + global DAG** — ``LifecyclePlanBuilder.build()`` creates:
+  - A ``LifecycleEngine`` for per-file Generate→Review→Fix→Test cycles
+  - A slim ``TaskGraph`` for global phases (security, module review, deploy, docs)
+  The per-file lifecycle is event-driven; the global DAG runs after all files
+  reach a terminal state.
+
+``TaskGraphBuilder`` is retained for modification workflows only.
 """
 
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import Any, Iterator
+from typing import TYPE_CHECKING, Any, Iterator
 
 import networkx as nx
 
-from core.models import Task, TaskStatus, TaskType, RepositoryBlueprint, FileBlueprint
+from core.models import Task, TaskStatus, TaskType, RepositoryBlueprint, FileBlueprint, ChangePlan, ChangeAction
 from core.state_machine import LifecycleEngine
+
+if TYPE_CHECKING:
+    from memory.dependency_graph import DependencyGraphStore
 
 logger = logging.getLogger(__name__)
 
@@ -108,7 +110,12 @@ class TaskGraph:
 
 
 class TaskGraphBuilder:
-    """Builds a task graph from a repository blueprint."""
+    """Task graph builder for modification workflows.
+
+    ``build_from_blueprint()`` has been removed — use ``LifecyclePlanBuilder``
+    for new-project generation.  This class is kept for ``ModificationTaskGraphBuilder``
+    which still uses it internally for helper utilities.
+    """
 
     def __init__(self) -> None:
         self._next_id = 1
@@ -117,163 +124,6 @@ class TaskGraphBuilder:
         tid = self._next_id
         self._next_id += 1
         return tid
-
-    def build_from_blueprint(self, blueprint: RepositoryBlueprint) -> TaskGraph:
-        graph = TaskGraph()
-        file_task_map: dict[str, int] = {}
-
-        # Pre-validate: warn about depends_on references to files not in the blueprint
-        known_paths = {fb.path for fb in blueprint.file_blueprints}
-        for fb in blueprint.file_blueprints:
-            for dep_path in fb.depends_on:
-                if dep_path not in known_paths:
-                    logger.warning(
-                        f"Blueprint: {fb.path} depends on '{dep_path}' which is "
-                        f"not in the blueprint — dependency will be ignored"
-                    )
-
-        # Phase 1: Generate code files (respecting dependency order)
-        for fb in blueprint.file_blueprints:
-            deps = [file_task_map[d] for d in fb.depends_on if d in file_task_map]
-            task = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.GENERATE_FILE,
-                file=fb.path,
-                description=f"Generate {fb.path}: {fb.purpose}",
-                dependencies=deps,
-            )
-            graph.add_task(task)
-            file_task_map[fb.path] = task.task_id
-
-        # Phase 2: File-level reviews
-        review_tasks: list[int] = []
-        review_task_map: dict[str, int] = {}
-        for fb in blueprint.file_blueprints:
-            gen_task_id = file_task_map[fb.path]
-            task = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.REVIEW_FILE,
-                file=fb.path,
-                description=f"Review {fb.path}",
-                dependencies=[gen_task_id],
-            )
-            graph.add_task(task)
-            review_tasks.append(task.task_id)
-            review_task_map[fb.path] = task.task_id
-
-        # Phase 2.5: Fix code based on review findings
-        fix_task_map: dict[str, int] = {}
-        for fb in blueprint.file_blueprints:
-            review_task_id = review_task_map[fb.path]
-            fix_task = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.FIX_CODE,
-                file=fb.path,
-                description=f"Fix {fb.path} based on review",
-                dependencies=[review_task_id],
-                metadata={"review_task_id": review_task_id},
-            )
-            graph.add_task(fix_task)
-            fix_task_map[fb.path] = fix_task.task_id
-
-        # Phase 3: Generate tests
-        # IMPORTANT: Each test task depends on ALL fix tasks, not just its own.
-        # For compiled languages (Java, Go, Rust, C#), the test command compiles
-        # the entire project.  If UserService.java hasn't been generated yet when
-        # UserTest runs `mvn test`, compilation fails and the fix loop wastes all
-        # attempts on errors from files that don't exist yet.
-        # By depending on all fix tasks, we guarantee every source file is written
-        # and review-fixed before ANY test task begins.
-        all_fix_ids = list(fix_task_map.values())
-        test_tasks: list[int] = []
-        for fb in blueprint.file_blueprints:
-            if fb.layer in ("test", "config", "deploy"):
-                continue
-            task = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.GENERATE_TEST,
-                file=fb.path,
-                description=f"Generate tests for {fb.path}",
-                dependencies=all_fix_ids,
-            )
-            graph.add_task(task)
-            test_tasks.append(task.task_id)
-
-        # Phase 4: Security scan (after all fixes applied)
-        all_gen_ids = list(fix_task_map.values())
-        sec_task = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.SECURITY_SCAN,
-            file="*",
-            description="Security scan of entire codebase",
-            dependencies=all_gen_ids,
-        )
-        graph.add_task(sec_task)
-
-        # Phase 5: Module-level review (after all per-file fixes)
-        all_fix_ids = list(fix_task_map.values())
-        mod_review = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.REVIEW_MODULE,
-            file="*",
-            description="Module consistency review",
-            dependencies=all_fix_ids,
-        )
-        graph.add_task(mod_review)
-
-        # Phase 5.5: Module-level fix — fix cross-file consistency issues
-        # Each source file gets a fix task that sees the module review findings
-        mod_fix_ids: list[int] = []
-        for fb in blueprint.file_blueprints:
-            if fb.layer in ("config", "deploy"):
-                continue
-            mod_fix = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.FIX_CODE,
-                file=fb.path,
-                description=f"Fix {fb.path} based on module review",
-                dependencies=[mod_review.task_id],
-                metadata={"review_task_id": mod_review.task_id},
-            )
-            graph.add_task(mod_fix)
-            mod_fix_ids.append(mod_fix.task_id)
-
-        # Phase 6: Architecture review (after module fixes + security)
-        arch_review = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.REVIEW_ARCHITECTURE,
-            file="*",
-            description="Architecture review for dependency cycles and layer violations",
-            dependencies=mod_fix_ids + [sec_task.task_id],
-        )
-        graph.add_task(arch_review)
-
-        # Phase 7: Deployment artifacts
-        deploy_task = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.GENERATE_DEPLOY,
-            file="deploy/",
-            description="Generate Dockerfile and Kubernetes manifests",
-            dependencies=[arch_review.task_id],
-        )
-        graph.add_task(deploy_task)
-
-        # Phase 8: Documentation
-        docs_task = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.GENERATE_DOCS,
-            file="docs/",
-            description="Generate README, changelog, API docs",
-            dependencies=[arch_review.task_id],
-        )
-        graph.add_task(docs_task)
-
-        errors = graph.validate()
-        if errors:
-            raise ValueError(f"Task graph validation failed: {errors}")
-
-        logger.info(f"Built task graph with {len(graph.tasks)} tasks")
-        return graph
 
 
 class LifecyclePlanBuilder:
@@ -322,11 +172,16 @@ class LifecyclePlanBuilder:
             for fb in blueprint.file_blueprints
         }
 
+        from core.language import detect_language_from_blueprint
+        lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
+        compiled = bool(lang_profile.build_command)
+
         engine = LifecycleEngine(
             file_paths=file_paths,
             file_deps=file_deps,
             max_review_fixes=max_review_fixes,
             max_test_fixes=max_test_fixes,
+            compiled=compiled,
         )
 
         # Mark config/deploy/test files to skip testing
@@ -344,6 +199,7 @@ class LifecyclePlanBuilder:
             file="*",
             description="[sentinel] All per-file lifecycles completed",
             dependencies=[],
+            metadata={"sentinel": True},
         )
         global_graph.add_task(lifecycle_done)
 
@@ -383,13 +239,23 @@ class LifecyclePlanBuilder:
             global_graph.add_task(mod_fix)
             mod_fix_ids.append(mod_fix.task_id)
 
-        # Architecture review
+        # Integration tests — run after all per-file fixes and module review
+        integration_test = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.GENERATE_INTEGRATION_TEST,
+            file="tests/integration/",
+            description="Generate integration tests verifying cross-module interactions",
+            dependencies=mod_fix_ids + [sec_task.task_id],
+        )
+        global_graph.add_task(integration_test)
+
+        # Architecture review (after integration tests + security)
         arch_review = Task(
             task_id=self._alloc_id(),
             task_type=TaskType.REVIEW_ARCHITECTURE,
             file="*",
             description="Architecture review for dependency cycles and layer violations",
-            dependencies=mod_fix_ids + [sec_task.task_id],
+            dependencies=[integration_test.task_id],
         )
         global_graph.add_task(arch_review)
 
@@ -422,3 +288,367 @@ class LifecyclePlanBuilder:
             len(file_paths), len(global_graph.tasks),
         )
         return engine, global_graph
+
+
+class ModificationTaskGraphBuilder:
+    """Builds a task DAG for modifying an existing repository.
+
+    The modification flow is:
+      1. MODIFY_FILE tasks for each change in the plan (graph-ordered via dep_store)
+      2. GENERATE_FILE tasks for brand-new files in the plan
+      3. REVIEW_FILE for each modified/new file
+      4. FIX_CODE for each review
+      5. GENERATE_TEST for affected test files (expanded by dep_store impact analysis)
+      6. REVIEW_MODULE for cross-file consistency
+
+    When ``dep_store`` is provided the builder:
+    - Reorders modification tasks topologically so dependencies are modified first
+    - Expands affected_tests using graph-derived impact analysis (not just heuristics)
+    - Logs any detected dependency cycles as warnings before building
+    - Stores per-file impact metadata in task.metadata for downstream context use
+    """
+
+    def __init__(self, dep_store: DependencyGraphStore | None = None) -> None:
+        self._next_id = 1
+        self._dep_store = dep_store
+
+    def _alloc_id(self) -> int:
+        tid = self._next_id
+        self._next_id += 1
+        return tid
+
+    def build_from_change_plan(
+        self,
+        change_plan: ChangePlan,
+        blueprint: RepositoryBlueprint,
+    ) -> TaskGraph:
+        """Build a task graph from a ChangePlan.
+
+        Each ChangeAction becomes a MODIFY_FILE task; each new_file becomes
+        a GENERATE_FILE task.  Reviews and tests follow.
+        """
+        graph = TaskGraph()
+        file_task_map: dict[str, int] = {}  # file_path → last task_id for that file
+
+        # ── Pre-flight: conflict detection & resolution ───────────────
+        conflicts = self._detect_conflicts(change_plan.changes)
+        if conflicts:
+            for conflict in conflicts:
+                logger.warning("Change conflict detected: %s", conflict)
+            change_plan.risk_notes.extend(conflicts)
+
+        # Merge changes that target the same symbol in the same file into a
+        # single MODIFY_FILE task.  Without this, the second task reads the
+        # file (with task 1's edits in place), asks the LLM to apply only
+        # its change, and writes the full file back — silently dropping task
+        # 1's changes if the LLM doesn't faithfully preserve them.
+        resolved_changes = self._merge_conflicting_changes(change_plan.changes)
+
+        # ── Pre-flight: cycle detection & safe ordering ────────────────
+        ordered_changes = self._order_changes(resolved_changes)
+
+        # ── Phase 1: Modification tasks (graph-safe order) ────────────
+        for change in ordered_changes:
+            deps = [
+                file_task_map[d]
+                for d in change.depends_on
+                if d in file_task_map
+            ]
+            # Implicit same-file chain: if a previous task already targets
+            # this file, make the new task depend on it.  This guarantees
+            # sequential execution even when the change plan omits the
+            # self-dependency in its explicit depends_on list.
+            if change.file in file_task_map:
+                prev_id = file_task_map[change.file]
+                if prev_id not in deps:
+                    deps.append(prev_id)
+
+            impact_meta = self._get_impact_meta(change.file)
+            task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.MODIFY_FILE,
+                file=change.file,
+                description=f"Modify {change.file}: {change.description}",
+                dependencies=deps,
+                metadata={
+                    "change_type": change.type.value,
+                    "change_description": change.description,
+                    "target_function": change.function,
+                    "target_class": change.class_name,
+                    **impact_meta,
+                },
+            )
+            graph.add_task(task)
+            file_task_map[change.file] = task.task_id
+
+        # ── Phase 1b: Generate brand-new files ────────────────────────
+        for nf in change_plan.new_files:
+            deps = [
+                file_task_map[d]
+                for d in nf.depends_on
+                if d in file_task_map
+            ]
+            task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.GENERATE_FILE,
+                file=nf.path,
+                description=f"Create new file {nf.path}: {nf.purpose}",
+                dependencies=deps,
+            )
+            graph.add_task(task)
+            file_task_map[nf.path] = task.task_id
+
+        # ── Phase 2: Review each modified/new file ────────────────────
+        review_task_map: dict[str, int] = {}
+        for file_path, gen_task_id in file_task_map.items():
+            task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.REVIEW_FILE,
+                file=file_path,
+                description=f"Review changes in {file_path}",
+                dependencies=[gen_task_id],
+            )
+            graph.add_task(task)
+            review_task_map[file_path] = task.task_id
+
+        # ── Phase 2.5: Fix based on review ────────────────────────────
+        fix_task_ids: list[int] = []
+        for file_path, review_id in review_task_map.items():
+            fix_task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.FIX_CODE,
+                file=file_path,
+                description=f"Fix {file_path} based on review",
+                dependencies=[review_id],
+                metadata={"review_task_id": review_id},
+            )
+            graph.add_task(fix_task)
+            fix_task_ids.append(fix_task.task_id)
+
+        # ── Phase 3: Tests for affected files ─────────────────────────
+        # Merge plan's explicit test list with graph-derived impacted tests.
+        test_targets = self._expand_test_targets(
+            change_plan.affected_tests, list(file_task_map.keys())
+        )
+        for file_path in test_targets:
+            task = Task(
+                task_id=self._alloc_id(),
+                task_type=TaskType.GENERATE_TEST,
+                file=file_path,
+                description=f"Generate/update tests for {file_path}",
+                dependencies=fix_task_ids,
+            )
+            graph.add_task(task)
+
+        # ── Phase 4: Module-level review ──────────────────────────────
+        mod_review = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.REVIEW_MODULE,
+            file="*",
+            description="Module consistency review of modifications",
+            dependencies=fix_task_ids,
+        )
+        graph.add_task(mod_review)
+
+        errors = graph.validate()
+        if errors:
+            raise ValueError(f"Modification task graph validation failed: {errors}")
+
+        logger.info(
+            "Built modification task graph: %d tasks (%d modify, %d new, %d review, %d test)",
+            len(graph.tasks),
+            len(ordered_changes),
+            len(change_plan.new_files),
+            len(review_task_map),
+            len(test_targets),
+        )
+        return graph
+
+    def _order_changes(self, changes: list[ChangeAction]) -> list[ChangeAction]:
+        """Return changes in safe modification order using the dependency graph.
+
+        When dep_store is available:
+          1. Detect and warn about cycles in the affected subgraph.
+          2. Use get_modification_order() to topologically sort the target files.
+          3. Map back to the original ChangeAction objects.
+
+        Falls back to original order if dep_store is absent or graph is sparse.
+        """
+        if self._dep_store is None or not changes:
+            return changes
+
+        file_paths = [c.file for c in changes]
+
+        # Warn about cycles before they cause silent ordering problems
+        cycles = self._dep_store.detect_cycles()
+        affected_files = set(file_paths)
+        affecting_cycles = [
+            cycle for cycle in cycles
+            if any(f in affected_files for f in cycle)
+        ]
+        if affecting_cycles:
+            logger.warning(
+                "Dependency cycles detected involving modification targets: %s",
+                affecting_cycles,
+            )
+
+        ordered_paths = self._dep_store.get_modification_order(file_paths)
+
+        # Map back to ChangeAction, preserving duplicates (multiple changes per file)
+        path_to_changes: dict[str, list[ChangeAction]] = {}
+        for change in changes:
+            path_to_changes.setdefault(change.file, []).append(change)
+
+        result: list[ChangeAction] = []
+        seen: set[str] = set()
+        for path in ordered_paths:
+            if path not in seen and path in path_to_changes:
+                result.extend(path_to_changes[path])
+                seen.add(path)
+        # Append any changes for files not in the graph (new files, etc.)
+        for change in changes:
+            if change.file not in seen:
+                result.append(change)
+                seen.add(change.file)
+
+        if result != changes:
+            original = [c.file for c in changes]
+            reordered = [c.file for c in result]
+            logger.info(
+                "Modification order resequenced by dependency graph: %s → %s",
+                original, reordered,
+            )
+
+        return result
+
+    def _get_impact_meta(self, file_path: str) -> dict[str, Any]:
+        """Return impact analysis metadata for a file to embed in task.metadata."""
+        if self._dep_store is None:
+            return {}
+        impact = self._dep_store.get_impact_analysis(file_path)
+        return {
+            "impact_direct_dependents": impact.get("direct_dependents", []),
+            "impact_transitive_dependents": impact.get("transitive_dependents", []),
+            "impact_affected_tests": impact.get("test_files", []),
+        }
+
+    def _expand_test_targets(
+        self, plan_tests: list[str], changed_files: list[str]
+    ) -> set[str]:
+        """Merge plan test list with graph-derived impacted test files."""
+        targets: set[str] = set(plan_tests) | set(changed_files)
+
+        if self._dep_store is None:
+            return targets
+
+        for file_path in changed_files:
+            impact = self._dep_store.get_impact_analysis(file_path)
+            graph_tests = impact.get("test_files", [])
+            if graph_tests:
+                logger.debug(
+                    "Graph impact: %s affects tests %s", file_path, graph_tests
+                )
+            targets.update(graph_tests)
+
+        return targets
+
+    def _merge_conflicting_changes(
+        self, changes: list[ChangeAction]
+    ) -> list[ChangeAction]:
+        """Merge changes that target the same symbol in the same file.
+
+        Two changes with identical ``(file, class_name, function)`` keys are
+        collapsed into a single ``ChangeAction`` whose description combines
+        both intents.  The merged task is given to the agent once, so it can
+        apply all sub-changes in a single read-modify-write pass rather than
+        having the second pass overwrite (and potentially lose) the first's
+        edits.
+
+        Changes whose target key contains only blank fields — i.e. file-level
+        changes with no named symbol — are never merged because there is no
+        reliable way to determine whether they conflict.
+        """
+        # Preserve insertion order so the task graph stays deterministic.
+        seen: dict[tuple[str, str, str], list[ChangeAction]] = {}
+        for change in changes:
+            key = (change.file, change.class_name or "", change.function or "")
+            seen.setdefault(key, []).append(change)
+
+        merged: list[ChangeAction] = []
+        for (file, cls, fn), group in seen.items():
+            if len(group) == 1:
+                merged.append(group[0])
+                continue
+
+            # Blank-target changes (no class AND no function) stay separate —
+            # they likely touch different parts of the file.
+            if not cls and not fn:
+                merged.extend(group)
+                continue
+
+            # Merge: combine descriptions; union depends_on; keep first type.
+            combined_desc = "; ".join(
+                f"({i + 1}) {c.description}" for i, c in enumerate(group)
+            )
+            seen_deps: set[str] = set()
+            all_deps: list[str] = []
+            for c in group:
+                for d in c.depends_on:
+                    if d not in seen_deps:
+                        all_deps.append(d)
+                        seen_deps.add(d)
+
+            symbol = f"{cls}.{fn}" if fn else (cls or fn)
+            logger.info(
+                "Merging %d conflicting changes for '%s' in %s into one task",
+                len(group), symbol, file,
+            )
+            merged.append(ChangeAction(
+                type=group[0].type,
+                file=file,
+                description=combined_desc,
+                function=fn,
+                class_name=cls,
+                depends_on=all_deps,
+                details=group[0].details,
+            ))
+
+        return merged
+
+    def _detect_conflicts(self, changes: list[ChangeAction]) -> list[str]:
+        """Detect when multiple changes target the same function/class in the same file.
+
+        Returns a list of human-readable conflict descriptions.  Conflicts are
+        promoted to ``ChangePlan.risk_notes`` and logged as warnings so the
+        operator (or the approval gate) can decide whether to proceed.
+
+        Serialization: conflicting changes are left in their original order;
+        the dependency graph in ``build_from_change_plan`` will emit them as
+        sequential tasks by virtue of using ``file_task_map`` (each file slot
+        holds only the last task_id, so each subsequent task for the same file
+        implicitly depends on the previous one).
+        """
+        conflicts: list[str] = []
+        # file → list of (class_name, function) tuples already seen
+        file_targets: dict[str, list[tuple[str, str]]] = {}
+
+        for change in changes:
+            target = (change.class_name or "", change.function or "")
+            previous = file_targets.setdefault(change.file, [])
+
+            # A conflict is two changes targeting the *same named symbol*
+            # in the same file (ignoring blank/unnamed targets).
+            if any(t != ("", "") and t == target and target != ("", "") for t in previous):
+                qualifier = (
+                    f"{change.class_name}.{change.function}"
+                    if change.function
+                    else (change.class_name or change.function or "unnamed symbol")
+                )
+                conflicts.append(
+                    f"Multiple changes targeting '{qualifier}' in {change.file} — "
+                    "changes will be serialized but may produce merge conflicts"
+                )
+
+            previous.append(target)
+
+        return conflicts

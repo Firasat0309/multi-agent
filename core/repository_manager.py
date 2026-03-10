@@ -6,11 +6,19 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from core.language import LanguageProfile, detect_language_from_blueprint, PYTHON
+from core.import_validator import ImportValidator
 from core.models import FileIndex, RepositoryBlueprint, RepositoryIndex
+
+# Avoid circular imports: EmbeddingStore is imported lazily in write_file()
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from memory.embedding_store import EmbeddingStore
 
 logger = logging.getLogger(__name__)
 
@@ -32,12 +40,18 @@ _ROOT_LEVEL_FILES = {
 class RepositoryManager:
     """Manages the generated repository workspace."""
 
-    def __init__(self, workspace_dir: Path) -> None:
+    def __init__(
+        self,
+        workspace_dir: Path,
+        embedding_store: EmbeddingStore | None = None,
+    ) -> None:
         self.workspace = workspace_dir
         self.deploy_dir = workspace_dir / "deploy"
         self.docs_dir = workspace_dir / "docs"
         self._repo_index = RepositoryIndex()
         self._lang_profile: LanguageProfile = PYTHON
+        self._import_validator = ImportValidator()
+        self._embedding_store = embedding_store
 
     @property
     def src_dir(self) -> Path:
@@ -118,17 +132,60 @@ class RepositoryManager:
             return self.workspace / rel_path
         return root / rel_path
 
+    @staticmethod
+    def _write_atomic(file_path: Path, content: str) -> None:
+        """Write *content* to *file_path* atomically via a temp-file + rename.
+
+        Prevents half-written files from being seen by concurrent readers or
+        by agents that re-scan the workspace after a crash / KeyboardInterrupt.
+        On Windows, ``os.replace`` is used (atomic on NTFS for same-volume
+        moves) instead of ``Path.rename`` which can raise if the destination
+        already exists.
+        """
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=file_path.parent, prefix=".~", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            os.replace(tmp_path, file_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
     def write_file(self, rel_path: str, content: str) -> Path:
         """Write a file to the source root and update index (sync version)."""
         file_path = self._resolve_write_path(self.src_dir, rel_path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
+        self._write_atomic(file_path, content)
 
         # Ensure __init__.py exists in all parent packages (Python only)
         self._ensure_init_files(file_path)
 
         # Update repo index
         self._index_file(rel_path, content)
+
+        # Validate imports immediately after write — surface broken imports
+        # before they reach test time.  Non-blocking: warnings only.
+        known_files = {f.path for f in self._repo_index.files}
+        broken = self._import_validator.validate(
+            rel_path, content, known_files, self._lang_profile
+        )
+        if broken:
+            logger.warning(
+                "Broken imports detected in %s: %s", rel_path, broken
+            )
+
+        # Incremental embedding update — keeps vector index current as files
+        # are written rather than deferring everything to finalization.
+        if self._embedding_store is not None:
+            try:
+                self._embedding_store.index_file(rel_path, content)
+            except Exception as e:
+                logger.warning("Embedding index update failed for %s: %s", rel_path, e)
 
         logger.info(f"Wrote {rel_path} ({len(content)} bytes)")
         return file_path
@@ -145,8 +202,7 @@ class RepositoryManager:
     def write_test_file(self, rel_path: str, content: str) -> Path:
         """Write a test file to the test root."""
         file_path = self._resolve_write_path(self.test_dir, rel_path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
+        self._write_atomic(file_path, content)
         self._ensure_init_files(file_path)
         logger.info(f"Wrote test {rel_path}")
         return file_path
@@ -158,8 +214,7 @@ class RepositoryManager:
     def write_deploy_file(self, rel_path: str, content: str) -> Path:
         """Write a deployment file."""
         file_path = self.deploy_dir / rel_path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
+        self._write_atomic(file_path, content)
         logger.info(f"Wrote deploy artifact {rel_path}")
         return file_path
 
@@ -170,8 +225,7 @@ class RepositoryManager:
     def write_doc_file(self, rel_path: str, content: str) -> Path:
         """Write a documentation file."""
         file_path = self.docs_dir / rel_path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
+        self._write_atomic(file_path, content)
         logger.info(f"Wrote doc {rel_path}")
         return file_path
 
@@ -443,3 +497,87 @@ class RepositoryManager:
         for fb in blueprint.file_blueprints:
             graph[fb.path] = fb.depends_on
         return graph
+
+    # ── Existing-repo scanning ───────────────────────────────────────
+
+    def scan_existing_repo(self) -> RepositoryIndex:
+        """Scan an existing workspace and build the repo index from actual files.
+
+        Unlike ``initialize()`` which creates a workspace from a blueprint,
+        this reads whatever is already on disk — for modification workflows
+        where the repo already exists.
+        """
+        logger.info("Scanning existing repository at %s", self.workspace)
+
+        # Auto-detect language from file extensions in the workspace
+        ext_counts: dict[str, int] = {}
+        skip_dirs = {
+            ".git", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+            "target", "build", "dist", ".idea", ".vscode", ".gradle",
+            ".mypy_cache", ".pytest_cache",
+        }
+        for f in self.workspace.rglob("*"):
+            if f.is_file() and not any(p in skip_dirs for p in f.parts):
+                ext_counts[f.suffix.lower()] = ext_counts.get(f.suffix.lower(), 0) + 1
+
+        from core.language import detect_language_from_extensions
+        self._lang_profile = detect_language_from_extensions(ext_counts)
+        logger.info("Detected language: %s", self._lang_profile.display_name)
+
+        # Index all source files
+        file_count = 0
+        for ext in self._lang_profile.file_extensions:
+            for src_file in self.workspace.rglob(f"*{ext}"):
+                if not src_file.is_file():
+                    continue
+                if any(p in skip_dirs for p in src_file.parts):
+                    continue
+                try:
+                    content = src_file.read_text(encoding="utf-8")
+                    rel_path = str(src_file.relative_to(self.workspace)).replace("\\", "/")
+                    self._index_file(rel_path, content)
+                    file_count += 1
+                except Exception as e:
+                    logger.warning("Failed to index %s: %s", src_file, e)
+
+        logger.info("Indexed %d files into repo index", file_count)
+        return self._repo_index
+
+    def read_source_files(self, paths: list[str]) -> dict[str, str]:
+        """Read a specific, bounded set of source files by relative path.
+
+        Reads only the files listed in *paths* (workspace-relative), silently
+        skipping any that do not exist or cannot be decoded.  Use this instead
+        of the old ``read_all_source_files()`` to avoid bulk-loading the entire
+        repository into memory.
+        """
+        result: dict[str, str] = {}
+        for rel_path in paths:
+            content = self.read_file(rel_path)
+            if content is not None:
+                result[rel_path] = content
+        return result
+
+    def iter_source_files(self):
+        """Yield (rel_path, content) pairs for every source file in the workspace.
+
+        Streams files one at a time so the caller can stop early, apply a
+        budget cap, or process files without holding the full workspace in RAM.
+        Files inside common build/cache directories are skipped automatically.
+        """
+        skip_dirs = {
+            ".git", "node_modules", "__pycache__", ".venv", "venv",
+            "target", "build", "dist", ".idea", ".vscode",
+        }
+        for ext in self._lang_profile.file_extensions:
+            for src_file in self.workspace.rglob(f"*{ext}"):
+                if not src_file.is_file():
+                    continue
+                if any(p in src_file.parts for p in skip_dirs):
+                    continue
+                try:
+                    content = src_file.read_text(encoding="utf-8")
+                    rel_path = str(src_file.relative_to(self.workspace)).replace("\\", "/")
+                    yield rel_path, content
+                except Exception:
+                    pass

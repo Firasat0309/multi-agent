@@ -106,7 +106,15 @@ class TestTaskGraph:
 
 
 class TestTaskGraphBuilder:
-    def test_build_from_blueprint(self):
+    """TaskGraphBuilder no longer provides build_from_blueprint() — tests migrated to LifecyclePlanBuilder."""
+
+    def test_builder_instantiation(self):
+        """TaskGraphBuilder can still be instantiated (used internally by ModificationTaskGraphBuilder)."""
+        builder = TaskGraphBuilder()
+        assert builder is not None
+
+    def test_lifecycle_replaces_legacy_build_from_blueprint(self):
+        """LifecyclePlanBuilder.build() replaces the removed build_from_blueprint()."""
         blueprint = RepositoryBlueprint(
             name="test",
             description="test project",
@@ -128,16 +136,21 @@ class TestTaskGraphBuilder:
             ],
         )
 
-        builder = TaskGraphBuilder()
-        graph = builder.build_from_blueprint(blueprint)
+        builder = LifecyclePlanBuilder()
+        engine, global_graph = builder.build(blueprint)
 
-        # Should have: 3 generate + 3 review + 3 test + 1 security + 1 module review + 1 arch review + 1 deploy + 1 docs
-        assert len(graph.tasks) > 3
-        errors = graph.validate()
+        # Engine has all 3 files
+        assert engine.has_file("models/user.py")
+        assert engine.has_file("services/user_service.py")
+        assert engine.has_file("controllers/user_controller.py")
+
+        # Global graph is valid
+        assert len(global_graph.tasks) > 3
+        errors = global_graph.validate()
         assert len(errors) == 0
 
-        order = graph.get_execution_order()
-        assert len(order) == len(graph.tasks)
+        order = global_graph.get_execution_order()
+        assert len(order) == len(global_graph.tasks)
 
 
 class TestLifecyclePlanBuilder:

@@ -73,8 +73,18 @@ class ArchitectAgent(BaseAgent):
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
-        """Not used directly - use design_architecture instead."""
-        return TaskResult(success=False, errors=["Use design_architecture() method"])
+        """Design a repository architecture from context.task.description."""
+        prompt = context.task.metadata.get("user_prompt", context.task.description)
+        try:
+            blueprint = await self.design_architecture(prompt)
+            return TaskResult(
+                success=True,
+                output=f"Architecture designed: {blueprint.name} ({len(blueprint.file_blueprints)} files)",
+                metrics={**self.get_metrics(), "blueprint_name": blueprint.name},
+            )
+        except Exception as exc:
+            logger.exception("ArchitectAgent.execute failed")
+            return TaskResult(success=False, errors=[str(exc)])
 
     async def design_architecture(self, user_prompt: str) -> RepositoryBlueprint:
         """Design a complete repository blueprint from user requirements.
