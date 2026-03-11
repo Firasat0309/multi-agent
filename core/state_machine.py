@@ -406,7 +406,11 @@ class LifecycleEngine:
         """Return files ready for the next action.
 
         A file is actionable if:
-          - PENDING and all dependency files have passed GENERATING phase
+          - PENDING and all dependency files are ready:
+              * checkpoint mode: dep.phase in {TESTING, PASSED} — dep has
+                cleared its tier's build checkpoint and is stable to depend on.
+              * standard mode:   dep.phase not in {PENDING, GENERATING} —
+                dep has been generated (safe for interpreted languages).
           - In any active phase (GENERATING, REVIEWING, FIXING, TESTING)
 
         Terminal files (PASSED, FAILED) are never returned.
@@ -419,13 +423,28 @@ class LifecycleEngine:
 
             if lc.phase == FilePhase.PENDING:
                 deps = self._deps.get(path, [])
-                deps_met = all(
-                    dep not in self._lifecycles
-                    or self._lifecycles[dep].phase not in (
-                        FilePhase.PENDING, FilePhase.GENERATING,
+                if self._checkpoint_mode:
+                    # In checkpoint mode a dep is ready only once it has passed
+                    # its tier's build checkpoint (phase >= TESTING).  This
+                    # prevents a dependent from generating against a file that
+                    # is still mid-review/fix and may be substantially rewritten.
+                    deps_met = all(
+                        dep not in self._lifecycles
+                        or self._lifecycles[dep].phase in (
+                            FilePhase.TESTING, FilePhase.PASSED,
+                        )
+                        for dep in deps
                     )
-                    for dep in deps
-                )
+                else:
+                    # Interpreted languages: a dep is ready as soon as it has
+                    # left the GENERATING phase (existing behaviour).
+                    deps_met = all(
+                        dep not in self._lifecycles
+                        or self._lifecycles[dep].phase not in (
+                            FilePhase.PENDING, FilePhase.GENERATING,
+                        )
+                        for dep in deps
+                    )
                 if deps_met:
                     actionable.append((path, lc.phase))
             else:

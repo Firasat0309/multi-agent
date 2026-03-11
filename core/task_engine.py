@@ -786,10 +786,13 @@ class EnhanceLifecyclePlanBuilder:
                 },
             }
 
-        # New files → GENERATE_FILE lifecycle (default)
+        # New files → GENERATE_FILE lifecycle (default).
+        # Do NOT filter nf.depends_on here — the post-loop all_file_set filter
+        # below handles it correctly for all cases, including cross-new-file
+        # deps where B depends on A but B's iteration runs before A's append.
         for nf in change_plan.new_files:
             file_paths.append(nf.path)
-            file_deps[nf.path] = [d for d in nf.depends_on if d in set(file_paths)]
+            file_deps[nf.path] = list(nf.depends_on)
 
         # ── Filter deps to only internal files ───────────────────────
         all_file_set = set(file_paths)

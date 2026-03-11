@@ -1,0 +1,367 @@
+"""End-to-end tests for PipelineExecutor tier-blocking and dep-readiness.
+
+Covers the four safety properties introduced in the tiered architecture:
+
+1. A Tier 0 checkpoint failure blocks Tier 1 from ever starting.
+2. Downstream tier files are explicitly marked FAILED (not silently PASSED).
+3. In checkpoint_mode, a dep must reach TESTING/PASSED before dependents
+   become actionable (not merely post-GENERATING).
+4. In non-checkpoint mode (interpreted languages), dep past GENERATING
+   is sufficient — existing behaviour is preserved.
+5. A passing Tier 0 checkpoint allows Tier 1 to proceed (control case).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from core.checkpoint import CheckpointCycleResult
+from core.models import Task, TaskType
+from core.pipeline_definition import GENERATE_PIPELINE
+from core.pipeline_executor import PipelineExecutor
+from core.state_machine import EventType, FilePhase, LifecycleEngine
+from core.task_engine import TaskGraph
+from core.tier_scheduler import Tier
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _make_engine(compiled: bool = True) -> LifecycleEngine:
+    """Two-file engine: Model.java (Tier 0) → Service.java (Tier 1)."""
+    return LifecycleEngine(
+        file_paths=["Model.java", "Service.java"],
+        file_deps={"Model.java": [], "Service.java": ["Model.java"]},
+        compiled=compiled,
+        checkpoint_mode=compiled,
+    )
+
+
+def _two_tiers() -> list[Tier]:
+    return [
+        Tier(index=0, files=["Model.java"]),
+        Tier(index=1, files=["Service.java"]),
+    ]
+
+
+def _make_global_graph() -> TaskGraph:
+    graph = TaskGraph()
+    sentinel = Task(
+        task_id=1,
+        task_type=TaskType.REVIEW_FILE,
+        file="*",
+        description="sentinel",
+        dependencies=[],
+        metadata={"sentinel": True},
+    )
+    graph.add_task(sentinel)
+    return graph
+
+
+def _make_executor(compiled: bool = True) -> PipelineExecutor:
+    """Minimal PipelineExecutor with mocked I/O dependencies."""
+    lang = MagicMock()
+    lang.name = "java"
+    lang.build_command = "mvn compile" if compiled else ""
+    lang.test_command = None  # skip repo-level test checkpoint in all tests
+
+    settings = MagicMock()
+    settings.max_concurrent_agents = 4
+    settings.phase_timeout_seconds = 60
+
+    am = MagicMock()
+    am.repo = MagicMock()
+    am.repo.workspace = Path("/tmp/workspace")
+    am.blueprint = MagicMock()
+    am.blueprint.file_blueprints = []
+    am._dep_store = None
+    am._embedding_store = None
+    am._metrics = {"tasks_completed": 0, "tasks_failed": 0, "agent_metrics": {}}
+    am.execute_graph = AsyncMock()
+
+    executor = PipelineExecutor(
+        agent_manager=am,
+        settings=settings,
+        lang_profile=lang,
+    )
+    return executor
+
+
+async def _advance_through_review(engine: LifecycleEngine, tier: Tier) -> None:
+    """Synthetic lifecycle: advance every file in the tier to BUILDING."""
+    for path in tier.files:
+        lc = engine.get_lifecycle(path)
+        if lc.phase == FilePhase.PENDING:
+            engine.process_event(path, EventType.DEPS_MET)
+        if lc.phase == FilePhase.GENERATING:
+            engine.process_event(path, EventType.CODE_GENERATED)
+        if lc.phase == FilePhase.REVIEWING:
+            engine.process_event(path, EventType.REVIEW_PASSED)
+        # File is now in BUILDING; the checkpoint will resolve it.
+
+
+# ── Shared fixture: stub generator must not touch the filesystem ──────────
+
+
+@pytest.fixture(autouse=True)
+def _mock_stub_generator():
+    """Prevent StubGenerator from touching the filesystem in any test."""
+    mock_instance = MagicMock()
+    mock_instance.generate_stubs.return_value = []
+    mock_instance.cleanup_stubs.return_value = None
+    with patch("core.pipeline_executor.StubGenerator", return_value=mock_instance):
+        yield
+
+
+# ── Tier-blocking tests ────────────────────────────────────────────────────
+
+
+class TestTierBlockingOnCheckpointFailure:
+
+    @pytest.mark.anyio
+    async def test_tier0_failure_blocks_tier1_from_starting(self) -> None:
+        """Core safety property: a permanently-failed Tier 0 checkpoint
+        must prevent Tier 1 files from ever entering the lifecycle."""
+        engine = _make_engine(compiled=True)
+        tiers = _two_tiers()
+        global_graph = _make_global_graph()
+        executor = _make_executor(compiled=True)
+
+        async def fail_checkpoint(eng: LifecycleEngine, ck_def, tier: Tier) -> CheckpointCycleResult:
+            # Behaves like _run_checkpoint after retries exhausted:
+            # mark BUILDING files as FAILED.
+            for path in tier.files:
+                lc = eng.get_lifecycle(path)
+                if lc.phase == FilePhase.BUILDING:
+                    eng.process_event(path, EventType.RETRIES_EXHAUSTED)
+            return CheckpointCycleResult(passed=False, total_attempts=4, files_fixed=[])
+
+        executor._run_tier_lifecycles = _advance_through_review
+        executor._run_checkpoint = fail_checkpoint
+
+        result = await executor.execute(engine, global_graph, pipeline_def=GENERATE_PIPELINE, tiers=tiers)
+
+        # Tier 0 file must be FAILED.
+        assert engine.get_lifecycle("Model.java").phase == FilePhase.FAILED, (
+            "Model.java should be FAILED after permanent checkpoint failure"
+        )
+
+        # Tier 1 file must never have started — blocked by execute() gate.
+        tier1_phase = engine.get_lifecycle("Service.java").phase
+        assert tier1_phase == FilePhase.FAILED, (
+            f"Service.java should be FAILED (blocked by Tier 0 gate) "
+            f"but phase is {tier1_phase.value!r}"
+        )
+
+        # Overall stats must reflect failures.
+        stats = result["stats"]
+        assert stats.get("lifecycle_failed", 0) > 0
+        assert stats.get("lifecycle_passed", 0) == 0
+
+    @pytest.mark.anyio
+    async def test_tier0_failure_checkpoint_results_show_not_passed(self) -> None:
+        """The checkpoint_results entry for the failed tier must record passed=False."""
+        engine = _make_engine(compiled=True)
+        tiers = _two_tiers()
+        executor = _make_executor(compiled=True)
+
+        async def fail_checkpoint(eng, ck_def, tier):
+            for path in tier.files:
+                lc = eng.get_lifecycle(path)
+                if lc.phase == FilePhase.BUILDING:
+                    eng.process_event(path, EventType.RETRIES_EXHAUSTED)
+            return CheckpointCycleResult(passed=False, total_attempts=4, files_fixed=[])
+
+        executor._run_tier_lifecycles = _advance_through_review
+        executor._run_checkpoint = fail_checkpoint
+
+        result = await executor.execute(engine, _make_global_graph(), pipeline_def=GENERATE_PIPELINE, tiers=tiers)
+
+        assert result["checkpoint_results"], "Expected at least one checkpoint result"
+        # Only the Tier 0 checkpoint should have run (Tier 1 was blocked).
+        assert len(result["checkpoint_results"]) == 1
+        assert result["checkpoint_results"][0]["passed"] is False
+
+    @pytest.mark.anyio
+    async def test_tier0_success_allows_tier1_to_start(self) -> None:
+        """Control: a passing Tier 0 checkpoint must not block Tier 1."""
+        engine = _make_engine(compiled=True)
+        tiers = _two_tiers()
+        executor = _make_executor(compiled=True)
+
+        async def pass_checkpoint(eng: LifecycleEngine, ck_def, tier: Tier) -> CheckpointCycleResult:
+            for path in tier.files:
+                lc = eng.get_lifecycle(path)
+                if lc.phase == FilePhase.BUILDING:
+                    eng.process_event(path, EventType.BUILD_PASSED)
+            return CheckpointCycleResult(passed=True, total_attempts=1, files_fixed=[])
+
+        executor._run_tier_lifecycles = _advance_through_review
+        executor._run_checkpoint = pass_checkpoint
+        executor._run_test_phase = AsyncMock()
+
+        await executor.execute(engine, _make_global_graph(), pipeline_def=GENERATE_PIPELINE, tiers=tiers)
+
+        # Model.java should have progressed past BUILDING.
+        model_phase = engine.get_lifecycle("Model.java").phase
+        assert model_phase not in (FilePhase.BUILDING, FilePhase.PENDING, FilePhase.FAILED), (
+            f"Model.java stuck in {model_phase.value!r} after passing checkpoint"
+        )
+        # Service.java must have started (at minimum moved past PENDING).
+        service_phase = engine.get_lifecycle("Service.java").phase
+        assert service_phase != FilePhase.PENDING, (
+            "Service.java never started — Tier 1 was incorrectly blocked despite Tier 0 passing"
+        )
+
+
+# ── Dependency readiness tests ─────────────────────────────────────────────
+
+
+class TestDependencyReadiness:
+
+    def test_checkpoint_mode_blocks_dep_in_reviewing(self) -> None:
+        """In checkpoint_mode, a dep in REVIEWING must NOT unblock dependents."""
+        engine = LifecycleEngine(
+            file_paths=["A.java", "B.java"],
+            file_deps={"A.java": [], "B.java": ["A.java"]},
+            compiled=True,
+            checkpoint_mode=True,
+        )
+
+        # Advance A.java to REVIEWING (post-GENERATING, pre-BUILDING).
+        engine.process_event("A.java", EventType.DEPS_MET)
+        engine.process_event("A.java", EventType.CODE_GENERATED)
+        assert engine.get_lifecycle("A.java").phase == FilePhase.REVIEWING
+
+        actionable_paths = {p for p, _ in engine.get_actionable_files()}
+        assert "B.java" not in actionable_paths, (
+            "B.java should NOT be actionable when A.java is only at REVIEWING "
+            "(checkpoint_mode requires dep.phase in {TESTING, PASSED})"
+        )
+
+    def test_checkpoint_mode_unblocks_dep_after_build_passed(self) -> None:
+        """In checkpoint_mode, a dep in TESTING (post BUILD_PASSED) must unblock dependents."""
+        engine = LifecycleEngine(
+            file_paths=["A.java", "B.java"],
+            file_deps={"A.java": [], "B.java": ["A.java"]},
+            compiled=True,
+            checkpoint_mode=True,
+        )
+
+        # Advance A.java all the way to TESTING.
+        engine.process_event("A.java", EventType.DEPS_MET)
+        engine.process_event("A.java", EventType.CODE_GENERATED)
+        engine.process_event("A.java", EventType.REVIEW_PASSED)
+        # In checkpoint_mode, BUILDING is not auto-passed; simulate checkpoint success.
+        engine.get_lifecycle("A.java").phase  # should be BUILDING
+        engine.process_event("A.java", EventType.BUILD_PASSED)
+        assert engine.get_lifecycle("A.java").phase == FilePhase.TESTING
+
+        actionable_paths = {p for p, _ in engine.get_actionable_files()}
+        assert "B.java" in actionable_paths, (
+            "B.java should be actionable once A.java has reached TESTING "
+            "(checkpoint_mode: dep.phase in {TESTING, PASSED} is sufficient)"
+        )
+
+    def test_standard_mode_unblocks_dep_after_generating(self) -> None:
+        """Without checkpoint_mode (interpreted), post-GENERATING is sufficient."""
+        engine = LifecycleEngine(
+            file_paths=["a.py", "b.py"],
+            file_deps={"a.py": [], "b.py": ["a.py"]},
+            compiled=False,
+            checkpoint_mode=False,
+        )
+
+        # Advance a.py to REVIEWING (left GENERATING).
+        engine.process_event("a.py", EventType.DEPS_MET)
+        engine.process_event("a.py", EventType.CODE_GENERATED)
+        # For interpreted languages BUILD_PASSED is auto-emitted, so a.py may
+        # now be in REVIEWING or further.
+        assert engine.get_lifecycle("a.py").phase not in (
+            FilePhase.PENDING, FilePhase.GENERATING,
+        )
+
+        actionable_paths = {p for p, _ in engine.get_actionable_files()}
+        assert "b.py" in actionable_paths, (
+            "b.py should be actionable once a.py has left GENERATING "
+            "(interpreted mode: post-GENERATING is sufficient)"
+        )
+
+    def test_failed_dep_does_not_unblock_in_checkpoint_mode(self) -> None:
+        """A FAILED dep (e.g. after build exhaustion) must not unblock dependents."""
+        engine = LifecycleEngine(
+            file_paths=["A.java", "B.java"],
+            file_deps={"A.java": [], "B.java": ["A.java"]},
+            compiled=True,
+            checkpoint_mode=True,
+        )
+
+        engine.process_event("A.java", EventType.DEPS_MET)
+        engine.process_event("A.java", EventType.RETRIES_EXHAUSTED)
+        assert engine.get_lifecycle("A.java").phase == FilePhase.FAILED
+
+        actionable_paths = {p for p, _ in engine.get_actionable_files()}
+        assert "B.java" not in actionable_paths, (
+            "B.java must NOT be actionable when its dep A.java is FAILED"
+        )
+
+
+# ── Skip_for_interpreted tests ─────────────────────────────────────────────
+
+
+class TestPhaseSkipForInterpreted:
+
+    @pytest.mark.anyio
+    async def test_skip_for_interpreted_phase_not_run(self) -> None:
+        """A phase with skip_for_interpreted=True must not execute for non-compiled langs."""
+        from core.pipeline_definition import (
+            CheckpointDef,
+            FileTaskDef,
+            Phase,
+            PipelineDefinition,
+        )
+
+        pipeline = PipelineDefinition(
+            name="test",
+            phases=[
+                Phase(
+                    name="compiled_only",
+                    file_tasks=[FileTaskDef(task_type=TaskType.GENERATE_FILE)],
+                    checkpoint=CheckpointDef(name="build", max_retries=1),
+                    skip_for_interpreted=True,
+                ),
+                Phase(
+                    name="testing",
+                    file_tasks=[FileTaskDef(task_type=TaskType.GENERATE_TEST)],
+                ),
+            ],
+        )
+
+        engine = LifecycleEngine(
+            file_paths=["script.py"],
+            file_deps={"script.py": []},
+            compiled=False,
+            checkpoint_mode=False,
+        )
+
+        executor = _make_executor(compiled=False)
+        checkpoint_called = False
+
+        async def should_not_checkpoint(*_args, **_kwargs):
+            nonlocal checkpoint_called
+            checkpoint_called = True
+            return CheckpointCycleResult(passed=True, total_attempts=1, files_fixed=[])
+
+        executor._run_checkpoint = should_not_checkpoint
+        executor._run_tier_lifecycles = AsyncMock()
+        executor._run_test_phase = AsyncMock()
+
+        await executor.execute(engine, _make_global_graph(), pipeline_def=pipeline)
+
+        assert not checkpoint_called, (
+            "_run_checkpoint should never be called for an interpreted language "
+            "when skip_for_interpreted=True"
+        )

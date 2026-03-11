@@ -140,19 +140,36 @@ class PipelineExecutor:
         pipeline_def: PipelineDefinition | None = None,
         tiers: list[Tier] | None = None,
     ) -> dict[str, Any]:
-        """Execute the full pipeline: tiers → checkpoints → tests → global.
+        """Execute the full pipeline — phases are driven by ``pipeline_def``.
 
-        This replaces ``AgentManager.execute_with_lifecycle()``.
+        Each ``Phase`` in the definition is dispatched based on the
+        ``task_type`` of its first ``FileTaskDef``:
+
+          - ``GENERATE_FILE`` / ``MODIFY_FILE`` → tiered generation with an
+            optional per-tier build checkpoint (``phase.checkpoint``).
+          - ``GENERATE_TEST`` → flat test generation followed by an optional
+            repo-level test checkpoint.
+
+        ``Phase.skip_for_interpreted`` causes a phase to be skipped when the
+        language has no build step (Python, Ruby, etc.).
+
+        If ``pipeline_def`` is ``None`` or has no phases, a default two-phase
+        structure (generation + test) is synthesised so execution is always
+        driven by a uniform phase list.
 
         Args:
             engine: The lifecycle engine managing per-file state machines.
             global_graph: The global task DAG (security, deploy, docs).
-            pipeline_def: Optional pipeline definition for checkpoint config.
-            tiers: Pre-computed tiers.  If None, all files run as a single tier.
+            pipeline_def: Pipeline definition controlling phase order,
+                checkpoint config, and skip semantics for each phase.
+            tiers: Pre-computed dependency tiers.  If None, all files run as
+                   a single tier (backward-compatible behavior).
 
         Returns:
             Execution result dict compatible with the existing pipeline format.
         """
+        from core.pipeline_definition import Phase as _Phase, FileTaskDef as _FileTaskDef
+
         start_time = time.monotonic()
 
         # Wire up event bus subscribers for cross-file coordination.
@@ -167,94 +184,148 @@ class PipelineExecutor:
             ]
             tiers = [Tier(index=0, files=sorted(all_files))]
 
-        # Determine checkpoint config
-        checkpoint_def = None
-        if pipeline_def:
-            for phase in pipeline_def.phases:
-                if phase.checkpoint:
-                    checkpoint_def = phase.checkpoint
-                    break
-
-        # ── Phase 1: Tier-based generation with checkpoints ──────────
         total_checkpoint_fixes = 0
         checkpoint_results: list[CheckpointCycleResult] = []
 
         # Stub generator for forward references (compiled languages only).
-        # Before a tier's checkpoint, stubs are created for later-tier files
-        # so the compiler can resolve forward references.
         stub_gen = StubGenerator(self._lang.name, self._am.repo.workspace)
         active_stubs: list[str] = []
 
-        # Build blueprint map for richer stubs
+        # Build blueprint map for richer stubs.
         bp_map: dict[str, object] = {}
         for fb in self._am.blueprint.file_blueprints:
             bp_map[fb.path] = fb
 
-        for tier_idx, tier in enumerate(tiers):
-            logger.info(
-                "=== Tier %d: %d files ===", tier.index, len(tier),
-            )
-
-            # Clean up any stubs from the previous tier that are now being
-            # generated for real.
-            stubs_to_remove = [s for s in active_stubs if s in set(tier.files)]
-            if stubs_to_remove:
-                stub_gen.cleanup_stubs(stubs_to_remove)
-                active_stubs = [s for s in active_stubs if s not in set(stubs_to_remove)]
-
-            # Run per-file lifecycles for this tier (Generate → Review → Fix)
-            # Files in this tier go through the lifecycle but WITHOUT the
-            # per-file BUILDING phase — that's handled by the checkpoint.
-            await self._run_tier_lifecycles(engine, tier)
-
-            # Check if any files in this tier failed
-            tier_failed = [
-                f for f in tier.files
-                if engine.get_lifecycle(f).phase == FilePhase.FAILED
+        # ── Resolve phases ──────────────────────────────────────────────────
+        # Use the phases from pipeline_def when available; otherwise synthesise
+        # a default two-phase structure so the loop below is always uniform.
+        phases = pipeline_def.phases if (pipeline_def and pipeline_def.phases) else []
+        if not phases:
+            first_ck = None
+            if pipeline_def:
+                first_ck = next(
+                    (ph.checkpoint for ph in pipeline_def.phases if ph.checkpoint),
+                    None,
+                )
+            phases = [
+                _Phase(
+                    name="code_generation",
+                    file_tasks=[_FileTaskDef(task_type=TaskType.GENERATE_FILE)],
+                    checkpoint=first_ck,
+                ),
+                _Phase(
+                    name="testing",
+                    file_tasks=[_FileTaskDef(task_type=TaskType.GENERATE_TEST)],
+                ),
             ]
-            if tier_failed:
-                logger.warning(
-                    "Tier %d: %d files failed lifecycle: %s",
-                    tier.index, len(tier_failed), tier_failed,
+
+        # Task types that identify a generation phase (processed tier-by-tier).
+        _GEN_TYPES = {TaskType.GENERATE_FILE, TaskType.MODIFY_FILE}
+
+        # ── Phase loop ──────────────────────────────────────────────────────
+        tier_hard_blocked = False
+
+        for phase in phases:
+            if tier_hard_blocked:
+                logger.error(
+                    "=== Phase '%s' skipped — upstream tier checkpoint failed ===",
+                    phase.name,
                 )
+                continue
 
-            # Run build checkpoint after this tier (compiled languages only)
-            if self._compiled and checkpoint_def:
-                # Generate stubs for files in later tiers so the compiler
-                # can resolve forward references during this checkpoint.
-                later_files = []
-                for future_tier in tiers[tier_idx + 1:]:
-                    later_files.extend(future_tier.files)
-                if later_files:
-                    new_stubs = stub_gen.generate_stubs(later_files, bp_map)
-                    active_stubs.extend(new_stubs)
-
-                cycle_result = await self._run_checkpoint(
-                    engine, checkpoint_def, tier,
+            if phase.skip_for_interpreted and not self._compiled:
+                logger.info(
+                    "=== Phase '%s' skipped (interpreted language) ===", phase.name,
                 )
-                checkpoint_results.append(cycle_result)
-                total_checkpoint_fixes += len(cycle_result.files_fixed)
+                continue
 
-                # Clean up stubs after checkpoint — the real files will be
-                # generated in subsequent tiers.
-                if active_stubs:
-                    stub_gen.cleanup_stubs(active_stubs)
-                    active_stubs = []
+            first_tt = phase.file_tasks[0].task_type if phase.file_tasks else None
+            # Checkpoints are only meaningful for compiled languages.
+            ck_def = phase.checkpoint if self._compiled else None
 
-        # ── Phase 2: Test generation ─────────────────────────────────
-        logger.info("=== Test Generation Phase ===")
-        await self._run_test_phase(engine)
+            if first_tt in _GEN_TYPES or first_tt is None:
+                # ── Tier-based generation + per-tier checkpoints ──────────────
+                logger.info("=== Phase: %s ===", phase.name)
 
-        # ── Phase 2b: Repo-level test verification ───────────────────
-        # After per-file tests are generated, run the full test suite
-        # (e.g., `mvn test`, `go test ./...`) to catch integration issues.
-        if self._lang.test_command:
-            test_checkpoint_result = await self._run_test_checkpoint()
-            if test_checkpoint_result:
-                checkpoint_results.append(test_checkpoint_result)
-                total_checkpoint_fixes += len(test_checkpoint_result.files_fixed)
+                for tier_idx, tier in enumerate(tiers):
+                    logger.info(
+                        "=== Tier %d: %d files ===", tier.index, len(tier),
+                    )
 
-        # ── Phase 3: Global DAG ──────────────────────────────────────
+                    # Drop stubs for files about to be generated for real.
+                    stubs_to_remove = [s for s in active_stubs if s in set(tier.files)]
+                    if stubs_to_remove:
+                        stub_gen.cleanup_stubs(stubs_to_remove)
+                        active_stubs = [
+                            s for s in active_stubs if s not in stubs_to_remove
+                        ]
+
+                    # Run per-file lifecycles (Generate/Modify → Review → Fix).
+                    await self._run_tier_lifecycles(engine, tier)
+
+                    tier_failed = [
+                        f for f in tier.files
+                        if engine.get_lifecycle(f).phase == FilePhase.FAILED
+                    ]
+                    if tier_failed:
+                        logger.warning(
+                            "Tier %d: %d files failed lifecycle: %s",
+                            tier.index, len(tier_failed), tier_failed,
+                        )
+
+                    if ck_def:
+                        # Forward-reference stubs for later-tier files so this
+                        # tier's checkpoint can resolve their types.
+                        later_files = [
+                            p for ft in tiers[tier_idx + 1:] for p in ft.files
+                        ]
+                        if later_files:
+                            new_stubs = stub_gen.generate_stubs(later_files, bp_map)
+                            active_stubs.extend(new_stubs)
+
+                        cycle_result = await self._run_checkpoint(
+                            engine, ck_def, tier,
+                        )
+                        checkpoint_results.append(cycle_result)
+                        total_checkpoint_fixes += len(cycle_result.files_fixed)
+
+                        # ── Hard gate: failed checkpoint blocks downstream tiers ─
+                        if not cycle_result.passed:
+                            logger.error(
+                                "Tier %d checkpoint failed permanently — "
+                                "blocking %d downstream tier(s) from starting",
+                                tier.index, len(tiers) - tier_idx - 1,
+                            )
+                            for blocked_tier in tiers[tier_idx + 1:]:
+                                for path in blocked_tier.files:
+                                    lc = engine.get_lifecycle(path)
+                                    if not lc.is_terminal:
+                                        engine.process_event(
+                                            path, EventType.RETRIES_EXHAUSTED,
+                                        )
+                            if active_stubs:
+                                stub_gen.cleanup_stubs(active_stubs)
+                                active_stubs = []
+                            tier_hard_blocked = True
+                            break
+
+                        # Clean up stubs after a passed checkpoint.
+                        if active_stubs:
+                            stub_gen.cleanup_stubs(active_stubs)
+                            active_stubs = []
+
+            else:
+                # ── Test generation phase ─────────────────────────────────────
+                logger.info("=== Phase: %s ===", phase.name)
+                await self._run_test_phase(engine)
+
+                if ck_def and self._lang.test_command:
+                    test_ck = await self._run_test_checkpoint(ck_def.max_retries)
+                    if test_ck:
+                        checkpoint_results.append(test_ck)
+                        total_checkpoint_fixes += len(test_ck.files_fixed)
+
+        # ── Global DAG ──────────────────────────────────────────────────────
         logger.info("=== Global Tasks Phase ===")
         sentinel = next(
             (t for t in global_graph.tasks.values() if t.metadata.get("sentinel")),
@@ -264,7 +335,7 @@ class PipelineExecutor:
             global_graph.mark_completed(sentinel.task_id)
         await self._am.execute_graph(global_graph)
 
-        # ── Results ──────────────────────────────────────────────────
+        # ── Results ─────────────────────────────────────────────────────────
         elapsed = time.monotonic() - start_time
 
         lifecycle_summary = engine.get_results_summary()
@@ -514,17 +585,18 @@ class PipelineExecutor:
                     },
                 ))
 
-        # All retries exhausted — proceed anyway (degraded)
-        logger.warning(
-            "[Checkpoint] Build checkpoint exhausted %d retries — proceeding with errors",
+        # All retries exhausted — mark unresolved BUILDING files as FAILED.
+        # Returning passed=False signals execute() to block all downstream tiers.
+        logger.error(
+            "[Checkpoint] Build checkpoint exhausted %d retries — "
+            "marking unresolved BUILDING file(s) as FAILED",
             checkpoint_def.max_retries,
         )
 
-        # Force-transition remaining BUILDING files to TESTING
         for path in tier.files:
             lc = engine.get_lifecycle(path)
             if lc.phase == FilePhase.BUILDING:
-                engine.process_event(path, EventType.BUILD_PASSED)
+                engine.process_event(path, EventType.RETRIES_EXHAUSTED)
 
         return CheckpointCycleResult(
             passed=False,
