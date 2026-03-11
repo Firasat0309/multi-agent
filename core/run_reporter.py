@@ -30,6 +30,8 @@ class RunReporter:
         stats: dict[str, int],
         elapsed: float,
         success: bool,
+        code_success: bool = True,
+        tests_passed: bool = True,
         token_cost: Any | None = None,
     ) -> Path:
         """Write workspace/run_report.json and return the path."""
@@ -38,6 +40,10 @@ class RunReporter:
         report: dict[str, Any] = {
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "success": success,
+            # Granular quality signals — lets callers distinguish between
+            # "code generation failed" and "tests didn't fully pass".
+            "code_success": code_success,
+            "tests_passed": tests_passed,
             "elapsed_seconds": round(elapsed, 2),
             "prompt": prompt,
             "project": blueprint.name if blueprint else "",

@@ -408,11 +408,21 @@ class LifecycleEngine:
         passed = [p for p, lc in self._lifecycles.items() if lc.phase == FilePhase.PASSED]
         failed = [p for p, lc in self._lifecycles.items() if lc.phase == FilePhase.FAILED]
         total_fixes = sum(lc.total_fix_count for lc in self._lifecycles.values())
+        # Files whose code generated/compiled fine but whose tests never fully
+        # passed (test-fix limit exhausted).  These reach PASSED phase but with
+        # test_fix_count > 0, indicating the code is valid but tests are
+        # incomplete or need attention.
+        tests_degraded = [
+            p for p, lc in self._lifecycles.items()
+            if lc.phase == FilePhase.PASSED and lc.test_fix_count > 0
+        ]
         return {
             "total_files": len(self._lifecycles),
             "passed": len(passed),
             "failed": len(failed),
+            "tests_degraded": len(tests_degraded),
             "total_fix_cycles": total_fixes,
             "passed_files": passed,
             "failed_files": failed,
+            "tests_degraded_files": tests_degraded,
         }

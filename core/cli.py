@@ -64,7 +64,7 @@ def generate(
     """Generate a backend project from a natural language prompt."""
     try:
         settings = Settings(
-            workspace_dir=Path(workspace),
+            workspace_dir=Path(workspace).resolve(),
             llm=LLMConfig(
                 provider=LLMProvider(provider),
                 model=model,
@@ -167,7 +167,7 @@ def enhance(
     Example:
         python -m core.cli enhance "Add password reset feature" -w ./my-project
     """
-    ws = Path(workspace)
+    ws = Path(workspace).resolve()
     if not ws.exists():
         console.print(f"[red]Workspace not found: {workspace}[/red]")
         sys.exit(1)

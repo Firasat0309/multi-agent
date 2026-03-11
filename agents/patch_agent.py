@@ -139,4 +139,4 @@ class PatchAgent(BaseAgent):
         """Fall back to CoderAgent full-file rewrite when patching fails."""
         from agents.coder_agent import CoderAgent
         coder = CoderAgent(llm_client=self.llm, repo_manager=self.repo)
-        return await coder._modify_file(context)  # type: ignore[return-value]
+        return await coder.modify_file(context)

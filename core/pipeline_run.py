@@ -108,7 +108,15 @@ class RunPipeline:
 
         planner = PlannerAgent(llm_client=self._llm, repo_manager=repo_manager)
         try:
-            lifecycle_engine, global_graph = await planner.create_lifecycle_plan(blueprint)
+            # Compiled languages (Java, Go, Rust, C#, TypeScript) need more review-fix
+            # cycles because initial code generation is more likely to contain syntax
+            # errors that require multiple LLM passes to fully resolve.
+            is_compiled = bool(lang_profile.build_command)
+            review_fixes = 4 if is_compiled else 3
+            lifecycle_engine, global_graph = await planner.create_lifecycle_plan(
+                blueprint,
+                max_review_fixes=review_fixes,
+            )
         except (LLMConfigError, Exception) as e:
             is_config = isinstance(e, LLMConfigError)
             if not is_config:
@@ -202,15 +210,26 @@ class RunPipeline:
 
         elapsed = time.monotonic() - start_time
         stats = exec_result.get("stats", {})
-        success = (
+
+        # Code success: all files generated, reviewed, and built correctly.
+        # Test failures (tests_degraded) are a quality signal, not a hard gate —
+        # the generated code itself is valid even when generated tests don't all pass.
+        code_success = (
             stats.get("failed", 0) == 0
             and stats.get("blocked", 0) == 0
             and stats.get("lifecycle_failed", 0) == 0
         )
+        tests_passed = stats.get("lifecycle_tests_degraded", 0) == 0
+        # Overall success requires code to generate correctly; test quality is
+        # reported separately so a run with working code is never masked as
+        # a total failure just because generated tests are imperfect.
+        success = code_success
+
         self._complete_phase("Finalize")
         logger.info(
-            "Pipeline %s | stats=%s | elapsed=%.1fs",
-            "SUCCEEDED" if success else "COMPLETED WITH ISSUES", stats, elapsed,
+            "Pipeline %s | code_success=%s tests_passed=%s | stats=%s | elapsed=%.1fs",
+            "SUCCEEDED" if success else "COMPLETED WITH ISSUES",
+            code_success, tests_passed, stats, elapsed,
         )
 
         token_cost = self._build_token_cost()
@@ -221,6 +240,8 @@ class RunPipeline:
             stats=stats,
             elapsed=elapsed,
             success=success,
+            code_success=code_success,
+            tests_passed=tests_passed,
             token_cost=token_cost,
         )
 

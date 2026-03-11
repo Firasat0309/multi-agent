@@ -347,8 +347,19 @@ class ModificationTaskGraphBuilder:
         # ── Pre-flight: cycle detection & safe ordering ────────────────
         ordered_changes = self._order_changes(resolved_changes)
 
+        # Files that are brand-new (in new_files) must be created by a
+        # GENERATE_FILE task (Phase 1b), not a MODIFY_FILE task — the file
+        # doesn't exist yet and PatchAgent cannot patch a non-existent file.
+        # Routing them through MODIFY_FILE also causes a duplicate task when
+        # the same path appears in both change_plan.changes and new_files.
+        new_file_paths = {nf.path for nf in change_plan.new_files}
+
         # ── Phase 1: Modification tasks (graph-safe order) ────────────
         for change in ordered_changes:
+            # Skip files that are truly new — handled by GENERATE_FILE below.
+            if change.file in new_file_paths:
+                continue
+
             deps = [
                 file_task_map[d]
                 for d in change.depends_on
@@ -532,11 +543,43 @@ class ModificationTaskGraphBuilder:
             "impact_affected_tests": impact.get("test_files", []),
         }
 
+    @staticmethod
+    def _is_test_file(path: str) -> bool:
+        """Heuristic: return True if path looks like an existing test file.
+
+        Test files should NOT be passed to TestAgent as source targets because
+        TestAgent will compute a 'test for the test file' path (e.g.
+        test_test_foo.py) and fail with 'No blueprint' for the test file.
+        """
+        stem = path.replace("\\", "/").split("/")[-1].lower()
+        return (
+            stem.startswith("test_")
+            or stem.endswith("_test.py")
+            or stem.endswith(".test.ts")
+            or stem.endswith("_test.go")
+            or stem.endswith("_test.rs")
+            or stem.endswith("tests.cs")
+            or stem.endswith("test.java")
+            or "/test/" in path.lower()
+            or "/tests/" in path.lower()
+        )
+
     def _expand_test_targets(
         self, plan_tests: list[str], changed_files: list[str]
     ) -> set[str]:
-        """Merge plan test list with graph-derived impacted test files."""
-        targets: set[str] = set(plan_tests) | set(changed_files)
+        """Merge plan test list with graph-derived impacted test files.
+
+        ``plan_tests`` (``change_plan.affected_tests``) are test-file paths.
+        Adding them directly would cause TestAgent to generate a 'test for a
+        test file', which always fails with 'No blueprint'.  They are filtered
+        out here; the corresponding source files are already in
+        ``changed_files`` so their tests will be regenerated regardless.
+        """
+        # Only include source files as test generation targets; skip files
+        # that are already test files (they'd be double-processed).
+        targets: set[str] = {
+            f for f in changed_files if not self._is_test_file(f)
+        }
 
         if self._dep_store is None:
             return targets
@@ -548,7 +591,10 @@ class ModificationTaskGraphBuilder:
                 logger.debug(
                     "Graph impact: %s affects tests %s", file_path, graph_tests
                 )
-            targets.update(graph_tests)
+            # graph_tests are test-file paths; filter them out for the same
+            # reason as plan_tests — TestAgent cannot re-generate a test file
+            # by receiving a test file path (it would compute test_test_foo.py).
+            targets.update(f for f in graph_tests if not self._is_test_file(f))
 
         return targets
 

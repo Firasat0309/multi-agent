@@ -70,12 +70,50 @@ def _config_format(path: str) -> str | None:
 class CoderAgent(BaseAgent):
     role = AgentRole.CODER
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # Set before execute_agentic() so system_prompt uses the right language.
+        self._current_language: str = "python"
+
     @property
     def tools(self) -> list[ToolDefinition]:
         return CODER_TOOLS
 
+    # Per-language syntax rules injected into the system prompt so the LLM
+    # doesn't produce the most common syntax errors for that language.
+    _LANGUAGE_SYNTAX_RULES: dict[str, str] = {
+        "java": (
+            "\n\nCRITICAL Java syntax rules — every violation makes the file uncompilable:\n"
+            "- Every import statement MUST end with a semicolon: `import java.util.List;`\n"
+            "- Every field/variable declaration MUST end with exactly ONE semicolon — NEVER `;;`\n"
+            "- serialVersionUID must be initialised: `private static final long serialVersionUID = 1L;`\n"
+            "- Every statement (assignment, return, method call, throw) MUST end with a semicolon\n"
+            "- Method/constructor signatures do NOT end with a semicolon — only close with `{}`\n"
+            "- Class/interface/enum declarations open with `{` and close with `}` — no trailing semicolon\n"
+            "- Annotations (@Override, @Autowired, @Entity) go on the line BEFORE the annotated element\n"
+            "- Generic type parameters use angle brackets: `List<String>`, not raw `List`\n"
+            "- Before writing the file, mentally scan every line for missing or duplicate semicolons"
+        ),
+        "typescript": (
+            "\n\nCRITICAL TypeScript syntax rules:\n"
+            "- Every import statement MUST end with a semicolon\n"
+            "- Every statement MUST end with a semicolon\n"
+            "- Use explicit return types on public functions and methods\n"
+            "- Interface and type declarations do NOT use `=` unless it is a type alias\n"
+            "- Decorators (@Injectable, @Component) go on the line BEFORE the class/method"
+        ),
+        "csharp": (
+            "\n\nCRITICAL C# syntax rules:\n"
+            "- Every using statement MUST end with a semicolon: `using System.Linq;`\n"
+            "- Every field/property/statement MUST end with a semicolon\n"
+            "- Attributes ([HttpGet], [Authorize]) go on the line BEFORE the annotated element\n"
+            "- Auto-properties use `{ get; set; }` syntax"
+        ),
+    }
+
     def _get_source_system_prompt(self, language: str) -> str:
         profile = get_language_profile(language)
+        lang_rules = self._LANGUAGE_SYNTAX_RULES.get(profile.name, "")
         return (
             f"You are an expert {profile.display_name} developer agent. "
             f"You generate production-quality {profile.display_name} code.\n\n"
@@ -89,6 +127,7 @@ class CoderAgent(BaseAgent):
             "- Use dependency injection patterns\n"
             "- Do NOT add placeholder or TODO comments - write complete implementations\n"
             "- Do NOT import modules that aren't in the dependency graph"
+            f"{lang_rules}"
         )
 
     def _get_config_system_prompt(self, fmt: str) -> str:
@@ -103,7 +142,7 @@ class CoderAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return self._get_source_system_prompt("python")
+        return self._get_source_system_prompt(self._current_language)
 
     def _build_prompt(self, context: AgentContext) -> str:
         """Initial user message for the agentic GENERATE_FILE loop."""
@@ -112,6 +151,17 @@ class CoderAgent(BaseAgent):
             return self._format_context(context)
         lang = fb.language or context.blueprint.tech_stack.get("language", "python")
         profile = get_language_profile(lang)
+
+        # For compiled languages, embed a pre-write syntax reminder directly in
+        # the user turn so the model sees it immediately before producing code.
+        syntax_reminder = ""
+        lang_rules = self._LANGUAGE_SYNTAX_RULES.get(profile.name, "")
+        if lang_rules:
+            syntax_reminder = (
+                f"\n\nBefore calling write_file, verify every line of your code against "
+                f"these {profile.display_name} syntax rules:{lang_rules}"
+            )
+
         return (
             f"{self._format_context(context)}\n\n"
             f"Generate the complete {profile.display_name} file for: {fb.path}\n"
@@ -123,6 +173,7 @@ class CoderAgent(BaseAgent):
             f"2. Search for usage patterns or symbol definitions if needed\n"
             f"3. Write the complete, working {profile.display_name} code via write_file\n\n"
             f"Output ONLY the code to write_file — no markdown fences, no explanations."
+            f"{syntax_reminder}"
         )
 
     def _parse_agentic_result(
@@ -137,6 +188,16 @@ class CoderAgent(BaseAgent):
                 "CoderAgent agentic loop finished but %s was not written via write_file tool; "
                 "checking %d written files: %s",
                 fb.path, len(files_written), files_written,
+            )
+            # A generation task that produced no file is a hard failure — there
+            # is nothing to review, build, or test.  Return failure so the
+            # lifecycle engine handles it rather than passing a ghost file into
+            # downstream phases.
+            return TaskResult(
+                success=False,
+                output=f"CoderAgent did not write {fb.path}",
+                errors=[f"{fb.path} was not written by the write_file tool"],
+                metrics=self.get_metrics(),
             )
         out = (
             f"Generated {fb.path} via agentic loop ({len(files_written)} file(s) written)"
@@ -171,6 +232,8 @@ class CoderAgent(BaseAgent):
 
         # Source files: use the agentic tool-use loop so the agent can
         # read dependency interfaces and write the file directly.
+        lang = fb.language or context.blueprint.tech_stack.get("language", "python")
+        self._current_language = lang  # used by system_prompt property during the loop
         return await self.execute_agentic(context)
 
     async def _generate_source(self, context: AgentContext) -> TaskResult:
@@ -277,13 +340,26 @@ class CoderAgent(BaseAgent):
         else:
             issues_text = review_output
 
+        # For compiled languages add an explicit post-fix syntax checklist so the
+        # model validates its own output before returning.
+        syntax_checklist = self._LANGUAGE_SYNTAX_RULES.get(profile.name, "")
+        if syntax_checklist:
+            syntax_note = (
+                f"\n\nAfter writing the fixed code, verify:\n"
+                f"{syntax_checklist.strip()}"
+            )
+        else:
+            syntax_note = ""
+
         prompt = (
             f"{self._format_context(context)}\n\n"
             f"The following file has review issues that must be fixed:\n\n"
             f"File: {file_path}\n\n"
             f"Current content:\n```{profile.code_fence_name}\n{current_content}\n```\n\n"
             f"Issues to fix ({fix_trigger}):\n{issues_text}\n\n"
-            f"Output the complete corrected file. Output only the code, nothing else."
+            f"Output the COMPLETE corrected file with ALL issues resolved. "
+            f"Output only the code, nothing else."
+            f"{syntax_note}"
         )
 
         fixed_code = await self._call_llm(prompt, system_override=self._get_source_system_prompt(lang))
@@ -320,6 +396,14 @@ class CoderAgent(BaseAgent):
             "- Do NOT add placeholder or TODO comments — write complete implementations\n"
             "- Output only the code, no markdown fences or explanations"
         )
+
+    async def modify_file(self, context: AgentContext) -> TaskResult:
+        """Public entry-point for targeted file modification.
+
+        Alias kept so external callers (PatchAgent fallback) do not depend on
+        a private method name.  Delegates to ``_modify_file``.
+        """
+        return await self._modify_file(context)
 
     async def _modify_file(self, context: AgentContext) -> TaskResult:
         """Modify an existing file based on a change action.

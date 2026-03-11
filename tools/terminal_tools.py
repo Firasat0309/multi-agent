@@ -79,7 +79,7 @@ class TerminalTools:
     def is_sandboxed(self) -> bool:
         return self._sandbox_manager is not None and self._sandbox_id is not None
 
-    async def run_command(self, command: str) -> CommandResult:
+    async def run_command(self, command: str, timeout: int | None = None) -> CommandResult:
         """Execute a command in the working directory.
 
         Uses execvp-style execution (no shell) to prevent command injection.
@@ -90,7 +90,13 @@ class TerminalTools:
         share a mutable build directory, execution is serialized via a class-
         level asyncio.Lock to prevent concurrent builds from corrupting each
         other's artifacts.
+
+        Args:
+            command: The shell command string to execute.
+            timeout: Optional timeout in seconds; overrides the instance-level
+                     ``self.timeout`` when provided.
         """
+        effective_timeout = timeout if timeout is not None else self.timeout
         try:
             parts = shlex.split(command)
         except ValueError as e:
@@ -111,19 +117,21 @@ class TerminalTools:
         # Serialize build tools that share mutable state (target/, bin/, obj/)
         if base_cmd in _EXCLUSIVE_BUILD_COMMANDS:
             async with self._get_build_lock():
-                return await self._execute(parts)
+                return await self._execute(parts, effective_timeout)
         else:
-            return await self._execute(parts)
+            return await self._execute(parts, effective_timeout)
 
-    async def _execute(self, parts: list[str]) -> CommandResult:
+    async def _execute(self, parts: list[str], timeout: int | None = None) -> CommandResult:
         """Route to sandbox or local execution."""
+        effective_timeout = timeout if timeout is not None else self.timeout
         if self.is_sandboxed:
-            return await self._sandbox_execute(parts)
-        return await self._local_execute(parts)
+            return await self._sandbox_execute(parts, effective_timeout)
+        return await self._local_execute(parts, effective_timeout)
 
-    async def _sandbox_execute(self, parts: list[str]) -> CommandResult:
+    async def _sandbox_execute(self, parts: list[str], timeout: int | None = None) -> CommandResult:
         """Execute command inside the Docker sandbox container."""
         assert self._sandbox_manager is not None and self._sandbox_id is not None
+        effective_timeout = timeout if timeout is not None else self.timeout
 
         # Build env-var prefix for the container
         # Inside Docker the workspace is mounted at /workspace
@@ -139,21 +147,22 @@ class TerminalTools:
         try:
             result = await asyncio.wait_for(
                 self._sandbox_manager.execute(self._sandbox_id, full_cmd),
-                timeout=self.timeout,
+                timeout=effective_timeout,
             )
             return result
         except asyncio.TimeoutError:
             return CommandResult(
                 exit_code=-1,
                 stdout="",
-                stderr=f"Sandbox command timed out after {self.timeout}s",
+                stderr=f"Sandbox command timed out after {effective_timeout}s",
                 timed_out=True,
             )
         except Exception as e:
             return CommandResult(exit_code=-1, stdout="", stderr=f"Sandbox error: {e}")
 
-    async def _local_execute(self, parts: list[str]) -> CommandResult:
+    async def _local_execute(self, parts: list[str], timeout: int | None = None) -> CommandResult:
         """Low-level subprocess execution on the host."""
+        effective_timeout = timeout if timeout is not None else self.timeout
         # Build environment — include source root in PYTHONPATH so imports resolve
         env = {**os.environ, "PYTHONPATH": str(self.working_dir)}
         if self._lang.source_root:
@@ -185,7 +194,7 @@ class TerminalTools:
             )
             try:
                 stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(), timeout=self.timeout
+                    proc.communicate(), timeout=effective_timeout
                 )
                 return CommandResult(
                     exit_code=proc.returncode or 0,
@@ -197,7 +206,7 @@ class TerminalTools:
                 return CommandResult(
                     exit_code=-1,
                     stdout="",
-                    stderr=f"Command timed out after {self.timeout}s",
+                    stderr=f"Command timed out after {effective_timeout}s",
                     timed_out=True,
                 )
         except Exception as e:
