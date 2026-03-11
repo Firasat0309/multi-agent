@@ -85,6 +85,9 @@ class Settings:
     )
     allow_host_execution: bool = False  # Must be True to run without Docker
     require_plan_approval: bool = False  # If True, pause for human review after change planning
+    # Number of build attempts per tier checkpoint (1 initial + retries).
+    # Increase for flaky compilers; decrease to fail-fast during development.
+    build_checkpoint_retries: int = 3
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -101,6 +104,7 @@ class Settings:
                 sandbox_type=SandboxType(os.environ.get("SANDBOX_TYPE", "docker")),
             ),
             max_concurrent_agents=int(os.environ.get("MAX_CONCURRENT_AGENTS", "4")),
+            build_checkpoint_retries=int(os.environ.get("BUILD_CHECKPOINT_RETRIES", "3")),
         )
 
 

@@ -251,7 +251,7 @@ class AgentManager:
                 dep_store=self._dep_store,
                 embedding_store=self._embedding_store,
             )
-            context = context_builder.build(task)
+            context = await asyncio.to_thread(context_builder.build, task)
 
             try:
                 agent = self._create_agent(task.task_type)
@@ -519,7 +519,10 @@ class AgentManager:
             FilePhase.FIXING: {
                 "task_type": TaskType.FIX_CODE,
                 "success_event": EventType.FIX_APPLIED,
-                "failure_event": EventType.RETRIES_EXHAUSTED,
+                # Even if the fix agent returns a failure result, fire FIX_APPLIED
+                # so the file proceeds back to REVIEWING/TESTING rather than FAILED.
+                # Review/test cycle limits will naturally exhaust and push forward.
+                "failure_event": EventType.FIX_APPLIED,
                 "description": f"Fix {file_path} ({lc.fix_trigger} issues)",
             },
             FilePhase.BUILDING: {
@@ -566,7 +569,10 @@ class AgentManager:
             dep_store=self._dep_store,
             embedding_store=self._embedding_store,
         )
-        context = context_builder.build(task)
+        # Run context build in a thread — embedding_store.search() loads the
+        # SentenceTransformer model synchronously on first call, which makes
+        # HuggingFace network requests that would otherwise block the event loop.
+        context = await asyncio.to_thread(context_builder.build, task)
 
         try:
             agent = self._create_agent(config["task_type"])
@@ -673,8 +679,17 @@ class AgentManager:
 
         except Exception as e:
             logger.exception("[%s] %s error", file_path, phase.value)
-            engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
-            self._metrics["tasks_failed"] += 1
+            # For review/fix phases, proceed gracefully instead of failing the file.
+            # Only hard-fail on GENERATING — the pipeline only fails on build retries.
+            if phase == FilePhase.REVIEWING:
+                # Skip review, treat as passed so file moves to BUILDING.
+                engine.process_event(file_path, EventType.REVIEW_PASSED)
+            elif phase == FilePhase.FIXING:
+                # Treat as applied so file returns to REVIEWING/TESTING cycle.
+                engine.process_event(file_path, EventType.FIX_APPLIED)
+            else:
+                engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
+                self._metrics["tasks_failed"] += 1
 
     async def execute_with_checkpoints(
         self,

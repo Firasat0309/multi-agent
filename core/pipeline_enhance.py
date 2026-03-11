@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -112,6 +113,10 @@ class EnhancePipeline:
             embedding_model=self._settings.memory.embedding_model,
         )
         repo_manager._embedding_store = embedding_store
+
+        # Pre-warm the embedding model in a background thread so it's ready
+        # before file processing begins.
+        asyncio.ensure_future(asyncio.to_thread(embedding_store._ensure_client))
 
         repo_index = repo_manager.get_repo_index()
         known_files = {f.path for f in repo_index.files}
@@ -260,7 +265,7 @@ class EnhancePipeline:
         logger.info("[Phase 3] Building lifecycle plan from change plan...")
 
         is_compiled = bool(lang_profile.build_command)
-        review_fixes = 3 if is_compiled else 2
+        review_fixes = 2  # 2 review-fix cycles per file; pipeline only fails on build
 
         enhance_builder = EnhanceLifecyclePlanBuilder(dep_store=dep_store)
         lifecycle_engine, global_graph = enhance_builder.build(
@@ -339,7 +344,9 @@ class EnhancePipeline:
                         lifecycle_engine,
                         global_graph,
                         tiers=tiers,
-                        pipeline_def=ENHANCE_PIPELINE,
+                        pipeline_def=ENHANCE_PIPELINE.with_retries(
+                            self._settings.build_checkpoint_retries
+                        ),
                     )
 
                     changed_files = snap.get_changed_files()

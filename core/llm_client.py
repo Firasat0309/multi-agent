@@ -421,6 +421,10 @@ class LLMClient:
                     f"Set: export GEMINI_API_KEY=\"your-api-key\"\n"
                     f"Get key at: https://aistudio.google.com/app/apikey"
                 ) from e
+            elif any(code in str(e) for code in ("500", "502", "503", "529")) or "overloaded" in error_str or "resource_exhausted" in error_str or "429" in str(e):
+                # Transient server / rate-limit errors — re-raise the original
+                # exception so the caller's retry loop can handle it.
+                raise
             elif "google" in error_type.lower() or "grpc" in error_type.lower():
                 raise LLMConfigError(
                     f"❌ Google Gemini API error: {str(e)}\n\n"
@@ -742,10 +746,48 @@ class LLMClient:
         # Flatten normalized messages into a plain conversation string for Gemini
         conversation = self._flatten_messages_for_gemini(messages)
 
-        response = await self._gemini_generate(
-            self._get_client(), full_system, conversation,
-            self.config.temperature, max_tokens,
-        )
+        _max_attempts = 4
+        _base_delay = 2.0
+        last_exc: Exception | None = None
+        response: LLMResponse | None = None
+        for _attempt in range(_max_attempts):
+            try:
+                response = await self._gemini_generate(
+                    self._get_client(), full_system, conversation,
+                    self.config.temperature, max_tokens,
+                )
+                last_exc = None
+                break
+            except LLMClientError:
+                # Config / auth errors — surface immediately, no retry.
+                raise
+            except Exception as _exc:
+                last_exc = _exc
+                _msg = str(_exc)
+                _msg_lower = _msg.lower()
+                _is_transient = (
+                    any(code in _msg for code in ("500", "502", "503", "529"))
+                    or "overloaded" in _msg_lower
+                    or "resource_exhausted" in _msg_lower
+                    or "rate_limit" in _msg_lower
+                    or "ratelimit" in _msg_lower
+                    or "429" in _msg
+                    or "too many requests" in _msg_lower
+                )
+                if _is_transient and _attempt < _max_attempts - 1:
+                    _delay = _base_delay * (2 ** _attempt)
+                    logger.warning(
+                        "Gemini tool-use transient error (attempt %d/%d) — "
+                        "retrying in %.1fs: %s",
+                        _attempt + 1, _max_attempts, _delay, _msg[:120],
+                    )
+                    await asyncio.sleep(_delay)
+                    continue
+                raise
+        if last_exc is not None or response is None:
+            raise LLMClientError(
+                "Gemini generate_with_tools: retry loop exhausted"
+            ) from last_exc
         text = response.content.strip()
 
         # Try to detect a tool-call JSON envelope

@@ -102,6 +102,19 @@ class PipelineDefinition:
     def has_checkpoints(self) -> bool:
         return any(p.checkpoint is not None for p in self.phases)
 
+    def with_retries(self, max_retries: int) -> "PipelineDefinition":
+        """Return a copy of this pipeline with all checkpoint max_retries overridden."""
+        import dataclasses
+        new_phases = [
+            dataclasses.replace(
+                phase,
+                checkpoint=dataclasses.replace(phase.checkpoint, max_retries=max_retries)
+                if phase.checkpoint else None,
+            )
+            for phase in self.phases
+        ]
+        return dataclasses.replace(self, phases=new_phases)
+
 
 # ── Pre-built pipeline definitions ──────────────────────────────────────────
 

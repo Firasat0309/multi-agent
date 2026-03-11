@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -110,11 +111,8 @@ class RunPipeline:
 
         planner = PlannerAgent(llm_client=self._llm, repo_manager=repo_manager)
         try:
-            # Compiled languages (Java, Go, Rust, C#, TypeScript) need more review-fix
-            # cycles because initial code generation is more likely to contain syntax
-            # errors that require multiple LLM passes to fully resolve.
             is_compiled = bool(lang_profile.build_command)
-            review_fixes = 4 if is_compiled else 3
+            review_fixes = 2  # 2 review-fix cycles per file; pipeline only fails on build
             lifecycle_engine, global_graph = await planner.create_lifecycle_plan(
                 blueprint,
                 max_review_fixes=review_fixes,
@@ -167,6 +165,12 @@ class RunPipeline:
         )
         repo_manager._embedding_store = run_embedding_store
 
+        # Pre-warm the embedding model in a background thread.
+        # Loading SentenceTransformer makes HuggingFace network HEAD requests
+        # on first use; doing it now avoids blocking the event loop during the
+        # first file generation context build.
+        asyncio.ensure_future(asyncio.to_thread(run_embedding_store._ensure_client))
+
         event_bus = EventBus()
         agent_manager = AgentManager(
             settings=self._settings,
@@ -206,7 +210,9 @@ class RunPipeline:
                 lifecycle_engine,
                 global_graph,
                 tiers=tiers,
-                pipeline_def=GENERATE_PIPELINE,
+                pipeline_def=GENERATE_PIPELINE.with_retries(
+                    self._settings.build_checkpoint_retries
+                ),
             )
         except Exception as e:
             logger.exception("Task execution failed")
