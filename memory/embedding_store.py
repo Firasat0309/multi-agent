@@ -4,10 +4,17 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Module-level lock: ChromaDB's PersistentClient uses a shared class-level
+# dictionary keyed by persist_dir path.  Concurrent threads hitting the same
+# path simultaneously trigger a KeyError race condition inside ChromaDB.  A
+# single lock serialises all first-time initialisations across all instances.
+_chroma_init_lock = threading.Lock()
 
 # Top-level definition boundary patterns, keyed by file extension.
 # A line matching one of these signals the start of a new logical chunk.
@@ -49,6 +56,15 @@ class EmbeddingStore:
     def _ensure_client(self) -> None:
         if self._client is not None:
             return
+        with _chroma_init_lock:
+            # Re-check inside the lock — another thread may have initialised
+            # while we were waiting.
+            if self._client is not None:
+                return
+            self._ensure_client_locked()
+
+    def _ensure_client_locked(self) -> None:
+        """Inner init that runs under ``_chroma_init_lock``."""
         try:
             import chromadb
             from chromadb.utils.embedding_functions import (
@@ -82,6 +98,9 @@ class EmbeddingStore:
             self._collection = self._client.get_or_create_collection(**kwargs)
         except ImportError:
             logger.warning("chromadb not installed, vector memory disabled")
+            self._client = None
+        except Exception as e:
+            logger.warning("ChromaDB init failed (%s) — vector memory disabled", e)
             self._client = None
 
     def index_file(self, file_path: str, content: str) -> None:

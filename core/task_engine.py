@@ -156,9 +156,26 @@ class LifecyclePlanBuilder:
         """
         # ── Validate blueprint deps ─────────────────────────────────
         known_paths = {fb.path for fb in blueprint.file_blueprints}
+
+        # Build a suffix→full-path lookup so short dep references like
+        # "models/Greeting.java" resolve to their full blueprint paths
+        # (e.g. "src/main/java/com/example/helloworld/models/Greeting.java").
+        # Progressively shorter suffixes are added; the first (longest) match wins.
+        _suffix_map: dict[str, str] = {}
+        for p in known_paths:
+            _suffix_map[p] = p  # exact match always wins
+            parts = p.replace("\\", "/").split("/")
+            for i in range(1, len(parts)):
+                suffix = "/".join(parts[i:])
+                if suffix not in _suffix_map:
+                    _suffix_map[suffix] = p
+
+        def _resolve_dep(dep: str) -> str | None:
+            return _suffix_map.get(dep.replace("\\", "/"))
+
         for fb in blueprint.file_blueprints:
             for dep_path in fb.depends_on:
-                if dep_path not in known_paths:
+                if _resolve_dep(dep_path) is None:
                     logger.warning(
                         "Blueprint: %s depends on '%s' which is not in the "
                         "blueprint — dependency will be ignored",
@@ -168,7 +185,10 @@ class LifecyclePlanBuilder:
         # ── Build per-file lifecycle engine ──────────────────────────
         file_paths = [fb.path for fb in blueprint.file_blueprints]
         file_deps = {
-            fb.path: [d for d in fb.depends_on if d in known_paths]
+            fb.path: [
+                _resolve_dep(d) for d in fb.depends_on
+                if _resolve_dep(d) is not None
+            ]
             for fb in blueprint.file_blueprints
         }
 

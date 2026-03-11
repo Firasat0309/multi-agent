@@ -89,13 +89,58 @@ class BaseAgent(ABC):
         ]
         files_written: list[str] = []
         max_iterations = 10
+        _target = (context.file_blueprint.path if context.file_blueprint else None) or "task"
+        _heartbeat_interval = 15  # seconds between "still waiting" log lines
+
+        async def _llm_call_with_heartbeat(iteration: int) -> "LLMResponseWithTools":
+            """Wrap generate_with_tools with a pre-call log and a periodic heartbeat.
+
+            This prevents the screen from going silent for 30–90 seconds during
+            a large LLM response.  A background task logs every
+            ``_heartbeat_interval`` seconds so the user can see progress.
+            """
+            import time as _time
+            _t0 = _time.monotonic()
+            logger.info(
+                "[%s] LLM call iter %d/%d for %s — waiting for response…",
+                self.__class__.__name__, iteration + 1, max_iterations, _target,
+            )
+
+            async def _heartbeat() -> None:
+                while True:
+                    await asyncio.sleep(_heartbeat_interval)
+                    elapsed = _time.monotonic() - _t0
+                    logger.info(
+                        "[%s]   …still waiting (%.0fs elapsed, iter %d/%d, file: %s)",
+                        self.__class__.__name__, elapsed,
+                        iteration + 1, max_iterations, _target,
+                    )
+
+            hb = asyncio.create_task(_heartbeat())
+            try:
+                resp = await self.llm.generate_with_tools(
+                    messages=messages,
+                    tools=self.tools,
+                    system_prompt=self.system_prompt,
+                )
+            finally:
+                hb.cancel()
+                try:
+                    await hb
+                except asyncio.CancelledError:
+                    pass
+            elapsed = _time.monotonic() - _t0
+            tool_names = [tc.name for tc in resp.tool_calls] if resp.tool_calls else []
+            logger.info(
+                "[%s] LLM responded in %.1fs (iter %d/%d) stop=%s tools=%s",
+                self.__class__.__name__, elapsed,
+                iteration + 1, max_iterations,
+                resp.stop_reason, tool_names or "none",
+            )
+            return resp
 
         for iteration in range(max_iterations):
-            response = await self.llm.generate_with_tools(
-                messages=messages,
-                tools=self.tools,
-                system_prompt=self.system_prompt,
-            )
+            response = await _llm_call_with_heartbeat(iteration)
             self._metrics["llm_calls"] += 1
             self._metrics["tokens_used"] += sum(response.usage.values())
 
@@ -164,6 +209,13 @@ class BaseAgent(ABC):
             # Extend the conversation: assistant turn (with tool_use blocks) + user turn (results)
             messages.append({"role": "assistant", "content": response.raw_content})
             messages.append({"role": "user", "content": tool_results})
+
+            # If the target file was just written, return immediately rather
+            # than waiting for the model to emit end_turn.  This prevents
+            # hitting max_iterations when the write happens on the last turn.
+            target_file = context.file_blueprint.path if context.file_blueprint else None
+            if target_file and target_file in files_written:
+                return self._parse_agentic_result(context, response.content, files_written)
 
         raise RuntimeError(
             f"{self.__class__.__name__} exceeded max_iterations ({max_iterations}) "
@@ -330,11 +382,33 @@ class BaseAgent(ABC):
         temperature: float | None = None,
     ) -> str:
         """Call LLM and track metrics. Auto-continues in a loop if output is truncated."""
-        response = await self.llm.generate(
-            system_prompt=system_override or self.system_prompt,
-            user_prompt=user_prompt,
-            temperature=temperature,
-        )
+        import time as _time
+        _t0 = _time.monotonic()
+        _heartbeat_interval = 15
+
+        async def _heartbeat(label: str) -> None:
+            while True:
+                await asyncio.sleep(_heartbeat_interval)
+                logger.info("[%s] …still waiting for LLM (%.0fs, %s)",
+                            self.__class__.__name__, _time.monotonic() - _t0, label)
+
+        logger.info("[%s] LLM call (single-shot) — waiting for response…",
+                    self.__class__.__name__)
+        hb = asyncio.create_task(_heartbeat("initial"))
+        try:
+            response = await self.llm.generate(
+                system_prompt=system_override or self.system_prompt,
+                user_prompt=user_prompt,
+                temperature=temperature,
+            )
+        finally:
+            hb.cancel()
+            try:
+                await hb
+            except asyncio.CancelledError:
+                pass
+        logger.info("[%s] LLM responded in %.1fs", self.__class__.__name__,
+                    _time.monotonic() - _t0)
         self._metrics["llm_calls"] += 1
         self._metrics["tokens_used"] += sum(response.usage.values())
         content = response.content

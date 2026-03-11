@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import difflib
 import logging
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,12 @@ from core.models import AgentContext, AgentRole, ChangeAction, ChangeActionType,
 # Files with more lines than this threshold are modified via unified diff instead
 # of a full-file rewrite.  Diffs are ~5–20× cheaper in tokens for large files.
 _LARGE_FILE_THRESHOLD = 200
+
+# Max chars of build/compiler output to include in fix prompts.
+# Maven can dump 50K+ chars; the relevant error lines are always near the end.
+_MAX_ERROR_CHARS = 3_000
+# Max chars of a single related file included in fix context.
+_MAX_RELATED_FILE_CHARS = 2_000
 
 logger = logging.getLogger(__name__)
 
@@ -333,12 +340,22 @@ class CoderAgent(BaseAgent):
         profile = get_language_profile(lang)
         logger.info(f"Fixing {file_path} based on {len(review_errors)} review issue(s)")
 
+        # ── Cap error text to avoid token explosion ──────────────────────────
+        # Build output (Maven, javac, tsc) can be 50K+ chars.  Keep the last
+        # _MAX_ERROR_CHARS which contain the actual error lines, not the build
+        # setup noise at the start.
         if fix_trigger == "build" and build_errors:
-            issues_text = f"Compilation/build errors to fix:\n{build_errors}"
+            raw = build_errors
+            issues_text = (
+                f"Compilation/build errors to fix:\n"
+                + (raw[-_MAX_ERROR_CHARS:] if len(raw) > _MAX_ERROR_CHARS
+                   else raw)
+            )
         elif review_errors:
             issues_text = "\n".join(f"- {e}" for e in review_errors)
         else:
-            issues_text = review_output
+            raw = review_output
+            issues_text = raw[-_MAX_ERROR_CHARS:] if len(raw) > _MAX_ERROR_CHARS else raw
 
         # For compiled languages add an explicit post-fix syntax checklist so the
         # model validates its own output before returning.
@@ -351,9 +368,28 @@ class CoderAgent(BaseAgent):
         else:
             syntax_note = ""
 
+        # ── Slim context: fix tasks don't need the full dependency tree ───────
+        fix_context_header = self._format_fix_context(context)
+
+        line_count = len(current_content.splitlines())
+
+        # ── Large files: use diff output to avoid token-doubling ──────────────
+        if line_count > _LARGE_FILE_THRESHOLD:
+            result = await self._try_diff_fix(
+                context, file_path, current_content, lang, profile,
+                fix_context_header, issues_text, fix_trigger,
+            )
+            if result is not None:
+                return result
+            logger.warning(
+                "Diff fix failed for %s (%d lines) — falling back to full rewrite",
+                file_path, line_count,
+            )
+
+        # ── Small files or diff fallback: full-file rewrite ──────────────────
         prompt = (
-            f"{self._format_context(context)}\n\n"
-            f"The following file has review issues that must be fixed:\n\n"
+            f"{fix_context_header}\n\n"
+            f"The following file has issues that must be fixed:\n\n"
             f"File: {file_path}\n\n"
             f"Current content:\n```{profile.code_fence_name}\n{current_content}\n```\n\n"
             f"Issues to fix ({fix_trigger}):\n{issues_text}\n\n"
@@ -369,6 +405,85 @@ class CoderAgent(BaseAgent):
         return TaskResult(
             success=True,
             output=f"Fixed {file_path} ({len(review_errors)} issue(s) addressed)",
+            files_modified=[file_path],
+            metrics=self.get_metrics(),
+        )
+
+    def _format_fix_context(self, context: AgentContext) -> str:
+        """Minimal context for fix tasks — architecture + blueprint only.
+
+        Deliberately excludes related_files: during a fix the agent already has
+        the broken file content in the prompt, and dumping dependency source code
+        on top of it consumes tokens without improving fix quality.  The model
+        can call read_file via tools if it genuinely needs an interface.
+        """
+        parts: list[str] = []
+        if context.architecture_summary:
+            parts.append(f"## Architecture\n{context.architecture_summary[:1000]}")
+        if context.file_blueprint:
+            fb = context.file_blueprint
+            parts.append(
+                f"## File Blueprint\n"
+                f"Path: {fb.path}\n"
+                f"Purpose: {fb.purpose}\n"
+                f"Layer: {fb.layer}\n"
+                f"Depends on: {', '.join(fb.depends_on) or 'none'}\n"
+                f"Exports: {', '.join(fb.exports) or 'TBD'}"
+            )
+        return "\n\n".join(parts)
+
+    async def _try_diff_fix(
+        self,
+        context: AgentContext,
+        file_path: str,
+        current_content: str,
+        lang: str,
+        profile: LanguageProfile,
+        fix_context_header: str,
+        issues_text: str,
+        fix_trigger: str,
+    ) -> TaskResult | None:
+        """Ask the LLM for a unified diff that fixes the issues.
+
+        Returns a TaskResult on success, or None if the diff cannot be applied
+        (caller falls back to full-file rewrite).
+        """
+        numbered = "\n".join(
+            f"{i + 1:4d}  {line}"
+            for i, line in enumerate(current_content.splitlines())
+        )
+        prompt = (
+            f"{fix_context_header}\n\n"
+            f"File to fix: {file_path}\n"
+            f"Language: {profile.display_name}\n\n"
+            f"Current file content (line numbers for reference):\n"
+            f"```\n{numbered}\n```\n\n"
+            f"Issues to fix ({fix_trigger}):\n{issues_text}\n\n"
+            "Generate a unified diff patch that resolves ALL the issues above.\n"
+            "Output ONLY the raw diff — no markdown fences, no explanation.\n"
+            f"Format:\n--- a/{file_path}\n+++ b/{file_path}\n@@ -LINE,COUNT +LINE,COUNT @@\n..."
+        )
+        system = (
+            "You are a surgical code fix agent. "
+            "Output ONLY a standard unified diff — never rewrite entire files.\n"
+            "Include 3 lines of context around each changed hunk.\n"
+            "Line numbers in @@ headers MUST match the actual file content exactly."
+        )
+        patch_text = await self._call_llm(prompt, system_override=system)
+
+        valid, err = self._file_tools.validate_patch(file_path, patch_text)
+        if not valid:
+            logger.debug("Diff fix validation failed for %s: %s", file_path, err)
+            return None
+
+        applied = self._file_tools.apply_patch(file_path, patch_text)
+        if not applied:
+            logger.debug("Diff fix application failed for %s", file_path)
+            return None
+
+        return TaskResult(
+            success=True,
+            output=f"Fixed {file_path} via diff patch ({fix_trigger})",
             files_modified=[file_path],
             metrics=self.get_metrics(),
         )
