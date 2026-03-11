@@ -248,6 +248,9 @@ def _display_enhance_result(result: PipelineResult) -> None:
         table.add_row("Errors", error_text)
 
     console.print(table)
+
+
+def _display_result(result: PipelineResult) -> None:
     """Display pipeline results in a formatted table."""
     if result.success:
         console.print(Panel.fit(
