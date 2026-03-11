@@ -3,10 +3,32 @@
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Top-level definition boundary patterns, keyed by file extension.
+# A line matching one of these signals the start of a new logical chunk.
+# Extensions not in this table fall back to fixed-size window splitting.
+_TOPLEVEL_PATTERNS: dict[str, re.Pattern[str]] = {
+    ".py":   re.compile(r"^(class |def |async def )"),
+    ".go":   re.compile(r"^func "),
+    ".rs":   re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn |^(?:pub\s+)?(?:struct|enum|trait|impl)\s"),
+    ".rb":   re.compile(r"^(?:def |class |module )"),
+    ".java": re.compile(r"^(\s*(@\w+)\s*)*\s*(public|private|protected|static|abstract|final|synchronized|native)\b"),
+    ".ts":   re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b|^(?:export\s+)?(?:abstract\s+)?(?:class|interface|type|enum)\b"),
+    ".tsx":  re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b|^(?:export\s+)?(?:abstract\s+)?(?:class|interface|type|enum)\b"),
+    ".js":   re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b|^(?:export\s+)?class\b"),
+    ".jsx":  re.compile(r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\b|^(?:export\s+)?class\b"),
+    ".cs":   re.compile(r"^\s*(?:public|private|protected|internal|static|abstract|sealed|override|virtual)\b"),
+    ".swift":re.compile(r"^(?:(?:public|private|internal|open|fileprivate)\s+)?(?:func|class|struct|enum|protocol|extension)\b"),
+    ".kt":   re.compile(r"^(?:fun |(?:(?:data|sealed|abstract|open|inner)\s+)?class |object |interface )"),
+    ".php":  re.compile(r"^(?:(?:public|private|protected|static|abstract|final)\s+)*(?:function|class|interface|trait)\b"),
+    ".cpp":  re.compile(r"^[A-Za-z_][\w:* <>]*\s+[A-Za-z_]\w*\s*\("),
+    ".c":    re.compile(r"^[A-Za-z_][\w* ]*\s+[A-Za-z_]\w*\s*\("),
+}
 
 
 class EmbeddingStore:
@@ -68,7 +90,7 @@ class EmbeddingStore:
         if self._collection is None:
             return
 
-        chunks = self._chunk_code(content)
+        chunks = self._chunk_code(content, file_path=file_path)
         ids = [f"{file_path}::chunk_{i}" for i in range(len(chunks))]
         metadatas = [{"file": file_path, "chunk_index": i} for i in range(len(chunks))]
 
@@ -103,18 +125,26 @@ class EmbeddingStore:
                 })
         return hits
 
-    def _chunk_code(self, content: str, chunk_size: int = 40) -> list[str]:
-        """Split code into chunks by logical blocks (functions/classes or line groups)."""
+    def _chunk_code(self, content: str, chunk_size: int = 40, file_path: str = "") -> list[str]:
+        """Split code into chunks at top-level definition boundaries.
+
+        Uses language-appropriate patterns derived from *file_path*'s extension.
+        Falls back to fixed *chunk_size*-line windows for unknown file types.
+        """
+        ext = Path(file_path).suffix.lower() if file_path else ""
+        pattern = _TOPLEVEL_PATTERNS.get(ext)
+
         lines = content.splitlines()
         chunks: list[str] = []
         current_chunk: list[str] = []
 
         for line in lines:
-            # Start new chunk on top-level definitions
-            if (line.startswith("class ") or line.startswith("def ")) and current_chunk:
+            # Flush the current chunk when we hit a top-level definition boundary.
+            if current_chunk and pattern is not None and pattern.match(line):
                 chunks.append("\n".join(current_chunk))
                 current_chunk = []
             current_chunk.append(line)
+            # Also flush when the fixed-size window fills up.
             if len(current_chunk) >= chunk_size:
                 chunks.append("\n".join(current_chunk))
                 current_chunk = []

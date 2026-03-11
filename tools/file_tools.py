@@ -52,8 +52,7 @@ class FileTools:
     def write_file(self, path: str, content: str) -> str:
         """Write content to a file, creating parent directories as needed."""
         resolved = self._resolve(path)
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
+        _write_atomic(resolved, content)
         return f"Written {len(content)} bytes to {path}"
 
     def edit_file(self, path: str, old: str, new: str) -> str:
@@ -65,7 +64,7 @@ class FileTools:
         if old not in content:
             raise ValueError(f"String not found in {path}: {old[:50]}...")
         content = content.replace(old, new, 1)
-        resolved.write_text(content, encoding="utf-8")
+        _write_atomic(resolved, content)
         return f"Edited {path}"
 
     def insert_after(self, path: str, anchor: str, new_content: str) -> str:
@@ -81,7 +80,7 @@ class FileTools:
         for i, line in enumerate(lines):
             if anchor in line:
                 lines.insert(i + 1, new_content if new_content.endswith("\n") else new_content + "\n")
-                resolved.write_text("".join(lines), encoding="utf-8")
+                _write_atomic(resolved, "".join(lines))
                 return f"Inserted after line {i + 1} in {path}"
         raise ValueError(f"Anchor not found in {path}: {anchor[:50]}...")
 
@@ -94,7 +93,7 @@ class FileTools:
         for i, line in enumerate(lines):
             if anchor in line:
                 lines.insert(i, new_content if new_content.endswith("\n") else new_content + "\n")
-                resolved.write_text("".join(lines), encoding="utf-8")
+                _write_atomic(resolved, "".join(lines))
                 return f"Inserted before line {i + 1} in {path}"
         raise ValueError(f"Anchor not found in {path}: {anchor[:50]}...")
 
@@ -106,7 +105,7 @@ class FileTools:
         lines = resolved.read_text(encoding="utf-8").splitlines(keepends=True)
         idx = max(0, min(line_number - 1, len(lines)))
         lines.insert(idx, new_content if new_content.endswith("\n") else new_content + "\n")
-        resolved.write_text("".join(lines), encoding="utf-8")
+        _write_atomic(resolved, "".join(lines))
         return f"Inserted at line {line_number} in {path}"
 
     def append_to_file(self, path: str, content: str) -> str:
@@ -117,7 +116,7 @@ class FileTools:
         existing = resolved.read_text(encoding="utf-8")
         if not existing.endswith("\n"):
             content = "\n" + content
-        resolved.write_text(existing + content, encoding="utf-8")
+        _write_atomic(resolved, existing + content)
         return f"Appended to {path}"
 
     def apply_patch(self, file_path: str, patch_text: str) -> bool:

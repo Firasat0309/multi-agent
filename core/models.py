@@ -140,15 +140,24 @@ class RepositoryIndex:
     def _rebuild_index(self) -> None:
         self._path_index = {f.path: i for i, f in enumerate(self.files)}
 
-    def get_file(self, path: str) -> FileIndex | None:
-        if not self._path_index and self.files:
+    def _ensure_index(self) -> None:
+        """Rebuild the index if it is empty or out of sync with ``files``.
+
+        Catches the common mutation patterns (append, extend, slice-assign,
+        full replacement) by comparing dict length to list length.  In-place
+        path changes via ``files[i] = x`` should always go through
+        ``add_or_update`` to keep the index consistent.
+        """
+        if len(self._path_index) != len(self.files):
             self._rebuild_index()
+
+    def get_file(self, path: str) -> FileIndex | None:
+        self._ensure_index()
         idx = self._path_index.get(path)
         return self.files[idx] if idx is not None else None
 
     def add_or_update(self, file_index: FileIndex) -> None:
-        if not self._path_index and self.files:
-            self._rebuild_index()
+        self._ensure_index()
         idx = self._path_index.get(file_index.path)
         if idx is not None:
             self.files[idx] = file_index

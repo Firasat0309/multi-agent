@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -18,6 +18,30 @@ from config.settings import Settings, get_settings
 from core.pipeline import Pipeline, PipelineResult
 
 logger = logging.getLogger(__name__)
+
+# All workspaces must be resolved descendants of this directory.
+# Prevents path-traversal attacks on the /enhance endpoint.
+_WORKSPACE_ROOT: Path = Path.cwd().resolve()
+
+
+def _validate_workspace_path(raw: str) -> Path:
+    """Resolve *raw* and ensure it stays inside ``_WORKSPACE_ROOT``.
+
+    Raises ``HTTPException(400)`` if the path escapes the allowed root.
+    """
+    resolved = (Path.cwd() / raw).resolve()
+    try:
+        resolved.relative_to(_WORKSPACE_ROOT)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"workspace path '{raw}' resolves outside the allowed root "
+                f"'{_WORKSPACE_ROOT}'. Absolute paths and '..' traversal are "
+                "not permitted."
+            ),
+        )
+    return resolved
 
 app = FastAPI(
     title="Multi-Agent Code Generator API",
@@ -67,6 +91,10 @@ class JobStatus(BaseModel):
 # ── In-memory job store ───────────────────────────────────────────────────────
 # Use Redis / Postgres in multi-process deployments.
 
+_MAX_JOBS: int = 500        # hard cap on in-memory job records
+_JOB_TTL_HOURS: int = 2     # terminal jobs are evicted after this many hours
+_TERMINAL_STATES: frozenset[str] = frozenset({"completed", "failed", "cancelled"})
+
 class _Job:
     def __init__(self, job_id: str) -> None:
         self.job_id = job_id
@@ -95,6 +123,32 @@ class _Job:
 
 
 _jobs: dict[str, _Job] = {}
+
+
+def _evict_stale_jobs() -> None:
+    """Remove terminal jobs older than *_JOB_TTL_HOURS*, then enforce *_MAX_JOBS*.
+
+    Called before each new job is registered so the dict never grows unboundedly.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=_JOB_TTL_HOURS)
+    expired = [
+        jid
+        for jid, job in _jobs.items()
+        if job.status in _TERMINAL_STATES
+        and datetime.fromisoformat(job.created_at) < cutoff
+    ]
+    for jid in expired:
+        del _jobs[jid]
+
+    # Hard cap: evict oldest terminal jobs first, then oldest overall.
+    while len(_jobs) > _MAX_JOBS:
+        for jid, job in list(_jobs.items()):
+            if job.status in _TERMINAL_STATES:
+                del _jobs[jid]
+                break
+        else:
+            # All jobs are still running — drop the oldest one.
+            del _jobs[next(iter(_jobs))]
 
 
 # ── Helper ────────────────────────────────────────────────────────────────────
@@ -126,8 +180,9 @@ async def generate(
     """Start a new code generation job.  Returns immediately with a ``job_id``."""
     job_id = str(uuid.uuid4())[:8]
     job = _Job(job_id)
-    workspace = Path(request.workspace) / job_id
+    workspace = _validate_workspace_path(request.workspace) / job_id
     job.workspace = workspace
+    _evict_stale_jobs()
     _jobs[job_id] = job
 
     background_tasks.add_task(_run_generate, job, request)
@@ -145,8 +200,9 @@ async def enhance(
     """Start a repository enhancement job."""
     job_id = str(uuid.uuid4())[:8]
     job = _Job(job_id)
-    workspace = Path(request.workspace)
+    workspace = _validate_workspace_path(request.workspace)
     job.workspace = workspace
+    _evict_stale_jobs()
     _jobs[job_id] = job
 
     background_tasks.add_task(_run_enhance, job, request)
@@ -264,26 +320,42 @@ async def health() -> dict[str, str]:
 
 # ── Background runners ────────────────────────────────────────────────────────
 
+async def _watch_cancel(event: asyncio.Event, task: "asyncio.Task[Any]") -> None:
+    """Wait for *event* then cancel *task*.  Runs as a companion task."""
+    await event.wait()
+    task.cancel()
+
+
 async def _run_generate(job: _Job, request: GenerateRequest) -> None:
     import time
     t0 = time.monotonic()
     job.status = "running"
     job.phase = "initializing"
 
-    workspace = job.workspace or Path(request.workspace) / job.job_id
+    workspace = job.workspace or _validate_workspace_path(request.workspace) / job.job_id
     settings = _build_settings(request, workspace)
     pipeline = Pipeline(settings, interactive=False)
 
+    pipeline_task: asyncio.Task[PipelineResult] = asyncio.create_task(
+        pipeline.run(request.prompt)
+    )
+    cancel_watcher: asyncio.Task[None] = asyncio.create_task(
+        _watch_cancel(job._cancel_event, pipeline_task)
+    )
     try:
-        result = await pipeline.run(request.prompt)
-        job.status = "completed" if result.success else "failed"
+        result = await pipeline_task
+        if not job._cancel_event.is_set():
+            job.status = "completed" if result.success else "failed"
         job.result = _serialize_result(result)
         job.errors = result.errors
+    except asyncio.CancelledError:
+        job.status = "cancelled"
     except Exception as e:
         logger.exception("Pipeline failed for job %s", job.job_id)
         job.status = "failed"
         job.errors = [str(e)]
     finally:
+        cancel_watcher.cancel()
         job.elapsed_seconds = time.monotonic() - t0
 
 
@@ -293,20 +365,30 @@ async def _run_enhance(job: _Job, request: EnhanceRequest) -> None:
     job.status = "running"
     job.phase = "initializing"
 
-    workspace = Path(request.workspace)
+    workspace = job.workspace or _validate_workspace_path(request.workspace)
     settings = _build_settings(request, workspace)
     pipeline = Pipeline(settings, interactive=False)
 
+    pipeline_task: asyncio.Task[PipelineResult] = asyncio.create_task(
+        pipeline.enhance(request.prompt)
+    )
+    cancel_watcher: asyncio.Task[None] = asyncio.create_task(
+        _watch_cancel(job._cancel_event, pipeline_task)
+    )
     try:
-        result = await pipeline.enhance(request.prompt)
-        job.status = "completed" if result.success else "failed"
+        result = await pipeline_task
+        if not job._cancel_event.is_set():
+            job.status = "completed" if result.success else "failed"
         job.result = _serialize_result(result)
         job.errors = result.errors
+    except asyncio.CancelledError:
+        job.status = "cancelled"
     except Exception as e:
         logger.exception("Enhancement failed for job %s", job.job_id)
         job.status = "failed"
         job.errors = [str(e)]
     finally:
+        cancel_watcher.cancel()
         job.elapsed_seconds = time.monotonic() - t0
 
 
