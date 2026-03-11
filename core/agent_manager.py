@@ -35,6 +35,7 @@ from core.models import (
 from core.repository_manager import RepositoryManager
 from core.state_machine import EventType, FilePhase, LifecycleEngine
 from core.task_engine import TaskGraph
+from core.tier_scheduler import Tier
 from tools.terminal_tools import TerminalTools
 
 if TYPE_CHECKING:
@@ -496,13 +497,18 @@ class AgentManager:
             engine.process_event(file_path, EventType.DEPS_MET)
             phase = lc.phase  # now GENERATING
 
-        # Map phase → task type + event on success/failure
+        # Map phase → task type + event on success/failure.
+        # For GENERATING: use the lifecycle's generation_task_type which is
+        # MODIFY_FILE for the Enhance pipeline, GENERATE_FILE for Generate.
+        gen_task_type = TaskType(lc.generation_task_type)
+        gen_verb = "Modify" if gen_task_type == TaskType.MODIFY_FILE else "Generate"
+
         phase_config: dict[FilePhase, dict[str, Any]] = {
             FilePhase.GENERATING: {
-                "task_type": TaskType.GENERATE_FILE,
+                "task_type": gen_task_type,
                 "success_event": EventType.CODE_GENERATED,
                 "failure_event": EventType.RETRIES_EXHAUSTED,
-                "description": f"Generate {file_path}",
+                "description": f"{gen_verb} {file_path}",
             },
             FilePhase.REVIEWING: {
                 "task_type": TaskType.REVIEW_FILE,
@@ -535,13 +541,18 @@ class AgentManager:
             logger.warning("No action for phase %s on %s", phase.value, file_path)
             return
 
-        # Build a synthetic Task for the context builder
+        # Build a synthetic Task for the context builder.
+        # Merge lifecycle change_metadata (change_type, target_function etc.)
+        # so PatchAgent/CoderAgent receives the full context.
+        task_meta = self._build_lifecycle_metadata(lc)
+        task_meta.update(lc.change_metadata)
+
         task = Task(
             task_id=0,
             task_type=config["task_type"],
             file=file_path,
             description=config["description"],
-            metadata=self._build_lifecycle_metadata(lc),
+            metadata=task_meta,
         )
 
         if self._live:
@@ -664,6 +675,51 @@ class AgentManager:
             logger.exception("[%s] %s error", file_path, phase.value)
             engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
             self._metrics["tasks_failed"] += 1
+
+    async def execute_with_checkpoints(
+        self,
+        engine: LifecycleEngine,
+        global_graph: TaskGraph,
+        *,
+        tiers: list[Tier] | None = None,
+        pipeline_def: Any = None,
+    ) -> dict[str, Any]:
+        """Execute using tier-based scheduling with repo-level build checkpoints.
+
+        This is the preferred execution mode for new pipelines.  It replaces
+        ``execute_with_lifecycle()`` with:
+          - Tier-based file scheduling (dependency depth ordering)
+          - Repo-level build checkpoints between tiers
+          - Unified error attribution and targeted fix dispatch
+
+        Falls back to ``execute_with_lifecycle()`` semantics if no tiers
+        are provided (single-tier mode).
+
+        Args:
+            engine: Lifecycle engine managing per-file state machines.
+            global_graph: Global task DAG (security, deploy, docs).
+            tiers: Pre-computed dependency tiers.  If None, all files run
+                   as a single tier (backward-compatible behavior).
+            pipeline_def: Optional ``PipelineDefinition`` for checkpoint config.
+
+        Returns:
+            Result dict compatible with the existing pipeline format.
+        """
+        from core.pipeline_executor import PipelineExecutor
+
+        executor = PipelineExecutor(
+            agent_manager=self,
+            settings=self.settings,
+            lang_profile=self._lang,
+            event_bus=self._event_bus,
+        )
+
+        return await executor.execute(
+            engine,
+            global_graph,
+            pipeline_def=pipeline_def,
+            tiers=tiers,
+        )
 
     @staticmethod
     def _build_lifecycle_metadata(lc: Any) -> dict[str, Any]:

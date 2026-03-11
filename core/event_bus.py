@@ -44,6 +44,10 @@ class BusEventType(str, Enum):
     REVIEW_PASSED = "review_passed"
     REVIEW_FAILED = "review_failed"
 
+    # Build checkpoint events
+    BUILD_PASSED = "build_passed"
+    BUILD_FAILED = "build_failed"
+
     # Test events
     TEST_PASSED = "test_passed"
     TEST_FAILED = "test_failed"

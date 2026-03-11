@@ -19,8 +19,10 @@ from core.observability import setup_tracing
 from core.repository_manager import RepositoryManager
 from core.run_reporter import RunReporter
 from core.sandbox_orchestrator import SandboxOrchestrator, SandboxUnavailableError
+from core.pipeline_definition import GENERATE_PIPELINE
 from core.state_machine import LifecycleEngine
 from core.task_engine import TaskGraph
+from core.tier_scheduler import TierScheduler
 from core.workspace_indexer import index_workspace
 from memory.dependency_graph import DependencyGraphStore
 from memory.embedding_store import EmbeddingStore
@@ -180,9 +182,31 @@ class RunPipeline:
             event_bus=event_bus,
         )
 
+        # Compute dependency tiers for incremental build verification.
+        # Foundational files (models, interfaces) compile first; dependent
+        # files (services, controllers) generate only after their deps pass.
+        tier_scheduler = TierScheduler()
+        known_paths = {fb.path for fb in blueprint.file_blueprints}
+        file_deps = {
+            fb.path: [d for d in fb.depends_on if d in known_paths]
+            for fb in blueprint.file_blueprints
+        }
+        tiers = tier_scheduler.compute_tiers(
+            file_paths=[fb.path for fb in blueprint.file_blueprints],
+            file_deps=file_deps,
+        )
+
+        # Use checkpoint mode for compiled languages — build verification
+        # happens at repo level between tiers instead of per-file.
+        if is_compiled:
+            lifecycle_engine.checkpoint_mode = True
+
         try:
-            exec_result = await agent_manager.execute_with_lifecycle(
-                lifecycle_engine, global_graph,
+            exec_result = await agent_manager.execute_with_checkpoints(
+                lifecycle_engine,
+                global_graph,
+                tiers=tiers,
+                pipeline_def=GENERATE_PIPELINE,
             )
         except Exception as e:
             logger.exception("Task execution failed")

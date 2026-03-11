@@ -13,12 +13,14 @@ from core.agent_manager import AgentManager
 from core.event_bus import EventBus
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient, calculate_cost
-from core.models import ChangeAction, ChangeActionType, FileBlueprint, RepositoryBlueprint, TokenCost
+from core.models import ChangeAction, ChangeActionType, FileBlueprint, RepositoryBlueprint, TaskType, TokenCost
+from core.pipeline_definition import ENHANCE_PIPELINE
 from core.plan_approver import PlanApprover, PlanPendingApprovalError
 from core.repository_manager import RepositoryManager
 from core.run_reporter import RunReporter
 from core.sandbox_orchestrator import SandboxOrchestrator, SandboxUnavailableError
-from core.task_engine import ModificationTaskGraphBuilder
+from core.task_engine import EnhanceLifecyclePlanBuilder
+from core.tier_scheduler import TierScheduler
 from core.workspace_indexer import index_workspace
 from core.workspace_snapshot import WorkspaceSnapshot
 from memory.dependency_graph import DependencyGraphStore
@@ -32,13 +34,20 @@ logger = logging.getLogger(__name__)
 
 
 class EnhancePipeline:
-    """Executes the repository-modification workflow.
+    """Executes the repository-modification workflow using the unified executor.
+
+    Uses the same ``PipelineExecutor`` as the Generate pipeline, providing:
+      - Per-file Modify → Review → Fix lifecycle cycles
+      - Tier-based dependency scheduling
+      - Repo-level build checkpoints with error attribution
+      - Test generation and verification
+      - Global module review
 
     Phases:
       1. Analysis      — RepositoryAnalyzerAgent scans existing files
       2. Change Plan   — ChangePlannerAgent produces a structured diff plan
-      3. Task DAG      — ModificationTaskGraphBuilder builds execution order
-      4. Execution     — AgentManager performs targeted edits inside a snapshot
+      3. Lifecycle Plan — EnhanceLifecyclePlanBuilder builds engine + global DAG
+      4. Execution      — PipelineExecutor runs tiers, checkpoints, tests
       5. Finalise      — re-index workspace, write modify_report.json
     """
 
@@ -141,7 +150,11 @@ class EnhancePipeline:
         self._phase("Change Planning", "running")
         logger.info("[Phase 2] Planning targeted changes...")
 
-        planner = ChangePlannerAgent(llm_client=self._llm, repo_manager=repo_manager)
+        planner = ChangePlannerAgent(
+            llm_client=self._llm,
+            repo_manager=repo_manager,
+            embedding_store=embedding_store,
+        )
         try:
             change_plan = await planner.plan_changes(
                 user_request=user_prompt,
@@ -242,22 +255,34 @@ class EnhancePipeline:
                 len(change_plan.new_files),
             )
 
-        # ── Phase 3: Build modification task DAG ─────────────────────────────
+        # ── Phase 3: Build lifecycle plan ─────────────────────────────────────
         self._phase("Task Planning", "running")
-        logger.info("[Phase 3] Building modification task graph...")
+        logger.info("[Phase 3] Building lifecycle plan from change plan...")
 
-        mod_builder = ModificationTaskGraphBuilder(dep_store=dep_store)
-        task_graph = mod_builder.build_from_change_plan(change_plan, blueprint)
-        logger.info("Modification task graph: %d tasks", len(task_graph.tasks))
+        is_compiled = bool(lang_profile.build_command)
+        review_fixes = 3 if is_compiled else 2
 
+        enhance_builder = EnhanceLifecyclePlanBuilder(dep_store=dep_store)
+        lifecycle_engine, global_graph = enhance_builder.build(
+            change_plan,
+            blueprint,
+            max_review_fixes=review_fixes,
+            max_test_fixes=3,
+            compiled=is_compiled,
+        )
+
+        logger.info(
+            "Lifecycle engine: %d files, global DAG: %d tasks",
+            len(lifecycle_engine.get_stats()), len(global_graph.tasks),
+        )
         self._complete_phase("Task Planning")
         if self._live:
-            for task in task_graph.tasks.values():
+            for task in global_graph.tasks.values():
                 self._live.update_task(task.task_id, task.description, task.status.value)
 
-        # ── Phase 4: Execute modifications ────────────────────────────────────
+        # ── Phase 4: Execute via unified PipelineExecutor ─────────────────────
         self._phase("Code Modification & Review", "running")
-        logger.info("[Phase 4] Executing targeted modifications...")
+        logger.info("[Phase 4] Executing targeted modifications via unified executor...")
 
         sandbox = SandboxOrchestrator(self._settings)
         try:
@@ -288,12 +313,35 @@ class EnhancePipeline:
             event_bus=event_bus,
         )
 
+        # Compute dependency tiers for incremental build verification.
+        tier_scheduler = TierScheduler()
+        all_file_paths = list(lifecycle_engine._lifecycles.keys())
+        file_deps_for_tiers = {
+            fp: [d for d in lifecycle_engine._deps.get(fp, []) if d in set(all_file_paths)]
+            for fp in all_file_paths
+        }
+        tiers = tier_scheduler.compute_tiers(
+            file_paths=all_file_paths,
+            file_deps=file_deps_for_tiers,
+        )
+
+        # Use checkpoint mode for compiled languages — build verification
+        # happens at repo level between tiers instead of per-file.
+        if is_compiled:
+            lifecycle_engine.checkpoint_mode = True
+
         changed_files: list[str] = []
         diff_stats: dict[str, int] = {"lines_added": 0, "lines_removed": 0}
         try:
             async with WorkspaceSnapshot(self._settings.workspace_dir) as snap:
                 try:
-                    exec_result = await agent_manager.execute_graph(task_graph)
+                    exec_result = await agent_manager.execute_with_checkpoints(
+                        lifecycle_engine,
+                        global_graph,
+                        tiers=tiers,
+                        pipeline_def=ENHANCE_PIPELINE,
+                    )
+
                     changed_files = snap.get_changed_files()
                     diff_stats = snap.compute_diff_stats()
                     snap.commit()
@@ -328,19 +376,27 @@ class EnhancePipeline:
 
         elapsed = time.monotonic() - start_time
         stats = exec_result.get("stats", {})
-        success = stats.get("failed", 0) == 0 and stats.get("blocked", 0) == 0
+        # Code success: all files modified/generated, reviewed, and built.
+        # Test failures (tests_degraded) are a quality signal, not a hard gate.
+        code_success = (
+            stats.get("failed", 0) == 0
+            and stats.get("blocked", 0) == 0
+            and stats.get("lifecycle_failed", 0) == 0
+        )
+        success = code_success
 
         self._complete_phase("Finalize")
         logger.info(
-            "Modification pipeline %s | stats=%s | elapsed=%.1fs",
-            "SUCCEEDED" if success else "COMPLETED WITH ISSUES", stats, elapsed,
+            "Modification pipeline %s | code_success=%s | stats=%s | elapsed=%.1fs",
+            "SUCCEEDED" if success else "COMPLETED WITH ISSUES",
+            code_success, stats, elapsed,
         )
 
         token_cost = self._build_token_cost()
         RunReporter(self._settings.workspace_dir).write_modify_report(
             prompt=user_prompt,
             change_plan=change_plan,
-            task_graph=task_graph,
+            task_graph=global_graph,
             stats=stats,
             elapsed=elapsed,
             success=success,

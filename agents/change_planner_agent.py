@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from agents.base_agent import BaseAgent
 from core.ast_extractor import ASTExtractor
@@ -20,6 +20,9 @@ from core.models import (
     RepoAnalysis,
     TaskResult,
 )
+
+if TYPE_CHECKING:
+    from memory.embedding_store import EmbeddingStore
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +56,16 @@ class ChangePlannerAgent(BaseAgent):
     """
 
     role = AgentRole.CHANGE_PLANNER
+
+    def __init__(
+        self,
+        llm_client: Any,
+        repo_manager: Any,
+        *,
+        embedding_store: EmbeddingStore | None = None,
+    ) -> None:
+        super().__init__(llm_client=llm_client, repo_manager=repo_manager)
+        self._embedding_store = embedding_store
 
     @property
     def system_prompt(self) -> str:
@@ -184,13 +197,34 @@ class ChangePlannerAgent(BaseAgent):
         lines.append(f"Entry points: {analysis.entry_points}")
         lines.append("")
 
-        # Rank modules by keyword overlap with the user request so that
-        # relevant modules appear first and survive the budget cap.
+        # Rank modules by a hybrid of keyword overlap and semantic similarity.
+        # Embedding search surfaces conceptually related code even when the
+        # user's wording doesn't match the symbol names.
         request_tokens = set(user_request.lower().split())
 
-        def _module_score(m: ModuleInfo) -> int:
+        # Semantic boost: query the embedding store for files relevant to the request.
+        embedding_boost: dict[str, float] = {}
+        if self._embedding_store and user_request:
+            try:
+                hits = self._embedding_store.search(user_request, n_results=20)
+                if hits:
+                    max_dist = max(h["distance"] for h in hits) or 1.0
+                    for hit in hits:
+                        fp = hit.get("file", "")
+                        # Normalise distance to 0-1 score (lower distance = higher score)
+                        score = 1.0 - (hit["distance"] / max_dist) if max_dist else 0.0
+                        # Keep the best score per file across chunks
+                        embedding_boost[fp] = max(embedding_boost.get(fp, 0.0), score)
+            except Exception:
+                logger.debug("Embedding search failed, falling back to keyword-only ranking")
+
+        def _module_score(m: ModuleInfo) -> float:
+            # Keyword overlap score (integer count)
             symbols = " ".join([m.file] + m.classes + m.functions).lower()
-            return sum(1 for tok in request_tokens if tok in symbols)
+            keyword_score = sum(1 for tok in request_tokens if tok in symbols)
+            # Embedding similarity bonus (0-5 range to be comparable with keyword hits)
+            semantic_score = embedding_boost.get(m.file, 0.0) * 5
+            return keyword_score + semantic_score
 
         ranked_modules = sorted(analysis.modules, key=_module_score, reverse=True)
         shown = ranked_modules[:_MAX_CONTEXT_MODULES]

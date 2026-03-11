@@ -115,11 +115,22 @@ class FileLifecycle:
         *,
         max_review_fixes: int = 2,
         max_test_fixes: int = 3,
+        generation_task_type: str = "generate_file",
+        change_metadata: dict[str, Any] | None = None,
     ) -> None:
         self.file_path = file_path
         self.phase = FilePhase.PENDING
         self.max_review_fixes = max_review_fixes
         self.max_test_fixes = max_test_fixes
+
+        # Task type used in the GENERATING phase: "generate_file" for new
+        # files (CoderAgent) or "modify_file" for existing files (PatchAgent).
+        self.generation_task_type = generation_task_type
+
+        # Per-file metadata carried through the lifecycle.  Populated by
+        # EnhanceLifecyclePlanBuilder with change_type, change_description,
+        # target_function, target_class so PatchAgent receives full context.
+        self.change_metadata: dict[str, Any] = change_metadata or {}
 
         # Fix-cycle tracking
         self.review_fix_count = 0
@@ -291,6 +302,7 @@ class LifecycleEngine:
       - Provides ``get_actionable_files()`` for the executor to dispatch work
       - Aggregates event logs across all files for observability
       - Tracks which files skip testing (config, deploy layers)
+      - Supports checkpoint mode where BUILDING is handled at repo level
     """
 
     def __init__(
@@ -301,17 +313,31 @@ class LifecycleEngine:
         max_review_fixes: int = 2,
         max_test_fixes: int = 3,
         compiled: bool = False,
+        checkpoint_mode: bool = False,
+        file_overrides: dict[str, dict[str, Any]] | None = None,
     ) -> None:
         self._lifecycles: dict[str, FileLifecycle] = {}
         self._deps = file_deps
         self._skip_testing: set[str] = set()
         self._compiled = compiled
+        # When True, BUILDING is handled by repo-level checkpoints in
+        # PipelineExecutor, not per-file.  The REVIEW_PASSED transition
+        # still goes to BUILDING, but it's immediately auto-passed unless
+        # the checkpoint explicitly manages it.
+        self._checkpoint_mode = checkpoint_mode
+
+        # file_overrides allows per-file configuration of generation_task_type
+        # and change_metadata (used by the Enhance pipeline).
+        overrides = file_overrides or {}
 
         for path in file_paths:
+            fo = overrides.get(path, {})
             self._lifecycles[path] = FileLifecycle(
                 path,
                 max_review_fixes=max_review_fixes,
                 max_test_fixes=max_test_fixes,
+                generation_task_type=fo.get("generation_task_type", "generate_file"),
+                change_metadata=fo.get("change_metadata"),
             )
 
     # ── File configuration ──────────────────────────────────────────
@@ -319,6 +345,15 @@ class LifecycleEngine:
     def skip_testing(self, file_path: str) -> None:
         """Mark a file as not needing tests (config, deploy, test layers)."""
         self._skip_testing.add(file_path)
+
+    @property
+    def checkpoint_mode(self) -> bool:
+        """Whether build verification is handled at repo level."""
+        return self._checkpoint_mode
+
+    @checkpoint_mode.setter
+    def checkpoint_mode(self, value: bool) -> None:
+        self._checkpoint_mode = value
 
     # ── Lifecycle access ────────────────────────────────────────────
 
@@ -345,12 +380,25 @@ class LifecycleEngine:
             new_phase = lc.process_event(EventType.BUILD_PASSED)
             logger.info("[%s] build step skipped (interpreted language)", file_path)
 
+        # In checkpoint mode, BUILDING is handled at repo level by
+        # PipelineExecutor.  The file stays in BUILDING until the
+        # checkpoint explicitly triggers BUILD_PASSED or BUILD_FAILED.
+        # For non-checkpoint mode (legacy), the per-file BuildVerifierAgent
+        # handles it as before.
+
         # Config/deploy files skip testing
         if new_phase == FilePhase.TESTING and file_path in self._skip_testing:
             new_phase = lc.process_event(EventType.TEST_PASSED)
             logger.info("[%s] testing skipped (config/deploy layer)", file_path)
 
         return new_phase
+
+    def get_files_in_phase(self, phase: FilePhase) -> list[str]:
+        """Return all files currently in the given phase."""
+        return [
+            path for path, lc in self._lifecycles.items()
+            if lc.phase == phase
+        ]
 
     # ── Execution queries ───────────────────────────────────────────
 

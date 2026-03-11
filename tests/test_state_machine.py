@@ -29,6 +29,9 @@ class TestFileLifecycleHappyPath:
         assert lc.phase == FilePhase.REVIEWING
 
         lc.process_event(EventType.REVIEW_PASSED)
+        assert lc.phase == FilePhase.BUILDING
+
+        lc.process_event(EventType.BUILD_PASSED)
         assert lc.phase == FilePhase.TESTING
 
         lc.process_event(EventType.TEST_PASSED)
@@ -40,9 +43,10 @@ class TestFileLifecycleHappyPath:
         lc.process_event(EventType.DEPS_MET)
         lc.process_event(EventType.CODE_GENERATED)
         lc.process_event(EventType.REVIEW_PASSED)
+        lc.process_event(EventType.BUILD_PASSED)
         lc.process_event(EventType.TEST_PASSED)
 
-        assert len(lc.event_log) == 4
+        assert len(lc.event_log) == 5
         assert lc.event_log[0].event_type == EventType.DEPS_MET
         assert lc.event_log[0].phase_before == FilePhase.PENDING
         assert lc.event_log[0].phase_after == FilePhase.GENERATING
@@ -51,7 +55,8 @@ class TestFileLifecycleHappyPath:
     def test_zero_fix_counts_on_happy_path(self):
         lc = FileLifecycle("app.java")
         for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED,
-                     EventType.REVIEW_PASSED, EventType.TEST_PASSED]:
+                     EventType.REVIEW_PASSED, EventType.BUILD_PASSED,
+                     EventType.TEST_PASSED]:
             lc.process_event(evt)
         assert lc.review_fix_count == 0
         assert lc.test_fix_count == 0
@@ -83,7 +88,7 @@ class TestReviewFixCycle:
 
         assert lc.phase == FilePhase.REVIEWING
 
-    def test_review_pass_after_fix_goes_to_testing(self):
+    def test_review_pass_after_fix_goes_to_building(self):
         lc = FileLifecycle("svc.java")
         lc.process_event(EventType.DEPS_MET)
         lc.process_event(EventType.CODE_GENERATED)
@@ -91,7 +96,7 @@ class TestReviewFixCycle:
         lc.process_event(EventType.FIX_APPLIED)
         lc.process_event(EventType.REVIEW_PASSED)
 
-        assert lc.phase == FilePhase.TESTING
+        assert lc.phase == FilePhase.BUILDING
 
     def test_max_review_fixes_skips_to_testing(self):
         lc = FileLifecycle("svc.java", max_review_fixes=2)
@@ -121,6 +126,7 @@ class TestTestFixCycle:
         lc.process_event(EventType.DEPS_MET)
         lc.process_event(EventType.CODE_GENERATED)
         lc.process_event(EventType.REVIEW_PASSED)
+        lc.process_event(EventType.BUILD_PASSED)
         lc.process_event(EventType.TEST_FAILED, {"errors": "NullPointerException"})
 
         assert lc.phase == FilePhase.FIXING
@@ -130,7 +136,8 @@ class TestTestFixCycle:
 
     def test_fix_applied_routes_back_to_testing(self):
         lc = FileLifecycle("svc.java")
-        for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED, EventType.REVIEW_PASSED]:
+        for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED,
+                     EventType.REVIEW_PASSED, EventType.BUILD_PASSED]:
             lc.process_event(evt)
         lc.process_event(EventType.TEST_FAILED)
         lc.process_event(EventType.FIX_APPLIED)
@@ -139,7 +146,8 @@ class TestTestFixCycle:
 
     def test_alternating_fix_targets(self):
         lc = FileLifecycle("svc.java", max_test_fixes=6)
-        for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED, EventType.REVIEW_PASSED]:
+        for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED,
+                     EventType.REVIEW_PASSED, EventType.BUILD_PASSED]:
             lc.process_event(evt)
 
         assert lc.test_fix_target == "test"
@@ -158,7 +166,8 @@ class TestTestFixCycle:
 
     def test_max_test_fixes_marks_passed(self):
         lc = FileLifecycle("svc.java", max_test_fixes=2)
-        for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED, EventType.REVIEW_PASSED]:
+        for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED,
+                     EventType.REVIEW_PASSED, EventType.BUILD_PASSED]:
             lc.process_event(evt)
 
         # Fix cycles 1, 2
@@ -175,7 +184,8 @@ class TestTestFixCycle:
 
     def test_full_test_fix_then_pass(self):
         lc = FileLifecycle("svc.java")
-        for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED, EventType.REVIEW_PASSED]:
+        for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED,
+                     EventType.REVIEW_PASSED, EventType.BUILD_PASSED]:
             lc.process_event(evt)
 
         # First test fails, fix, re-test passes
@@ -200,6 +210,9 @@ class TestCombinedFixCycles:
         lc.process_event(EventType.FIX_APPLIED)
         lc.process_event(EventType.REVIEW_PASSED)
 
+        # Build passes
+        lc.process_event(EventType.BUILD_PASSED)
+
         # Test fails, fix, test passes
         lc.process_event(EventType.TEST_FAILED)
         lc.process_event(EventType.FIX_APPLIED)
@@ -209,7 +222,7 @@ class TestCombinedFixCycles:
         assert lc.review_fix_count == 1
         assert lc.test_fix_count == 1
         assert lc.total_fix_count == 2
-        assert len(lc.event_log) == 8
+        assert len(lc.event_log) == 9
 
 
 # ── FileLifecycle: error handling ───────────────────────────────────────
@@ -396,3 +409,183 @@ class TestLifecycleEngine:
         actionable = engine.get_actionable_files()
         assert len(actionable) == 1
         assert actionable[0][0] == "app.java"
+
+
+# ── LifecycleEngine: checkpoint mode ─────────────────────────────────
+
+class TestCheckpointMode:
+    """Tests for the checkpoint_mode flag and get_files_in_phase()."""
+
+    def test_checkpoint_mode_defaults_to_false(self):
+        engine = LifecycleEngine(
+            file_paths=["a.java"],
+            file_deps={"a.java": []},
+        )
+        assert not engine.checkpoint_mode
+
+    def test_checkpoint_mode_can_be_set(self):
+        engine = LifecycleEngine(
+            file_paths=["a.java"],
+            file_deps={"a.java": []},
+        )
+        engine.checkpoint_mode = True
+        assert engine.checkpoint_mode
+
+    def test_checkpoint_mode_via_constructor(self):
+        engine = LifecycleEngine(
+            file_paths=["a.java"],
+            file_deps={"a.java": []},
+            checkpoint_mode=True,
+        )
+        assert engine.checkpoint_mode
+
+    def test_get_files_in_phase(self):
+        engine = LifecycleEngine(
+            file_paths=["a.java", "b.java", "c.java"],
+            file_deps={"a.java": [], "b.java": [], "c.java": []},
+        )
+        # All start in PENDING
+        assert set(engine.get_files_in_phase(FilePhase.PENDING)) == {"a.java", "b.java", "c.java"}
+        assert engine.get_files_in_phase(FilePhase.GENERATING) == []
+
+        # Move a.java to GENERATING
+        engine.process_event("a.java", EventType.DEPS_MET)
+        assert "a.java" in engine.get_files_in_phase(FilePhase.GENERATING)
+        assert "a.java" not in engine.get_files_in_phase(FilePhase.PENDING)
+
+    def test_compiled_checkpoint_mode_keeps_building(self):
+        """In checkpoint mode for compiled langs, BUILDING files stay in BUILDING."""
+        engine = LifecycleEngine(
+            file_paths=["a.java"],
+            file_deps={"a.java": []},
+            compiled=True,
+            checkpoint_mode=True,
+        )
+        engine.process_event("a.java", EventType.DEPS_MET)
+        engine.process_event("a.java", EventType.CODE_GENERATED)
+        engine.process_event("a.java", EventType.REVIEW_PASSED)
+
+        # In checkpoint mode, the file reaches BUILDING and stays there
+        # (the checkpoint will explicitly call BUILD_PASSED later)
+        lc = engine.get_lifecycle("a.java")
+        assert lc.phase == FilePhase.BUILDING
+
+    def test_non_compiled_still_skips_building(self):
+        """For interpreted languages, BUILDING is still auto-skipped."""
+        engine = LifecycleEngine(
+            file_paths=["a.py"],
+            file_deps={"a.py": []},
+            compiled=False,
+            checkpoint_mode=True,
+        )
+        engine.process_event("a.py", EventType.DEPS_MET)
+        engine.process_event("a.py", EventType.CODE_GENERATED)
+        engine.process_event("a.py", EventType.REVIEW_PASSED)
+
+        lc = engine.get_lifecycle("a.py")
+        # Should skip BUILDING and go to TESTING
+        assert lc.phase == FilePhase.TESTING
+
+
+# ── FileLifecycle: modify mode & change metadata ─────────────────────
+
+class TestFileLifecycleModifyMode:
+    """Tests for generation_task_type and change_metadata on FileLifecycle."""
+
+    def test_default_generation_task_type(self):
+        lc = FileLifecycle("app.java")
+        assert lc.generation_task_type == "generate_file"
+
+    def test_modify_file_task_type(self):
+        lc = FileLifecycle("app.java", generation_task_type="modify_file")
+        assert lc.generation_task_type == "modify_file"
+
+    def test_change_metadata_defaults_to_empty(self):
+        lc = FileLifecycle("app.java")
+        assert lc.change_metadata == {}
+
+    def test_change_metadata_stored(self):
+        meta = {"change_type": "modify_function", "target_function": "handle_request"}
+        lc = FileLifecycle("app.java", change_metadata=meta)
+        assert lc.change_metadata == meta
+        assert lc.change_metadata["target_function"] == "handle_request"
+
+    def test_modify_lifecycle_full_happy_path(self):
+        """A modify_file lifecycle follows the same phase transitions."""
+        lc = FileLifecycle("app.java", generation_task_type="modify_file",
+                           change_metadata={"change_type": "add_method"})
+        lc.process_event(EventType.DEPS_MET)
+        assert lc.phase == FilePhase.GENERATING
+        lc.process_event(EventType.CODE_GENERATED)
+        assert lc.phase == FilePhase.REVIEWING
+        lc.process_event(EventType.REVIEW_PASSED)
+        assert lc.phase == FilePhase.BUILDING
+        lc.process_event(EventType.BUILD_PASSED)
+        assert lc.phase == FilePhase.TESTING
+        lc.process_event(EventType.TEST_PASSED)
+        assert lc.phase == FilePhase.PASSED
+
+    def test_change_metadata_none_becomes_empty_dict(self):
+        lc = FileLifecycle("app.java", change_metadata=None)
+        assert lc.change_metadata == {}
+
+
+# ── LifecycleEngine: file_overrides ──────────────────────────────────
+
+class TestLifecycleEngineFileOverrides:
+    """Tests for LifecycleEngine file_overrides parameter."""
+
+    def test_overrides_set_generation_task_type(self):
+        engine = LifecycleEngine(
+            file_paths=["existing.java", "new.java"],
+            file_deps={"existing.java": [], "new.java": []},
+            file_overrides={
+                "existing.java": {"generation_task_type": "modify_file"},
+            },
+        )
+        assert engine.get_lifecycle("existing.java").generation_task_type == "modify_file"
+        assert engine.get_lifecycle("new.java").generation_task_type == "generate_file"
+
+    def test_overrides_set_change_metadata(self):
+        meta = {"change_type": "modify_function", "target_class": "UserService"}
+        engine = LifecycleEngine(
+            file_paths=["svc.java"],
+            file_deps={"svc.java": []},
+            file_overrides={
+                "svc.java": {"change_metadata": meta},
+            },
+        )
+        lc = engine.get_lifecycle("svc.java")
+        assert lc.change_metadata == meta
+
+    def test_overrides_combined(self):
+        engine = LifecycleEngine(
+            file_paths=["a.java", "b.java"],
+            file_deps={"a.java": [], "b.java": ["a.java"]},
+            file_overrides={
+                "a.java": {
+                    "generation_task_type": "modify_file",
+                    "change_metadata": {"change_type": "add_method"},
+                },
+                "b.java": {
+                    "generation_task_type": "modify_file",
+                    "change_metadata": {"change_type": "rename_function"},
+                },
+            },
+        )
+        lc_a = engine.get_lifecycle("a.java")
+        lc_b = engine.get_lifecycle("b.java")
+        assert lc_a.generation_task_type == "modify_file"
+        assert lc_b.generation_task_type == "modify_file"
+        assert lc_a.change_metadata["change_type"] == "add_method"
+        assert lc_b.change_metadata["change_type"] == "rename_function"
+
+    def test_no_overrides_uses_defaults(self):
+        engine = LifecycleEngine(
+            file_paths=["app.java"],
+            file_deps={"app.java": []},
+            file_overrides=None,
+        )
+        lc = engine.get_lifecycle("app.java")
+        assert lc.generation_task_type == "generate_file"
+        assert lc.change_metadata == {}

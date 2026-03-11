@@ -698,3 +698,158 @@ class ModificationTaskGraphBuilder:
             previous.append(target)
 
         return conflicts
+
+
+class EnhanceLifecyclePlanBuilder:
+    """Builds a LifecycleEngine + global TaskGraph from a ChangePlan.
+
+    This is the Enhance-pipeline counterpart of ``LifecyclePlanBuilder``.
+    Instead of creating GENERATE_FILE lifecycles for every blueprint file, it
+    creates:
+      - MODIFY_FILE lifecycles for existing files being changed
+      - GENERATE_FILE lifecycles for brand-new files
+      - A global TaskGraph with just a module review sentinel
+
+    The resulting ``(LifecycleEngine, TaskGraph)`` can be passed directly to
+    ``AgentManager.execute_with_checkpoints()`` so the Enhance pipeline uses
+    the same unified executor, tier-based scheduling, build checkpoints, and
+    review→fix cycles as the Generate pipeline.
+    """
+
+    def __init__(self, dep_store: DependencyGraphStore | None = None) -> None:
+        self._next_id = 1
+        self._dep_store = dep_store
+
+    def _alloc_id(self) -> int:
+        tid = self._next_id
+        self._next_id += 1
+        return tid
+
+    def build(
+        self,
+        change_plan: ChangePlan,
+        blueprint: RepositoryBlueprint,
+        *,
+        max_review_fixes: int = 2,
+        max_test_fixes: int = 3,
+        compiled: bool = False,
+    ) -> tuple[LifecycleEngine, TaskGraph]:
+        """Build a lifecycle engine + global task graph from a change plan.
+
+        Returns:
+            (lifecycle_engine, global_task_graph)
+        """
+        # ── Collect files and their metadata ────────────────────────
+        new_file_paths = {nf.path for nf in change_plan.new_files}
+
+        # Merge changes that target the same symbol in the same file.
+        mod_builder = ModificationTaskGraphBuilder(dep_store=self._dep_store)
+        conflicts = mod_builder._detect_conflicts(change_plan.changes)
+        if conflicts:
+            for conflict in conflicts:
+                logger.warning("Change conflict detected: %s", conflict)
+            change_plan.risk_notes.extend(conflicts)
+        resolved_changes = mod_builder._merge_conflicting_changes(change_plan.changes)
+
+        # ── Build per-file overrides ─────────────────────────────────
+        # Group changes by file so we can build consolidated metadata.
+        changes_by_file: dict[str, list[ChangeAction]] = {}
+        for change in resolved_changes:
+            if change.file not in new_file_paths:
+                changes_by_file.setdefault(change.file, []).append(change)
+
+        file_overrides: dict[str, dict[str, Any]] = {}
+        file_paths: list[str] = []
+        file_deps: dict[str, list[str]] = {}
+
+        # Existing files → MODIFY_FILE lifecycle
+        for file_path, changes in changes_by_file.items():
+            file_paths.append(file_path)
+            combined_desc = "; ".join(c.description for c in changes)
+            # Union all change dependencies
+            deps: list[str] = []
+            seen_deps: set[str] = set()
+            for c in changes:
+                for d in c.depends_on:
+                    if d not in seen_deps and d != file_path:
+                        deps.append(d)
+                        seen_deps.add(d)
+            file_deps[file_path] = deps
+
+            file_overrides[file_path] = {
+                "generation_task_type": "modify_file",
+                "change_metadata": {
+                    "change_type": changes[0].type.value,
+                    "change_description": combined_desc,
+                    "target_function": changes[0].function,
+                    "target_class": changes[0].class_name,
+                },
+            }
+
+        # New files → GENERATE_FILE lifecycle (default)
+        for nf in change_plan.new_files:
+            file_paths.append(nf.path)
+            file_deps[nf.path] = [d for d in nf.depends_on if d in set(file_paths)]
+
+        # ── Filter deps to only internal files ───────────────────────
+        all_file_set = set(file_paths)
+        file_deps = {
+            fp: [d for d in deps if d in all_file_set]
+            for fp, deps in file_deps.items()
+        }
+
+        # ── Build lifecycle engine ───────────────────────────────────
+        engine = LifecycleEngine(
+            file_paths=file_paths,
+            file_deps=file_deps,
+            max_review_fixes=max_review_fixes,
+            max_test_fixes=max_test_fixes,
+            compiled=compiled,
+            file_overrides=file_overrides,
+        )
+
+        # Mark test files and config files to skip testing
+        known_bp_paths = {fb.path: fb for fb in blueprint.file_blueprints}
+        for fp in file_paths:
+            fb = known_bp_paths.get(fp)
+            if fb and fb.layer in ("test", "config", "deploy"):
+                engine.skip_testing(fp)
+            elif ModificationTaskGraphBuilder._is_test_file(fp):
+                engine.skip_testing(fp)
+
+        # ── Build global task graph ──────────────────────────────────
+        global_graph = TaskGraph()
+
+        # Sentinel task: marks lifecycle completion
+        lifecycle_done = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.REVIEW_FILE,
+            file="*",
+            description="[sentinel] All per-file lifecycles completed",
+            dependencies=[],
+            metadata={"sentinel": True},
+        )
+        global_graph.add_task(lifecycle_done)
+
+        # Module consistency review
+        mod_review = Task(
+            task_id=self._alloc_id(),
+            task_type=TaskType.REVIEW_MODULE,
+            file="*",
+            description="Module consistency review of modifications",
+            dependencies=[lifecycle_done.task_id],
+        )
+        global_graph.add_task(mod_review)
+
+        errors = global_graph.validate()
+        if errors:
+            raise ValueError(f"Enhance global task graph validation failed: {errors}")
+
+        logger.info(
+            "Built enhance lifecycle plan: %d files (%d modify, %d new) + %d global tasks",
+            len(file_paths),
+            len(changes_by_file),
+            len(change_plan.new_files),
+            len(global_graph.tasks),
+        )
+        return engine, global_graph
