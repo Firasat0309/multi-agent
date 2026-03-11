@@ -746,6 +746,9 @@ class LLMClient:
             self._get_client(), full_system, conversation,
             self.config.temperature, max_tokens,
         )
+        # Accumulate token counts (bypassed because _gemini_generate is called directly)
+        self.total_input_tokens += response.usage.get("input_tokens", 0)
+        self.total_output_tokens += response.usage.get("output_tokens", 0)
         text = response.content.strip()
 
         # Try to detect a tool-call JSON envelope

@@ -313,6 +313,7 @@ class CoderAgent(BaseAgent):
         review_errors: list[str] = context.task.metadata.get("review_errors", [])
         review_output: str = context.task.metadata.get("review_output", "")
         build_errors: str = context.task.metadata.get("build_errors", "")
+        test_errors: str = context.task.metadata.get("test_errors", "")
         fix_trigger: str = context.task.metadata.get("fix_trigger", "review")
 
         # Read current file content from the repo (non-blocking)
@@ -331,14 +332,16 @@ class CoderAgent(BaseAgent):
         fb = context.file_blueprint
         lang = (fb.language if fb else None) or context.blueprint.tech_stack.get("language", "python")
         profile = get_language_profile(lang)
-        logger.info(f"Fixing {file_path} based on {len(review_errors)} review issue(s)")
+        logger.info(f"Fixing {file_path} based on fix_trigger={fix_trigger!r}")
 
         if fix_trigger == "build" and build_errors:
             issues_text = f"Compilation/build errors to fix:\n{build_errors}"
+        elif fix_trigger == "test" and test_errors:
+            issues_text = f"Test failures to fix:\n{test_errors}"
         elif review_errors:
             issues_text = "\n".join(f"- {e}" for e in review_errors)
         else:
-            issues_text = review_output
+            issues_text = review_output or test_errors
 
         # For compiled languages add an explicit post-fix syntax checklist so the
         # model validates its own output before returning.

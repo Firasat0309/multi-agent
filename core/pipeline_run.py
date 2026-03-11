@@ -134,7 +134,7 @@ class RunPipeline:
 
         logger.info(
             "Lifecycle engine: %d files, global DAG: %d tasks",
-            len(lifecycle_engine.get_stats()), len(global_graph.tasks),
+            sum(lifecycle_engine.get_stats().values()), len(global_graph.tasks),
         )
         self._complete_phase("Task Planning")
         if self._live:

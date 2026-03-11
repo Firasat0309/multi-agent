@@ -125,6 +125,7 @@ class EnhancePipeline:
             description=repo_analysis.summary,
             architecture_style=repo_analysis.architecture_style,
             tech_stack=repo_analysis.tech_stack,
+            architecture_doc=repo_analysis.summary,
             file_blueprints=[
                 FileBlueprint(
                     path=m.file,
