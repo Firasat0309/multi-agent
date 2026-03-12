@@ -526,6 +526,12 @@ class AgentManager:
             engine.process_event(file_path, EventType.DEPS_MET)
             phase = lc.phase  # now GENERATING
 
+        # --skip-reviewer: auto-pass review phases
+        if phase == FilePhase.REVIEWING and "reviewer" in self._settings.skip_agents:
+            logger.info("[%s] Skipping review (--skip-reviewer)", file_path)
+            engine.process_event(file_path, EventType.REVIEW_PASSED)
+            return
+
         # Map phase → task type + event on success/failure.
         # For GENERATING: use the lifecycle's generation_task_type which is
         # MODIFY_FILE for the Enhance pipeline, GENERATE_FILE for Generate.

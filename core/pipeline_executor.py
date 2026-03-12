@@ -224,6 +224,7 @@ class PipelineExecutor:
 
         # ── Phase loop ──────────────────────────────────────────────────────
         tier_hard_blocked = False
+        skip_agents = self._settings.skip_agents
 
         for phase in phases:
             if tier_hard_blocked:
@@ -240,6 +241,19 @@ class PipelineExecutor:
                 continue
 
             first_tt = phase.file_tasks[0].task_type if phase.file_tasks else None
+
+            # --skip-tester: skip testing phases entirely.
+            if "tester" in skip_agents and first_tt == TaskType.GENERATE_TEST:
+                logger.info(
+                    "=== Phase '%s' skipped (--skip-tester) ===", phase.name,
+                )
+                # Move testable files straight to PASSED so they don't end
+                # up stuck in TESTING/BUILDING.
+                for path in list(engine._lifecycles.keys()):
+                    lc = engine.get_lifecycle(path)
+                    if lc.phase in (FilePhase.BUILDING, FilePhase.TESTING):
+                        engine.process_event(path, EventType.TEST_PASSED)
+                continue
             # Checkpoints are only meaningful for compiled languages.
             ck_def = phase.checkpoint if self._compiled else None
 

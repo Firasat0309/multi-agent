@@ -51,6 +51,8 @@ def cli(verbose: bool) -> None:
     default=False,
     help="Allow running without Docker isolation (NOT recommended for untrusted prompts)",
 )
+@click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
+@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent")
 def generate(
     prompt: str,
     workspace: str,
@@ -60,9 +62,17 @@ def generate(
     max_agents: int,
     no_interactive: bool,
     allow_host_execution: bool,
+    skip_tester: bool,
+    skip_reviewer: bool,
 ) -> None:
     """Generate a backend project from a natural language prompt."""
     try:
+        skip = set()
+        if skip_tester:
+            skip.add("tester")
+        if skip_reviewer:
+            skip.add("reviewer")
+
         settings = Settings(
             workspace_dir=Path(workspace).resolve(),
             llm=LLMConfig(
@@ -72,6 +82,7 @@ def generate(
             sandbox=SandboxConfig(sandbox_type=SandboxType(sandbox)),
             max_concurrent_agents=max_agents,
             allow_host_execution=allow_host_execution or sandbox == "local",
+            skip_agents=frozenset(skip),
         )
 
         pipeline = Pipeline(settings, interactive=not no_interactive)
@@ -143,6 +154,8 @@ def status(workspace: str) -> None:
     default=False,
     help="Allow running without Docker isolation",
 )
+@click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
+@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent")
 def enhance(
     prompt: str,
     workspace: str,
@@ -152,6 +165,8 @@ def enhance(
     max_agents: int,
     no_interactive: bool,
     allow_host_execution: bool,
+    skip_tester: bool,
+    skip_reviewer: bool,
 ) -> None:
     """Modify an existing project based on a natural language prompt.
 
@@ -173,6 +188,12 @@ def enhance(
         sys.exit(1)
 
     try:
+        skip = set()
+        if skip_tester:
+            skip.add("tester")
+        if skip_reviewer:
+            skip.add("reviewer")
+
         settings = Settings(
             workspace_dir=ws,
             llm=LLMConfig(
@@ -182,6 +203,7 @@ def enhance(
             sandbox=SandboxConfig(sandbox_type=SandboxType(sandbox)),
             max_concurrent_agents=max_agents,
             allow_host_execution=allow_host_execution or sandbox == "local",
+            skip_agents=frozenset(skip),
         )
 
         pipeline = Pipeline(settings, interactive=not no_interactive)

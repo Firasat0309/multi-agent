@@ -88,6 +88,9 @@ class Settings:
     # Number of build attempts per tier checkpoint (1 initial + retries).
     # Increase for flaky compilers; decrease to fail-fast during development.
     build_checkpoint_retries: int = 3
+    # Agent phases the user wants to skip entirely.  Recognised values:
+    # "tester", "reviewer".  Phases listed here are bypassed in the executor.
+    skip_agents: frozenset[str] = field(default_factory=frozenset)
 
     @classmethod
     def from_env(cls) -> Settings:
