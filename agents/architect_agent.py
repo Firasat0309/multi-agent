@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -138,6 +139,44 @@ class ArchitectAgent(BaseAgent):
         lower = prompt.lower()
         return any(kw in lower for kw in cls._DB_KEYWORDS)
 
+    async def _llm_with_heartbeat(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        max_tokens: int,
+        label: str = "LLM call",
+    ):
+        """Call ``self.llm.generate`` with periodic heartbeat logs.
+
+        Long LLM calls (especially on Gemini) can take 30-90s.  Without
+        visible output the user thinks the pipeline is stuck.
+        """
+        _HEARTBEAT = 15  # seconds between "still waiting" messages
+        done = asyncio.Event()
+
+        async def _heartbeat() -> None:
+            elapsed = 0
+            while not done.is_set():
+                await asyncio.sleep(_HEARTBEAT)
+                if done.is_set():
+                    break
+                elapsed += _HEARTBEAT
+                logger.info(
+                    "⏳ Waiting for %s response… (%ds elapsed)",
+                    label, elapsed,
+                )
+
+        hb = asyncio.create_task(_heartbeat())
+        try:
+            return await self.llm.generate(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                max_tokens=max_tokens,
+            )
+        finally:
+            done.set()
+            hb.cancel()
+
     async def design_architecture(self, user_prompt: str) -> RepositoryBlueprint:
         """Design a complete repository blueprint from user requirements.
 
@@ -161,10 +200,12 @@ class ArchitectAgent(BaseAgent):
             )
 
         # Architecture responses are large — use 16k tokens to avoid truncation.
-        response = await self.llm.generate(
+        logger.info("Sending architecture request to LLM (max_tokens=16384) — this may take 30-90s …")
+        response = await self._llm_with_heartbeat(
             system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
             user_prompt=effective_prompt,
             max_tokens=16384,
+            label="architecture design",
         )
         self._metrics["llm_calls"] += 1
         self._metrics["tokens_used"] += sum(response.usage.values())
@@ -174,7 +215,7 @@ class ArchitectAgent(BaseAgent):
         # If still truncated, request one continuation
         if response.stop_reason in ("max_tokens", "length", "MAX_TOKENS"):
             logger.warning("Architecture response truncated — requesting continuation")
-            continuation = await self.llm.generate(
+            continuation = await self._llm_with_heartbeat(
                 system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
                 user_prompt=(
                     f"{effective_prompt}\n\n"
@@ -184,6 +225,7 @@ class ArchitectAgent(BaseAgent):
                     f"Output only the continuation — no preamble."
                 ),
                 max_tokens=8192,
+                label="architecture continuation",
             )
             self._metrics["llm_calls"] += 1
             self._metrics["tokens_used"] += sum(continuation.usage.values())

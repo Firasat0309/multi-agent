@@ -527,7 +527,7 @@ class AgentManager:
             phase = lc.phase  # now GENERATING
 
         # --skip-reviewer: auto-pass review phases
-        if phase == FilePhase.REVIEWING and "reviewer" in self._settings.skip_agents:
+        if phase == FilePhase.REVIEWING and "reviewer" in self.settings.skip_agents:
             logger.info("[%s] Skipping review (--skip-reviewer)", file_path)
             engine.process_event(file_path, EventType.REVIEW_PASSED)
             return

@@ -75,7 +75,26 @@ class RunPipeline:
         architect = ArchitectAgent(llm_client=self._llm, repo_manager=repo_manager)
 
         try:
-            blueprint = await architect.design_architecture(user_prompt)
+            # Timeout the architecture LLM call so the pipeline never hangs
+            # indefinitely if the API endpoint stalls.
+            _arch_timeout = self._settings.phase_timeout_seconds
+            blueprint = await asyncio.wait_for(
+                architect.design_architecture(user_prompt),
+                timeout=_arch_timeout,
+            )
+        except asyncio.TimeoutError:
+            msg = (
+                f"Architecture design timed out after {_arch_timeout}s. "
+                "The LLM provider may be overloaded — try again later."
+            )
+            logger.error(msg)
+            self._fail_phase("Architecture Design", msg)
+            return PipelineResult(
+                success=False,
+                workspace_path=self._settings.workspace_dir,
+                errors=[msg],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
         except (LLMConfigError, Exception) as e:
             is_config = isinstance(e, LLMConfigError)
             if not is_config:
