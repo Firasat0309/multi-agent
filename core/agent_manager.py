@@ -212,6 +212,8 @@ class AgentManager:
 
         # For FIX_CODE tasks, pull review findings from the review task's result.
         # If the review passed, skip the fix entirely — no LLM call needed.
+        # For module-level reviews (file="*"), also skip files not mentioned
+        # in the review errors to avoid unnecessary full-file rewrites.
         if task.task_type == TaskType.FIX_CODE and "review_task_id" in task.metadata:
             review_task = task_graph.get_task(task.metadata["review_task_id"])
             if review_task and review_task.result:
@@ -227,8 +229,35 @@ class AgentManager:
                             task.task_id, task.description, "completed",
                         )
                     return
-                task.metadata["review_errors"] = review_task.result.errors
-                task.metadata["review_output"] = review_task.result.output
+
+                # For module reviews (review covers all files), only fix this
+                # file if it is actually mentioned in the review findings.
+                # This prevents needless full-file rewrites of unrelated files.
+                all_errors = review_task.result.errors or []
+                review_output = review_task.result.output or ""
+                file_mentioned = (
+                    not task.file
+                    or task.file == "*"
+                    or any(task.file in err for err in all_errors)
+                    or task.file in review_output
+                )
+                if not file_mentioned:
+                    logger.info(
+                        "FIX_CODE task %d skipped — file %s not mentioned in review findings",
+                        task.task_id, task.file,
+                    )
+                    task_graph.mark_completed(task.task_id)
+                    self._metrics["tasks_completed"] += 1
+                    if self._live:
+                        self._live.update_task(
+                            task.task_id, task.description, "completed",
+                        )
+                    return
+
+                # Forward only errors relevant to this file
+                file_errors = [e for e in all_errors if task.file in e] if task.file else all_errors
+                task.metadata["review_errors"] = file_errors or all_errors
+                task.metadata["review_output"] = review_output
 
         # Acquire a per-file lock for write tasks to prevent concurrent
         # modifications to the same file from racing.  Read-only tasks
