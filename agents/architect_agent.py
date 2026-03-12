@@ -38,7 +38,7 @@ class ArchitectAgent(BaseAgent):
             '  "name": "project-name",\n'
             '  "description": "what this project does",\n'
             '  "architecture_style": "REST|GraphQL|gRPC",\n'
-            '  "tech_stack": {"language": "<detected-language>", "framework": "<framework>", "db": "postgresql", ...},\n'
+            '  "tech_stack": {"language": "<detected-language>", "framework": "<framework>", "db": "h2", ...},\n'
             '  "folder_structure": ["controllers", "services", "repositories", "models", "config"],\n'
             '  "file_blueprints": [\n'
             "    {\n"
@@ -53,6 +53,11 @@ class ArchitectAgent(BaseAgent):
             '  "architecture_doc": "# Architecture\\n..."\n'
             "}\n\n"
             "Rules:\n"
+            "- DATABASE DEFAULT: If the user does not specify a database, always use H2 in-memory database "
+            "(set \"db\": \"h2\" in tech_stack). Configure it as an embedded in-memory datasource "
+            "(e.g. spring.datasource.url=jdbc:h2:mem:testdb for Spring Boot). "
+            "Only switch to a different database if the user explicitly names one "
+            "(e.g. PostgreSQL, MySQL, MongoDB, Redis, SQLite, Oracle, etc.).\n"
             "- Use the correct file extensions for the chosen language (.py, .java, .go, .ts, .rs, .cs)\n"
             "- Use the idiomatic framework and folder conventions for that language\n"
             "- Design clean layered architecture (models -> repositories -> services -> controllers)\n"
@@ -86,6 +91,20 @@ class ArchitectAgent(BaseAgent):
             logger.exception("ArchitectAgent.execute failed")
             return TaskResult(success=False, errors=[str(exc)])
 
+    # Known database keywords — used to detect an explicit DB choice in user prompts.
+    _DB_KEYWORDS: frozenset[str] = frozenset({
+        "postgresql", "postgres", "mysql", "mariadb", "oracle", "sqlite",
+        "mongodb", "redis", "cassandra", "dynamodb", "mssql", "sql server",
+        "cockroachdb", "firestore", "firebase", "supabase", "neo4j", "h2",
+        "elasticsearch", "clickhouse", "timescaledb", "planetscale",
+    })
+
+    @classmethod
+    def _user_specified_db(cls, prompt: str) -> bool:
+        """Return True if the prompt explicitly mentions a database technology."""
+        lower = prompt.lower()
+        return any(kw in lower for kw in cls._DB_KEYWORDS)
+
     async def design_architecture(self, user_prompt: str) -> RepositoryBlueprint:
         """Design a complete repository blueprint from user requirements.
 
@@ -96,10 +115,22 @@ class ArchitectAgent(BaseAgent):
         """
         logger.info("Designing architecture from user prompt")
 
+        # Belt-and-suspenders: if the user never mentioned a DB, append an
+        # explicit instruction so the LLM cannot silently default to Postgres.
+        effective_prompt = user_prompt
+        if not self._user_specified_db(user_prompt):
+            logger.info("No database specified in prompt — defaulting to H2 in-memory")
+            effective_prompt = (
+                user_prompt
+                + "\n\n[SYSTEM NOTE: The user did not specify a database. "
+                "Use H2 in-memory database (db: 'h2'). "
+                "Configure it as an embedded in-memory datasource.]"
+            )
+
         # Architecture responses are large — use 16k tokens to avoid truncation.
         response = await self.llm.generate(
             system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
-            user_prompt=user_prompt,
+            user_prompt=effective_prompt,
             max_tokens=16384,
         )
         self._metrics["llm_calls"] += 1
@@ -113,7 +144,7 @@ class ArchitectAgent(BaseAgent):
             continuation = await self.llm.generate(
                 system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
                 user_prompt=(
-                    f"{user_prompt}\n\n"
+                    f"{effective_prompt}\n\n"
                     f"Your previous JSON response was cut off. Here is the end:\n"
                     f"```\n{text[-500:]}\n```\n"
                     f"Continue EXACTLY from the cut-off point to complete the JSON. "

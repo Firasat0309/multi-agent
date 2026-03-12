@@ -25,7 +25,7 @@ class RepositoryBlueprint:
     name: str
     description: str
     architecture_style: str  # REST, GraphQL, gRPC, etc.
-    tech_stack: dict[str, str] = field(default_factory=dict)  # e.g. {"db": "postgresql"}
+    tech_stack: dict[str, str] = field(default_factory=dict)  # e.g. {"db": "h2"}
     folder_structure: list[str] = field(default_factory=list)
     file_blueprints: list[FileBlueprint] = field(default_factory=list)
     architecture_doc: str = ""

@@ -279,6 +279,13 @@ class CoderAgent(BaseAgent):
         # For pom.xml, enforce correct Java 17 configuration with up-to-date Maven fields
         pom_hint = ""
         if Path(fb.path).name.lower() == "pom.xml":
+            db_hint = ""
+            if tech.get("db", "").lower() == "h2":
+                db_hint = (
+                    "\n- Include the H2 in-memory database dependency with runtime scope:\n"
+                    "  <dependency><groupId>com.h2database</groupId>"
+                    "<artifactId>h2</artifactId><scope>runtime</scope></dependency>"
+                )
             pom_hint = (
                 "\nIMPORTANT Java 17 requirements for pom.xml:\n"
                 "- Use Spring Boot parent 3.x (e.g. 3.2.x) which targets Java 17 by default\n"
@@ -288,7 +295,8 @@ class CoderAgent(BaseAgent):
                 "- In the maven-compiler-plugin configuration use <release>17</release> "
                 "(NOT <source>/<target> inside the plugin — use the properties instead)\n"
                 "- Use <maven.compiler.release>17</maven.compiler.release> as the canonical property\n"
-                "- Include all required Spring Boot starter dependencies (web, data-jpa, validation, test)\n"
+                "- Include all required Spring Boot starter dependencies (web, data-jpa, validation, test)"
+                + db_hint + "\n"
                 "- The pom.xml must be complete and valid — do not truncate it"
             )
 
