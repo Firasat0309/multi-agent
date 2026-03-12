@@ -96,6 +96,8 @@ class TestLanguageProfileMethods:
         assert not PYTHON.matches_extension("models/User.java")
         assert JAVA.matches_extension("models/User.java")
         assert GO.matches_extension("handlers/user.go")
+        assert TYPESCRIPT.matches_extension("components/Button.ts")
+        assert TYPESCRIPT.matches_extension("components/Button.tsx")
 
     def test_to_module_path(self):
         assert PYTHON.to_module_path("models/user.py") == "models.user"

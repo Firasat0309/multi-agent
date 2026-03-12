@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import dataclasses
 import logging
 import time
 from pathlib import Path
@@ -30,6 +32,8 @@ from core.models import (
     AgentContext,
 )
 from core.repository_manager import RepositoryManager
+from core.workspace_indexer import index_workspace
+from memory.embedding_store import EmbeddingStore
 
 if TYPE_CHECKING:
     from core.live_console import LiveConsole
@@ -79,6 +83,16 @@ class FrontendPipeline:
         workspace = frontend_workspace or (self._settings.workspace_dir / "frontend")
         workspace.mkdir(parents=True, exist_ok=True)
         repo_manager = RepositoryManager(workspace)
+
+        # Wire EmbeddingStore so every write_file call indexes the component
+        # for semantic context queries used by later-tier ComponentGeneratorAgent tasks.
+        _fe_embedding_store = EmbeddingStore(
+            persist_dir=str(workspace / ".chroma"),
+            embedding_model=self._settings.memory.embedding_model,
+        )
+        asyncio.ensure_future(asyncio.to_thread(_fe_embedding_store._ensure_client))
+        repo_manager._embedding_store = _fe_embedding_store
+
         errors: list[str] = []
         metrics: dict = {}
         component_plan: ComponentPlan | None = None
@@ -252,6 +266,18 @@ class FrontendPipeline:
             logger.exception("State management generation failed")
             errors.append(f"State management failed: {exc}")
             self._fail_phase("FE: State Management", str(exc))
+
+        # ── Finalise: persist dep graph, repo index, and embeddings ──────────
+        try:
+            fe_settings = copy.copy(self._settings)
+            fe_settings.workspace_dir = workspace
+            fe_settings.memory = dataclasses.replace(
+                self._settings.memory,
+                chroma_persist_dir=str(workspace / ".chroma"),
+            )
+            index_workspace(repo_manager, fe_settings)
+        except Exception:
+            logger.warning("Frontend workspace indexing failed", exc_info=True)
 
         success = not any(
             e for e in errors
