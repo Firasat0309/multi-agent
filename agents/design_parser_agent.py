@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 from typing import Any
+
+import httpx
+
+_FIGMA_FILE_RE = re.compile(r"figma\.com/(?:file|design)/([A-Za-z0-9_-]+)")
+_FIGMA_API_BASE = "https://api.figma.com/v1"
 
 from agents.base_agent import BaseAgent
 from core.models import (
@@ -90,7 +97,31 @@ class DesignParserAgent(BaseAgent):
                 f"Preferred styling: {requirements.tech_preferences.get('styling', 'tailwind')}\n"
             )
 
-        figma_context = f"Figma URL: {figma_url}\n" if figma_url else ""
+        figma_context = ""
+        if figma_url:
+            file_key = self._extract_figma_key(figma_url)
+            token = os.environ.get("FIGMA_TOKEN", "")
+            if file_key and token:
+                try:
+                    figma_data = await self._fetch_figma_nodes(file_key, token)
+                    figma_context = (
+                        f"Figma URL: {figma_url}\n"
+                        f"Figma design structure (from REST API):\n"
+                        f"{self._summarise_figma_nodes(figma_data)}\n"
+                    )
+                    self._metrics["figma_api_call"] = 1
+                    logger.info("Fetched Figma file data for key %s", file_key)
+                except Exception as exc:
+                    logger.warning(
+                        "Figma API fetch failed (%s) — falling back to URL-as-text context", exc
+                    )
+                    figma_context = f"Figma URL: {figma_url}\n"
+            else:
+                figma_context = f"Figma URL: {figma_url}\n"
+                if file_key and not token:
+                    logger.info(
+                        "FIGMA_TOKEN not set — LLM will interpret URL without real design data"
+                    )
 
         raw = await self._call_llm_json(
             f"{req_text}{figma_context}\n"
@@ -98,6 +129,55 @@ class DesignParserAgent(BaseAgent):
         )
         self._metrics["llm_calls"] += 1
         return self._parse_spec(raw, requirements, figma_url)
+
+    # ── Figma REST API helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_figma_key(url: str) -> str | None:
+        """Return the Figma file key from a figma.com URL, or None."""
+        m = _FIGMA_FILE_RE.search(url)
+        return m.group(1) if m else None
+
+    async def _fetch_figma_nodes(self, file_key: str, token: str) -> dict:
+        """Call the Figma REST API and return the raw file JSON."""
+        api_url = f"{_FIGMA_API_BASE}/files/{file_key}?depth=2"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(api_url, headers={"X-Figma-Token": token})
+            resp.raise_for_status()
+            return resp.json()
+
+    @staticmethod
+    def _summarise_figma_nodes(data: dict) -> str:
+        """Convert Figma file JSON to a compact LLM-readable design summary."""
+        lines: list[str] = []
+        document = data.get("document", {})
+
+        pages = [
+            c["name"]
+            for c in document.get("children", [])
+            if c.get("type") == "CANVAS"
+        ]
+        if pages:
+            lines.append(f"Pages: {', '.join(pages)}")
+
+        for canvas in document.get("children", []):
+            if canvas.get("type") != "CANVAS":
+                continue
+            for child in canvas.get("children", [])[:20]:
+                node_type = child.get("type", "")
+                name = child.get("name", "")
+                if node_type in ("FRAME", "COMPONENT", "COMPONENT_SET", "GROUP"):
+                    lines.append(f"  {canvas['name']} / {node_type}: {name}")
+
+        styles = data.get("styles", {})
+        fill_styles = [v["name"] for v in styles.values() if v.get("styleType") == "FILL"][:10]
+        if fill_styles:
+            lines.append(f"Colour styles: {', '.join(fill_styles)}")
+        text_styles = [v["name"] for v in styles.values() if v.get("styleType") == "TEXT"][:8]
+        if text_styles:
+            lines.append(f"Text styles: {', '.join(text_styles)}")
+
+        return "\n".join(lines) if lines else "(no structured nodes found)"
 
     # ─────────────────────────────────────────────────────────────────────────
 

@@ -52,6 +52,11 @@ class RepositoryManager:
         self._lang_profile: LanguageProfile = PYTHON
         self._import_validator = ImportValidator()
         self._embedding_store = embedding_store
+        # Optional cross-pipeline lock for root-level shared files.
+        # Set by FullstackPipeline to prevent concurrent writes to files such
+        # as docker-compose.yml, .gitignore, package.json from parallel
+        # backend and frontend pipelines.
+        self._root_write_lock: asyncio.Lock | None = None
 
     @property
     def src_dir(self) -> Path:
@@ -196,7 +201,15 @@ class RepositoryManager:
         Delegates the actual I/O (write_text, mkdir, md5 hashing, __init__.py
         creation) to a thread so the event loop stays responsive while agents
         are generating files concurrently.
+
+        Root-level files (docker-compose.yml, package.json, .gitignore, etc.)
+        are serialised through ``_root_write_lock`` when it is set, preventing
+        concurrent writes from parallel pipelines (e.g. fullstack BE + FE).
         """
+        is_root_level = Path(rel_path).name.lower() in _ROOT_LEVEL_FILES
+        if self._root_write_lock is not None and is_root_level:
+            async with self._root_write_lock:
+                return await asyncio.to_thread(self.write_file, rel_path, content)
         return await asyncio.to_thread(self.write_file, rel_path, content)
 
     def write_test_file(self, rel_path: str, content: str) -> Path:

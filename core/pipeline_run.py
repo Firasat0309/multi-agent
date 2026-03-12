@@ -50,10 +50,12 @@ class RunPipeline:
         settings: Settings,
         llm: LLMClient,
         live: LiveConsole | None,
+        root_write_lock: asyncio.Lock | None = None,
     ) -> None:
         self._settings = settings
         self._llm = llm
         self._live = live
+        self._root_write_lock = root_write_lock
 
     async def execute(self, user_prompt: str, start_time: float) -> PipelineResult:
         from core.pipeline import PipelineResult
@@ -72,6 +74,8 @@ class RunPipeline:
         logger.info("[Phase 1] Designing architecture...")
 
         repo_manager = RepositoryManager(self._settings.workspace_dir)
+        if self._root_write_lock is not None:
+            repo_manager._root_write_lock = self._root_write_lock
         architect = ArchitectAgent(llm_client=self._llm, repo_manager=repo_manager)
 
         try:

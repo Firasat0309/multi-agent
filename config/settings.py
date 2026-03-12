@@ -83,6 +83,7 @@ class Settings:
     review_levels: list[str] = field(
         default_factory=lambda: ["file", "module", "architecture"]
     )
+    figma_token: str = field(default_factory=lambda: os.environ.get("FIGMA_TOKEN", ""))
     allow_host_execution: bool = False  # Must be True to run without Docker
     require_plan_approval: bool = False  # If True, pause for human review after change planning
     # Number of build attempts per tier checkpoint (1 initial + retries).

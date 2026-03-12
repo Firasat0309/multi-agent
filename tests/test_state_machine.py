@@ -164,7 +164,7 @@ class TestTestFixCycle:
         lc.process_event(EventType.FIX_APPLIED)
         assert lc.test_fix_target == "test"
 
-    def test_max_test_fixes_marks_passed(self):
+    def test_max_test_fixes_marks_degraded(self):
         lc = FileLifecycle("svc.java", max_test_fixes=2)
         for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED,
                      EventType.REVIEW_PASSED, EventType.BUILD_PASSED]:
@@ -176,10 +176,11 @@ class TestTestFixCycle:
         lc.process_event(EventType.TEST_FAILED)
         lc.process_event(EventType.FIX_APPLIED)
 
-        # 3rd failure exceeds limit → auto-pass with warnings
+        # 3rd failure exceeds limit → DEGRADED (was incorrectly PASSED)
         lc.process_event(EventType.TEST_FAILED)
 
-        assert lc.phase == FilePhase.PASSED
+        assert lc.phase == FilePhase.DEGRADED
+        assert lc.is_terminal
         assert lc.test_fix_count == 3
 
     def test_full_test_fix_then_pass(self):

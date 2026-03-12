@@ -69,6 +69,9 @@ class FullstackPipeline:
         self._llm = llm
         self._live = live
         self._interactive = interactive
+        # Shared lock serialises concurrent writes to root-level workspace files
+        # (e.g. docker-compose.yml, .gitignore) from the parallel BE+FE pipelines.
+        self._root_write_lock: asyncio.Lock = asyncio.Lock()
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -183,8 +186,14 @@ class FullstackPipeline:
         # Frontend workspace: workspace/frontend
         frontend_workspace = root_workspace / "frontend"
 
-        backend_pipeline = RunPipeline(backend_settings, self._llm, self._live)
-        frontend_pipeline = FrontendPipeline(self._settings, self._llm, self._live)
+        backend_pipeline = RunPipeline(
+            backend_settings, self._llm, self._live,
+            root_write_lock=self._root_write_lock,
+        )
+        frontend_pipeline = FrontendPipeline(
+            self._settings, self._llm, self._live,
+            root_write_lock=self._root_write_lock,
+        )
 
         # Build the enriched prompt that carries all context for the backend
         backend_prompt = (

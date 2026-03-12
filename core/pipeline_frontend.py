@@ -17,7 +17,10 @@ from agents.component_generator_agent import ComponentGeneratorAgent
 from agents.api_integration_agent import APIIntegrationAgent
 from agents.state_management_agent import StateManagementAgent
 from config.settings import Settings
+from core.import_validator import ImportValidator
+from core.language import TYPESCRIPT
 from core.llm_client import LLMClient, LLMConfigError
+from core.tsx_compiler import TSXCompiler
 from core.models import (
     APIContract,
     ComponentPlan,
@@ -62,10 +65,12 @@ class FrontendPipeline:
         settings: Settings,
         llm: LLMClient,
         live: LiveConsole | None = None,
+        root_write_lock: asyncio.Lock | None = None,
     ) -> None:
         self._settings = settings
         self._llm = llm
         self._live = live
+        self._root_write_lock = root_write_lock
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -83,6 +88,8 @@ class FrontendPipeline:
         workspace = frontend_workspace or (self._settings.workspace_dir / "frontend")
         workspace.mkdir(parents=True, exist_ok=True)
         repo_manager = RepositoryManager(workspace)
+        if self._root_write_lock is not None:
+            repo_manager._root_write_lock = self._root_write_lock
 
         # Wire EmbeddingStore so every write_file call indexes the component
         # for semantic context queries used by later-tier ComponentGeneratorAgent tasks.
@@ -215,6 +222,40 @@ class FrontendPipeline:
         metrics["components_generated"] = len(ordered_components) - len(gen_errors)
         self._complete_phase("FE: Component Generation")
 
+        # ── Phase 4.5: TypeScript Compilation Check ───────────────────────────
+        self._phase("FE: TypeScript Compilation", "running")
+        logger.info("[FE Phase 4.5] Running TypeScript compilation check...")
+        tsx_compiler = TSXCompiler()
+        compile_result = await tsx_compiler.check(workspace)
+        if not compile_result.tsc_available:
+            logger.info(
+                "[FE Phase 4.5] tsc not on PATH — skipping TypeScript compilation check"
+            )
+        elif compile_result.errors:
+            metrics["tsx_compile_errors"] = len(compile_result.errors)
+            for err in compile_result.errors:
+                errors.append(
+                    f"TSX compile error {err.file}:{err.line}: [{err.code}] {err.message}"
+                )
+            logger.warning(
+                "[FE Phase 4.5] %d TypeScript compile error(s)", len(compile_result.errors)
+            )
+        else:
+            logger.info("[FE Phase 4.5] TypeScript compilation passed")
+        self._complete_phase("FE: TypeScript Compilation")
+
+        # ── Phase 4.6: Cross-component import validation ───────────────────────
+        self._phase("FE: Import Validation", "running")
+        logger.info("[FE Phase 4.6] Validating cross-component imports...")
+        import_errors = self._validate_component_imports(workspace, ordered_components)
+        if import_errors:
+            metrics["import_errors"] = len(import_errors)
+            errors.extend(import_errors)
+            logger.warning("[FE Phase 4.6] %d unresolved import(s)", len(import_errors))
+        else:
+            logger.info("[FE Phase 4.6] All component imports resolved")
+        self._complete_phase("FE: Import Validation")
+
         # ── Phase 5: API Integration ──────────────────────────────────────────
         self._phase("FE: API Integration", "running")
         logger.info("[FE Phase 5] Generating API client layer...")
@@ -327,6 +368,40 @@ class FrontendPipeline:
                               "src/lib", "src/hooks"],
             file_blueprints=file_blueprints,
         )
+
+    @staticmethod
+    def _validate_component_imports(
+        workspace: Path,
+        components: list,
+    ) -> list[str]:
+        """Check that every relative import in each generated TSX component file
+        resolves to an existing file in the workspace.
+
+        Returns a list of human-readable error strings, one per broken import.
+        """
+        validator = ImportValidator()
+        # Build the set of all .ts/.tsx files that exist in the workspace
+        known_files: set[str] = {
+            p.relative_to(workspace).as_posix()
+            for p in workspace.rglob("*.ts")
+        } | {
+            p.relative_to(workspace).as_posix()
+            for p in workspace.rglob("*.tsx")
+        }
+        errors: list[str] = []
+        for comp in components:
+            file_path: str = comp.file_path
+            abs_path = workspace / file_path
+            if not abs_path.exists():
+                continue
+            try:
+                content = abs_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            broken = validator._validate_typescript(content, file_path, known_files)
+            for imp in broken:
+                errors.append(f"{file_path}: unresolved import '{imp}'")
+        return errors
 
     @staticmethod
     def _infer_framework(requirements: ProductRequirements) -> str:

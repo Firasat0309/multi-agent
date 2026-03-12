@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import posixpath
 import re
 from typing import TYPE_CHECKING
 
@@ -59,6 +60,8 @@ class ImportValidator:
                 return self._validate_java(content, known_files)
             if lang.name == "go":
                 return self._validate_go(content, known_files)
+            if lang.name in ("typescript", "tsx"):
+                return self._validate_typescript(content, file_path, known_files)
         except Exception as exc:
             logger.debug(
                 "Import validation error for %s (%s): %s",
@@ -119,6 +122,47 @@ class ImportValidator:
             if candidate not in known_files:
                 broken.append(imp)
 
+        return broken
+
+    def _validate_typescript(
+        self, content: str, file_path: str, known_files: set[str]
+    ) -> list[str]:
+        """Check relative TypeScript/TSX imports against the known workspace file set.
+
+        Only relative imports (starting with ``./`` or ``../``) are checked.
+        Bare specifiers (``react``, ``@/components/Foo``) are always skipped
+        since we cannot resolve package.json aliases or node_modules here.
+        """
+        file_path = file_path.replace("\\", "/")
+        file_dir = "/".join(file_path.split("/")[:-1])
+
+        # Match: import ... from '...'  /  import '...'  /  require('...')
+        imp_re = re.compile(
+            r"""(?:import\s+(?:type\s+)?(?:[^'"\n;]+?\s+from\s+)?"""
+            r"""['\"]([^'\"]+)['\"]|require\s*\(\s*['\"]([^'\"]+)['\"]\s*\))"""
+        )
+        broken: list[str] = []
+        for m in imp_re.finditer(content):
+            imp = m.group(1) or m.group(2)
+            if not imp.startswith("."):  # skip node_modules and @-aliases
+                continue
+            # Resolve relative path
+            raw = posixpath.normpath(file_dir + "/" + imp if file_dir else imp)
+            raw = raw.lstrip("/")
+            # Try all common extensions and index files
+            candidates = [
+                raw + ".ts",
+                raw + ".tsx",
+                raw + ".js",
+                raw + ".jsx",
+                raw + "/index.ts",
+                raw + "/index.tsx",
+                raw + "/index.js",
+            ]
+            # Also accept the path as-is (e.g. already has extension)
+            candidates.append(raw)
+            if not any(c in known_files for c in candidates):
+                broken.append(imp)
         return broken
 
     def _validate_go(self, content: str, known_files: set[str]) -> list[str]:
