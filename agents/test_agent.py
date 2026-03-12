@@ -25,38 +25,67 @@ class TestAgent(BaseAgent):
     def _get_system_prompt(self, language: str) -> str:
         profile = get_language_profile(language)
         return (
-            f"You are a test engineering agent for {profile.display_name} projects.\n\n"
+            f"You are a senior test engineer specializing in {profile.display_name}.\n\n"
 
-            "YOUR TASK: Generate a complete, compilable, runnable test file.\n\n"
+            "YOUR TASK: Generate a complete, compilable, runnable test file that "
+            "achieves ≥80% line coverage of the source file under test.\n\n"
+
+            "OUTPUT FORMAT:\n"
+            f"- Output ONLY raw {profile.display_name} code — no markdown fences, "
+            "no explanations, no commentary, no text before or after the code\n"
+            "- The very first line must be a valid language statement "
+            f"(package declaration, import, or {profile.display_name} comment)\n\n"
 
             "CRITICAL REQUIREMENTS:\n"
-            f"1. Output ONLY raw {profile.display_name} test code — no markdown fences, "
-            "no explanations, no commentary\n"
-            "2. The test file MUST compile and run independently\n"
-            "3. Every import MUST match the actual package/module path of the source file\n"
-            "4. Every test method MUST have meaningful assertions that verify actual behavior "
-            "— NEVER use assertTrue(true), assertNotNull(result) as the only assertion, "
-            "or any trivial placeholder\n"
-            "5. Test REAL method signatures from the source code — verify parameter types "
-            "and return types match exactly\n\n"
+            "1. The test file MUST compile and run independently with zero modifications\n"
+            "2. Every import MUST match the EXACT package/module path of the source file — "
+            "copy import paths directly from the source code provided\n"
+            "3. Every test method MUST have ≥1 specific assertion that checks a concrete "
+            "value, type, exception, or state change — NEVER use assertTrue(true), "
+            "assertNotNull(result), or any trivial placeholder as the ONLY assertion\n"
+            "4. Test REAL method signatures from the source code — parameter names, types, "
+            "and return types must match the source EXACTLY\n"
+            "5. Generate ≥3 test methods per public method/function/endpoint\n"
+            "6. Total test count must be ≥ (number_of_public_methods × 3)\n\n"
 
-            "TEST STRUCTURE:\n"
-            f"- Use the standard {profile.display_name} test framework\n"
-            "- For each public method in the source file:\n"
-            "  a) One test for the happy path (valid input → expected output)\n"
-            "  b) One test for an error case (invalid input → expected exception/error)\n"
-            "  c) One test for an edge case (boundary values, empty collections, null/nil)\n"
-            "- Mock external dependencies (database, HTTP clients, message queues) — "
-            "NEVER mock the class under test itself\n"
-            "- Each test must be independent: set up its own state, tear it down after\n"
-            "- Use descriptive test names that explain WHAT is tested and WHAT is expected\n"
-            "- Use fixtures/setup for common initialization\n\n"
+            "TEST STRUCTURE (follow this order):\n"
+            "1. Package/module declaration (if required by language)\n"
+            "2. All imports (source under test + test framework + mocking library)\n"
+            "3. Test class/suite declaration with setup/teardown\n"
+            f"4. Use the standard {profile.display_name} test framework\n"
+            "5. For EACH public method in the source file, write these tests:\n"
+            "   a) HAPPY PATH: valid input → verify exact expected return value\n"
+            "   b) ERROR CASE: invalid/null input → verify exact exception type and message\n"
+            "   c) EDGE CASE: boundary values (0, empty, max, nil) → verify exact behavior\n\n"
+
+            "MOCKING RULES:\n"
+            "- Mock ONLY external dependencies (DB, HTTP, filesystem, message queues)\n"
+            "- NEVER mock the class/module under test\n"
+            "- When dependency interfaces are provided in the prompt, mock those EXACT "
+            "signatures — do not guess method names or parameter types\n"
+            "- Configure mock return values for happy-path tests\n"
+            "- Configure mock exceptions for error-case tests\n"
+            "- Verify mock interactions: assert mocks were called with expected arguments\n\n"
 
             "ASSERTION RULES:\n"
-            "- Assert specific values: assertEquals(expected, actual) not just assertNotNull\n"
-            "- Assert exception types for error cases\n"
-            "- Assert collection sizes and contents, not just non-emptiness\n"
-            "- Verify mock interactions: confirm mocks were called with expected arguments"
+            "- assertEqual/assertEquals with SPECIFIC expected values (e.g., "
+            "assertEquals(42, result) not assertNotNull(result))\n"
+            "- assertRaises/assertThrows with SPECIFIC exception types\n"
+            "- Assert collection sizes AND specific elements, not just non-emptiness\n"
+            "- Assert state changes on mocks (e.g., verify save() was called with correct entity)\n\n"
+
+            "TEST ISOLATION & DETERMINISM:\n"
+            "- Each test must be independent: set up its own state, clean up after\n"
+            "- Use fixtures/setUp for common initialization code\n"
+            "- NEVER depend on test execution order\n"
+            "- NEVER use real time (sleep, current timestamp) — mock time-dependent behavior\n"
+            "- NEVER use random values without seeding — use fixed test data\n"
+            "- NEVER access real filesystem, network, or databases — mock all I/O\n\n"
+
+            "TEST NAMING:\n"
+            "- Names must describe: WHAT is tested + WHAT input + WHAT is expected\n"
+            "- Example patterns: test_methodName_whenCondition_thenExpectedResult, "
+            "test_createUser_withNullEmail_throwsValidationError"
         )
 
     @property
@@ -85,29 +114,61 @@ class TestAgent(BaseAgent):
         # Build language-specific hints (package declaration, framework, etc.)
         lang_hints = self._build_test_hints(test_path, fb, profile)
 
-        formatted = self._format_context(context)
+        # ── Build explicit dependency interface section ────────────────────
+        # Extract interfaces of files the source depends on so the LLM can
+        # create accurate mocks instead of guessing method signatures.
+        dep_interfaces: list[str] = []
+        if fb.depends_on and context.related_files:
+            for dep_path in fb.depends_on:
+                dep_content = context.related_files.get(dep_path, "")
+                if dep_content and dep_path != fb.path:
+                    # Use only first 2000 chars — enough for class/method signatures
+                    dep_interfaces.append(
+                        f"### {dep_path} (dependency — mock this interface)\n"
+                        f"```{profile.code_fence_name}\n{dep_content[:2000]}\n```"
+                    )
+
+        # ── Build exports checklist ───────────────────────────────────────
+        exports_list = fb.exports or []
+        exports_section = ""
+        if exports_list:
+            items = "\n".join(f"  - [ ] {export}" for export in exports_list)
+            exports_section = (
+                f"PUBLIC API THAT MUST BE TESTED (every item must have ≥3 tests):\n"
+                f"{items}\n\n"
+            )
+
         prompt = (
-            f"{formatted}\n\n"
-            f"Generate tests for: {fb.path}\n"
+            f"Generate comprehensive tests for: {fb.path}\n"
             f"Purpose: {fb.purpose}\n"
-            f"Exports to test: {', '.join(fb.exports)}\n\n"
+            f"Layer: {fb.layer}\n\n"
         )
 
-        # Explicitly include source code so the LLM knows what to test
+        # Include source code — this is the primary input
         if source_code:
             prompt += (
-                f"ACTUAL SOURCE CODE TO TEST (use exact method signatures from this):\n"
+                f"SOURCE CODE TO TEST (use EXACT method signatures from this):\n"
                 f"```{profile.code_fence_name}\n{source_code}\n```\n\n"
             )
 
+        # Include dependency interfaces for accurate mocking
+        if dep_interfaces:
+            prompt += (
+                "DEPENDENCY INTERFACES (mock these — use exact method signatures):\n"
+                + "\n".join(dep_interfaces) + "\n\n"
+            )
+
+        prompt += exports_section
+
         prompt += (
             f"{lang_hints}\n\n"
-            "IMPORTANT:\n"
-            "- Read the source code above carefully before writing tests\n"
-            "- Use the EXACT class names, method names, and parameter types from the source\n"
-            "- Generate at least 3 test methods per public method/endpoint\n"
-            "- Every test MUST have at least one specific assertion (not just assertNotNull)\n"
-            "- Output ONLY the complete test file code, nothing else"
+            "MANDATORY CHECKLIST:\n"
+            "1. Read the source code above — use EXACT class/method/function names\n"
+            "2. Generate ≥3 test methods per public method (happy + error + edge)\n"
+            f"3. Total minimum tests: {max(len(exports_list) * 3, 6)}\n"
+            "4. Every test has ≥1 specific assertion (not assertNotNull or assertTrue(true))\n"
+            "5. Mock all dependencies using the interfaces provided above\n"
+            "6. Output ONLY the complete test file code — nothing else"
         )
 
         test_code = await self._call_llm(prompt, system_override=self._get_system_prompt(lang))
@@ -278,10 +339,12 @@ class TestAgent(BaseAgent):
           - Runs only the SPECIFIC test file, not the entire suite
           - Build/config errors (no pom.xml etc.) → only fix tests, never touch source
           - Size guard: never replace source with content < 50% of original (prevents destruction)
-          - Error output truncated to 2000 chars to prevent token explosion
+          - Error output truncated to 3000 chars to prevent token explosion
+          - Fix prompts re-include original requirements to prevent test simplification
         """
         lang = context.file_blueprint.language if context.file_blueprint else "python"
         source_path = context.file_blueprint.path if context.file_blueprint else ""
+        exports_list = context.file_blueprint.exports if context.file_blueprint else []
         last_error = ""
         source_modified = False
 
@@ -294,15 +357,29 @@ class TestAgent(BaseAgent):
         # Truncate for prompt inclusion (avoid token bloat)
         source_snippet = source_for_context[:4000]
 
+        # Pre-build the requirements reminder to include in every fix prompt
+        requirements_reminder = (
+            "REQUIREMENTS (do NOT reduce test count or simplify tests to make them pass):\n"
+            f"- Must test these exports: {', '.join(exports_list) if exports_list else 'all public methods'}\n"
+            f"- Minimum {max(len(exports_list) * 3, 6)} test methods total\n"
+            "- Each test must have ≥1 specific assertion (no assertTrue(true) or assertNotNull-only)\n"
+            "- Happy path + error case + edge case for each public method\n"
+        )
+
         for attempt in range(max_attempts):
             cmd_result = await self.terminal.run_command(targeted_cmd)
 
             if cmd_result.exit_code == 0:
-                quality = self._check_test_quality(test_code, profile)
+                quality = self._check_test_quality(test_code, profile, exports_list)
                 quality_note = ""
                 if quality["test_count"] < 2:
                     quality_note = " (WARNING: only {n} test(s) — consider adding more)".format(
                         n=quality["test_count"]
+                    )
+                if quality.get("untested_exports"):
+                    quality_note += (
+                        f" (WARNING: untested exports: "
+                        f"{', '.join(quality['untested_exports'])})"
                     )
 
                 # ── Coverage measurement ──────────────────────────────
@@ -347,7 +424,7 @@ class TestAgent(BaseAgent):
             error_output = f"{cmd_result.stdout}\n{cmd_result.stderr}".strip()
             last_error = error_output[:500]
             # Truncate to prevent token explosion in fix prompts (Maven logs can be huge)
-            error_for_prompt = error_output[:2000]
+            error_for_prompt = error_output[:3000]
             logger.info(f"Test failed (attempt {attempt + 1}/{max_attempts})")
 
             # If the error is a build/config issue (no pom.xml etc.),
@@ -375,13 +452,17 @@ class TestAgent(BaseAgent):
                     )
                 fix_prompt += (
                     f"Error output:\n```\n{error_for_prompt}\n```\n\n"
-                    "INSTRUCTIONS:\n"
+                    f"{requirements_reminder}\n"
+                    "FIX INSTRUCTIONS:\n"
                     "1. The SOURCE CODE above is correct — adapt the TESTS to match it\n"
                     "2. Fix import paths to match the actual source file location\n"
                     "3. Fix method calls to match actual method signatures in the source\n"
                     "4. Fix assertions to match the actual return types and values\n"
-                    "5. Do NOT simplify or remove tests — fix them so they pass\n"
-                    "6. Output the COMPLETE corrected test file, nothing else"
+                    "5. Do NOT remove or simplify tests — fix them so they pass while "
+                    "keeping the same test count and coverage\n"
+                    "6. If a test method is fundamentally wrong, rewrite it for the same "
+                    "scenario (happy/error/edge) — do not delete it\n"
+                    "7. Output the COMPLETE corrected test file, nothing else"
                 )
                 test_code = await self._call_llm(
                     fix_prompt, system_override=self._get_system_prompt(lang)
@@ -397,18 +478,25 @@ class TestAgent(BaseAgent):
                     f"The following source file has a bug exposed by failing tests:\n\n"
                     f"Source file ({source_path}):\n"
                     f"```{profile.code_fence_name}\n{source_content}\n```\n\n"
+                    f"Failing test file ({test_path}):\n"
+                    f"```{profile.code_fence_name}\n{test_code}\n```\n\n"
                     f"Test error output:\n```\n{error_for_prompt}\n```\n\n"
-                    f"Fix ONLY the specific bug(s) — do NOT simplify, remove methods, "
-                    f"or reduce functionality. Keep the file structure and size intact. "
-                    f"Output only the complete corrected source file."
+                    f"FIX RULES:\n"
+                    f"1. Fix ONLY the specific bug(s) that cause the test failures\n"
+                    f"2. Do NOT remove, rename, or simplify any methods/classes/functions\n"
+                    f"3. Do NOT change method signatures (names, parameters, return types)\n"
+                    f"4. Keep the file structure, size, and all existing functionality intact\n"
+                    f"5. The fix should be minimal — change only the lines needed\n"
+                    f"6. Output the COMPLETE corrected source file, no markdown fences"
                 )
                 fixed_source = await self._call_llm(
                     fix_prompt,
                     system_override=(
                         f"You are an expert {profile.display_name} developer. "
                         f"Fix the specific bug in the source file so the tests pass. "
-                        f"IMPORTANT: Do NOT simplify or shorten the file. Keep all existing "
-                        f"methods, classes, and functionality intact. Only change what is "
+                        f"CRITICAL: Do NOT simplify, shorten, or restructure the file. "
+                        f"Do NOT change any method signatures. Keep all existing methods, "
+                        f"classes, and functionality intact. Only change the minimum lines "
                         f"necessary to fix the failing test. "
                         f"Output only the complete corrected code, no markdown fences."
                     ),
@@ -428,10 +516,12 @@ class TestAgent(BaseAgent):
                     # Refresh source snippet for next fix iteration
                     source_snippet = fixed_source[:4000]
 
-        # Exhausted attempts — still mark success=True so the task is not retried.
+        # Exhausted attempts — report partial success so downstream agents know
+        # tests exist but are not passing. success=False signals the pipeline
+        # that manual intervention is needed.
         return TaskResult(
-            success=True,
-            output=f"Tests written (still failing after {max_attempts} fix attempts — manual review needed)",
+            success=False,
+            output=f"Tests written but still failing after {max_attempts} fix attempts — manual review needed",
             errors=[last_error],
             files_modified=[test_path, source_path] if source_modified else [test_path],
             metrics={**self.get_metrics(), "fix_attempts": max_attempts, "tests_passing": False},
@@ -466,8 +556,9 @@ class TestAgent(BaseAgent):
         re.IGNORECASE,
     )
 
-    def _check_test_quality(self, test_code: str, profile: LanguageProfile) -> dict[str, Any]:
-        """Lightweight quality gate — count test functions and flag trivial assertions.
+    def _check_test_quality(self, test_code: str, profile: LanguageProfile,
+                           exports: list[str] | None = None) -> dict[str, Any]:
+        """Quality gate — count test functions, flag trivial assertions, check export coverage.
 
         Returns a metrics dict that gets merged into TaskResult.metrics.
         """
@@ -480,6 +571,20 @@ class TestAgent(BaseAgent):
             test_code, re.IGNORECASE,
         ))
 
+        # Check which exported symbols have corresponding test methods
+        exports = exports or []
+        tested_exports: list[str] = []
+        untested_exports: list[str] = []
+        test_code_lower = test_code.lower()
+        for export in exports:
+            # Check if the export name appears in any test method name or body
+            if export.lower() in test_code_lower:
+                tested_exports.append(export)
+            else:
+                untested_exports.append(export)
+
+        export_coverage = len(tested_exports) / len(exports) if exports else 1.0
+
         if test_count == 0:
             logger.warning("Quality gate: no test functions detected in generated test")
         elif trivial_count > 0:
@@ -488,9 +593,16 @@ class TestAgent(BaseAgent):
             )
         elif not has_assertions:
             logger.warning("Quality gate: no assertions found in test code")
+        if untested_exports:
+            logger.warning(
+                "Quality gate: %d export(s) not covered by tests: %s",
+                len(untested_exports), ", ".join(untested_exports),
+            )
 
         return {
             "test_count": test_count,
             "trivial_assertions": trivial_count,
             "has_assertions": has_assertions,
+            "export_coverage": round(export_coverage, 2),
+            "untested_exports": untested_exports,
         }
