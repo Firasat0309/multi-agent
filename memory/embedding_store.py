@@ -147,10 +147,21 @@ class EmbeddingStore:
     def _chunk_code(self, content: str, chunk_size: int = 40, file_path: str = "") -> list[str]:
         """Split code into chunks at top-level definition boundaries.
 
-        Uses language-appropriate patterns derived from *file_path*'s extension.
-        Falls back to fixed *chunk_size*-line windows for unknown file types.
+        For Java and Python files, uses AST-extracted signatures so each chunk
+        carries semantic meaning (type + method name + annotations + parameter
+        types) rather than arbitrary raw-line windows.  Falls back to the
+        pattern-based splitter for unsupported languages or when the AST parse
+        fails.
         """
         ext = Path(file_path).suffix.lower() if file_path else ""
+
+        # AST-based chunking for Java and Python
+        if ext in (".java", ".py") and file_path:
+            ast_chunks = self._chunk_via_ast(content, file_path, ext.lstrip("."))
+            if ast_chunks:
+                return ast_chunks
+
+        # Pattern-based fallback (all other languages / AST failures)
         pattern = _TOPLEVEL_PATTERNS.get(ext)
 
         lines = content.splitlines()
@@ -172,3 +183,71 @@ class EmbeddingStore:
             chunks.append("\n".join(current_chunk))
 
         return chunks if chunks else [content]
+
+    def _chunk_via_ast(self, content: str, file_path: str, language: str) -> list[str]:
+        """Return embedding chunks built from AST signatures (Java / Python).
+
+        Produces two kinds of chunks per type:
+
+        * **Class chunk** — file path, package, type header, annotations,
+          and all field declarations.  Gives the search index a surface that
+          matches queries like "UserService fields" or "class extending BaseEntity".
+        * **Method chunk** — file path, class name, annotations, and the full
+          method signature.  One chunk per method so retrieval is fine-grained.
+
+        Returns an empty list on any failure so the caller can fall back to the
+        pattern-based splitter.
+        """
+        try:
+            # Lazy import avoids a circular dependency between memory/ and core/
+            from core.ast_extractor import ASTExtractor  # noqa: PLC0415
+
+            file_sig = ASTExtractor().extract(file_path, content, language)
+            if file_sig is None or not file_sig.types:
+                return []
+
+            chunks: list[str] = []
+            pkg_line = f"Package: {file_sig.package}" if file_sig.package else ""
+
+            for type_sig in file_sig.types:
+                # ── Class-level chunk ──────────────────────────────────────
+                lines: list[str] = [f"File: {file_path}"]
+                if pkg_line:
+                    lines.append(pkg_line)
+                header = f"{type_sig.kind} {type_sig.name}".strip()
+                if type_sig.modifiers:
+                    header = f"{type_sig.modifiers} {header}".strip()
+                if type_sig.extends:
+                    header += f" extends {type_sig.extends}"
+                if type_sig.implements:
+                    header += f" implements {', '.join(type_sig.implements)}"
+                lines.append(header)
+                if type_sig.annotations:
+                    lines.append("Annotations: " + " ".join(type_sig.annotations))
+                for fld in type_sig.fields:
+                    field_line = f"  field: {fld.modifiers} {fld.type_name} {fld.name}".strip()
+                    lines.append(field_line)
+                if type_sig.enum_constants:
+                    lines.append("  constants: " + ", ".join(type_sig.enum_constants))
+                chunks.append("\n".join(lines))
+
+                # ── Per-method chunks ──────────────────────────────────────
+                for method in type_sig.methods:
+                    mlines: list[str] = [f"File: {file_path}", f"Class: {type_sig.name}"]
+                    if method.annotations:
+                        mlines.append("Annotations: " + " ".join(method.annotations))
+                    if method.is_constructor:
+                        sig = f"{method.modifiers} {method.name}{method.parameters}".strip()
+                    else:
+                        ret = method.return_type or ""
+                        sig = f"{method.modifiers} {ret} {method.name}{method.parameters}".strip()
+                    mlines.append(sig)
+                    chunks.append("\n".join(mlines))
+
+            return chunks if chunks else []
+
+        except Exception:
+            logger.debug(
+                "AST chunking failed for %s — falling back to pattern chunking", file_path
+            )
+            return []
