@@ -244,10 +244,16 @@ class RunPipeline:
         # Code success: all files generated, reviewed, and built correctly.
         # Test failures (tests_degraded) are a quality signal, not a hard gate —
         # the generated code itself is valid even when generated tests don't all pass.
+        # Also check checkpoint results — if any build checkpoint failed, the
+        # code is not reliable even if lifecycle states look OK.
+        checkpoints_passed = all(
+            cr.get("passed", True) for cr in exec_result.get("checkpoint_results", [])
+        )
         code_success = (
             stats.get("failed", 0) == 0
             and stats.get("blocked", 0) == 0
             and stats.get("lifecycle_failed", 0) == 0
+            and checkpoints_passed
         )
         tests_passed = stats.get("lifecycle_tests_degraded", 0) == 0
         # Overall success requires code to generate correctly; test quality is

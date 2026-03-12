@@ -548,10 +548,11 @@ class AgentManager:
             FilePhase.FIXING: {
                 "task_type": TaskType.FIX_CODE,
                 "success_event": EventType.FIX_APPLIED,
-                # Even if the fix agent returns a failure result, fire FIX_APPLIED
-                # so the file proceeds back to REVIEWING/TESTING rather than FAILED.
-                # Review/test cycle limits will naturally exhaust and push forward.
-                "failure_event": EventType.FIX_APPLIED,
+                # If the fix agent fails, fire RETRIES_EXHAUSTED to stop the
+                # cycle — the old FIX_APPLIED caused infinite loops where
+                # broken code cycled until limits were hit and then was
+                # incorrectly marked as PASSED.
+                "failure_event": EventType.RETRIES_EXHAUSTED,
                 "description": f"Fix {file_path} ({lc.fix_trigger} issues)",
             },
             FilePhase.BUILDING: {
@@ -708,14 +709,18 @@ class AgentManager:
 
         except Exception as e:
             logger.exception("[%s] %s error", file_path, phase.value)
-            # For review/fix phases, proceed gracefully instead of failing the file.
-            # Only hard-fail on GENERATING — the pipeline only fails on build retries.
+            # For review phase, treat crash as REVIEW_FAILED so the file still
+            # goes through build verification rather than silently passing.
             if phase == FilePhase.REVIEWING:
-                # Skip review, treat as passed so file moves to BUILDING.
-                engine.process_event(file_path, EventType.REVIEW_PASSED)
+                engine.process_event(
+                    file_path, EventType.REVIEW_FAILED,
+                    {"findings": [f"Review crashed: {e}"], "output": ""},
+                )
             elif phase == FilePhase.FIXING:
-                # Treat as applied so file returns to REVIEWING/TESTING cycle.
-                engine.process_event(file_path, EventType.FIX_APPLIED)
+                # Fix crashed — fire RETRIES_EXHAUSTED so the file stops
+                # cycling and is marked FAILED instead of looping forever.
+                engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
+                self._metrics["tasks_failed"] += 1
             else:
                 engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
                 self._metrics["tasks_failed"] += 1

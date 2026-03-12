@@ -115,6 +115,7 @@ class FileLifecycle:
         *,
         max_review_fixes: int = 2,
         max_test_fixes: int = 3,
+        max_build_fixes: int = 3,
         generation_task_type: str = "generate_file",
         change_metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -122,6 +123,7 @@ class FileLifecycle:
         self.phase = FilePhase.PENDING
         self.max_review_fixes = max_review_fixes
         self.max_test_fixes = max_test_fixes
+        self.max_build_fixes = max_build_fixes
 
         # Task type used in the GENERATING phase: "generate_file" for new
         # files (CoderAgent) or "modify_file" for existing files (PatchAgent).
@@ -222,11 +224,12 @@ class FileLifecycle:
             self.review_output = data.get("output", "")
 
             if self.review_fix_count > self.max_review_fixes:
-                # Skip fix, proceed directly to testing
-                new_phase = FilePhase.TESTING
+                # Review fixes exhausted — still send the file through BUILD
+                # so the compiler can verify it.  Never skip BUILD.
+                new_phase = FilePhase.BUILDING
                 self.fix_trigger = ""
                 logger.warning(
-                    "%s: review fix limit (%d) reached — proceeding to testing",
+                    "%s: review fix limit (%d) reached — proceeding to build verification",
                     self.file_path, self.max_review_fixes,
                 )
 
@@ -236,11 +239,12 @@ class FileLifecycle:
             self.test_errors = data.get("errors", "")
 
             if self.test_fix_count > self.max_test_fixes:
-                # Accept as-is — tests were generated, just not all passing
-                new_phase = FilePhase.PASSED
+                # Test fixes exhausted — mark FAILED, not PASSED.
+                # Code with broken tests should not be reported as success.
+                new_phase = FilePhase.FAILED
                 self.fix_trigger = ""
                 logger.warning(
-                    "%s: test fix limit (%d) reached — marking passed with warnings",
+                    "%s: test fix limit (%d) reached — marking as failed",
                     self.file_path, self.max_test_fixes,
                 )
 
@@ -249,13 +253,13 @@ class FileLifecycle:
             self.fix_trigger = "build"
             self.build_errors = data.get("errors", "")
 
-            if self.build_fix_count > self.max_review_fixes:
-                # Accept as-is after too many build fix attempts
-                new_phase = FilePhase.PASSED
+            if self.build_fix_count > self.max_build_fixes:
+                # Build fixes exhausted — file does not compile, mark FAILED.
+                new_phase = FilePhase.FAILED
                 self.fix_trigger = ""
                 logger.warning(
-                    "%s: build fix limit (%d) reached — proceeding anyway",
-                    self.file_path, self.max_review_fixes,
+                    "%s: build fix limit (%d) reached — marking as failed",
+                    self.file_path, self.max_build_fixes,
                 )
 
         elif event_type == EventType.REVIEW_PASSED:
@@ -312,6 +316,7 @@ class LifecycleEngine:
         *,
         max_review_fixes: int = 2,
         max_test_fixes: int = 3,
+        max_build_fixes: int = 3,
         compiled: bool = False,
         checkpoint_mode: bool = False,
         file_overrides: dict[str, dict[str, Any]] | None = None,
@@ -336,6 +341,7 @@ class LifecycleEngine:
                 path,
                 max_review_fixes=max_review_fixes,
                 max_test_fixes=max_test_fixes,
+                max_build_fixes=max_build_fixes,
                 generation_task_type=fo.get("generation_task_type", "generate_file"),
                 change_metadata=fo.get("change_metadata"),
             )

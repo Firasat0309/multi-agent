@@ -385,10 +385,15 @@ class EnhancePipeline:
         stats = exec_result.get("stats", {})
         # Code success: all files modified/generated, reviewed, and built.
         # Test failures (tests_degraded) are a quality signal, not a hard gate.
+        # Also verify build checkpoints actually passed.
+        checkpoints_passed = all(
+            cr.get("passed", True) for cr in exec_result.get("checkpoint_results", [])
+        )
         code_success = (
             stats.get("failed", 0) == 0
             and stats.get("blocked", 0) == 0
             and stats.get("lifecycle_failed", 0) == 0
+            and checkpoints_passed
         )
         success = code_success
 

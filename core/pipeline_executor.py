@@ -704,16 +704,17 @@ class PipelineExecutor:
                 and phase in (FilePhase.TESTING, FilePhase.FIXING)
             ]
 
-            # Also check for files still in BUILDING that should transition
+            # Files stuck in BUILDING at this point should be marked FAILED,
+            # not auto-passed — they never went through build verification.
             for path in list(engine._lifecycles.keys()):
                 lc = engine.get_lifecycle(path)
                 if lc.phase == FilePhase.BUILDING and path not in in_flight:
-                    # Auto-transition to TESTING
-                    engine.process_event(path, EventType.BUILD_PASSED)
-                    new_phase = lc.phase
-                    if new_phase in (FilePhase.TESTING, FilePhase.PASSED):
-                        if new_phase == FilePhase.TESTING:
-                            actionable.append((path, new_phase))
+                    logger.warning(
+                        "[%s] still in BUILDING at test phase — marking as failed "
+                        "(missed build checkpoint)",
+                        path,
+                    )
+                    engine.process_event(path, EventType.RETRIES_EXHAUSTED)
 
             for path, phase in actionable:
                 if path in in_flight:
