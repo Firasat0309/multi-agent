@@ -26,16 +26,37 @@ class TestAgent(BaseAgent):
         profile = get_language_profile(language)
         return (
             f"You are a test engineering agent for {profile.display_name} projects.\n\n"
-            "Rules:\n"
-            f"- Generate ONLY the {profile.display_name} test file content, no markdown fences\n"
-            f"- Use the standard test framework for {profile.display_name}\n"
-            "- Mock external dependencies (database, HTTP, etc.)\n"
-            "- Test both happy paths and error cases\n"
-            "- Test edge cases and boundary conditions\n"
-            "- Use descriptive test names\n"
-            "- Use fixtures/setup for common setup\n"
-            f"- Follow idiomatic {profile.display_name} testing conventions\n"
-            "- Generate both unit tests and integration tests where appropriate"
+
+            "YOUR TASK: Generate a complete, compilable, runnable test file.\n\n"
+
+            "CRITICAL REQUIREMENTS:\n"
+            f"1. Output ONLY raw {profile.display_name} test code — no markdown fences, "
+            "no explanations, no commentary\n"
+            "2. The test file MUST compile and run independently\n"
+            "3. Every import MUST match the actual package/module path of the source file\n"
+            "4. Every test method MUST have meaningful assertions that verify actual behavior "
+            "— NEVER use assertTrue(true), assertNotNull(result) as the only assertion, "
+            "or any trivial placeholder\n"
+            "5. Test REAL method signatures from the source code — verify parameter types "
+            "and return types match exactly\n\n"
+
+            "TEST STRUCTURE:\n"
+            f"- Use the standard {profile.display_name} test framework\n"
+            "- For each public method in the source file:\n"
+            "  a) One test for the happy path (valid input → expected output)\n"
+            "  b) One test for an error case (invalid input → expected exception/error)\n"
+            "  c) One test for an edge case (boundary values, empty collections, null/nil)\n"
+            "- Mock external dependencies (database, HTTP clients, message queues) — "
+            "NEVER mock the class under test itself\n"
+            "- Each test must be independent: set up its own state, tear it down after\n"
+            "- Use descriptive test names that explain WHAT is tested and WHAT is expected\n"
+            "- Use fixtures/setup for common initialization\n\n"
+
+            "ASSERTION RULES:\n"
+            "- Assert specific values: assertEquals(expected, actual) not just assertNotNull\n"
+            "- Assert exception types for error cases\n"
+            "- Assert collection sizes and contents, not just non-emptiness\n"
+            "- Verify mock interactions: confirm mocks were called with expected arguments"
         )
 
     @property
@@ -67,21 +88,26 @@ class TestAgent(BaseAgent):
         formatted = self._format_context(context)
         prompt = (
             f"{formatted}\n\n"
-            f"Generate comprehensive {profile.display_name} tests for: {fb.path}\n"
-            f"The file's purpose: {fb.purpose}\n"
-            f"The file exports: {', '.join(fb.exports)}\n\n"
+            f"Generate tests for: {fb.path}\n"
+            f"Purpose: {fb.purpose}\n"
+            f"Exports to test: {', '.join(fb.exports)}\n\n"
         )
 
         # Explicitly include source code so the LLM knows what to test
         if source_code:
             prompt += (
-                f"Here is the actual source code to test:\n"
+                f"ACTUAL SOURCE CODE TO TEST (use exact method signatures from this):\n"
                 f"```{profile.code_fence_name}\n{source_code}\n```\n\n"
             )
 
         prompt += (
             f"{lang_hints}\n\n"
-            f"Generate complete, working test code. Output only the code."
+            "IMPORTANT:\n"
+            "- Read the source code above carefully before writing tests\n"
+            "- Use the EXACT class names, method names, and parameter types from the source\n"
+            "- Generate at least 3 test methods per public method/endpoint\n"
+            "- Every test MUST have at least one specific assertion (not just assertNotNull)\n"
+            "- Output ONLY the complete test file code, nothing else"
         )
 
         test_code = await self._call_llm(prompt, system_override=self._get_system_prompt(lang))
@@ -344,14 +370,18 @@ class TestAgent(BaseAgent):
                 # Include source code so the LLM knows what correct behavior looks like
                 if source_snippet:
                     fix_prompt += (
-                        f"Source code being tested ({source_path}):\n"
+                        f"Source code being tested ({source_path}) — this is the SOURCE OF TRUTH:\n"
                         f"```{profile.code_fence_name}\n{source_snippet}\n```\n\n"
                     )
                 fix_prompt += (
                     f"Error output:\n```\n{error_for_prompt}\n```\n\n"
-                    f"Fix the test code so it compiles and passes. "
-                    f"The tests should accurately test the source code shown above. "
-                    f"Output only the complete corrected test file."
+                    "INSTRUCTIONS:\n"
+                    "1. The SOURCE CODE above is correct — adapt the TESTS to match it\n"
+                    "2. Fix import paths to match the actual source file location\n"
+                    "3. Fix method calls to match actual method signatures in the source\n"
+                    "4. Fix assertions to match the actual return types and values\n"
+                    "5. Do NOT simplify or remove tests — fix them so they pass\n"
+                    "6. Output the COMPLETE corrected test file, nothing else"
                 )
                 test_code = await self._call_llm(
                     fix_prompt, system_override=self._get_system_prompt(lang)

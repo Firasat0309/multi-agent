@@ -492,7 +492,12 @@ class BaseAgent(ABC):
         return result
 
     def _format_context(self, context: AgentContext) -> str:
-        """Format agent context into a prompt section."""
+        """Format agent context into a prompt section.
+
+        The primary file (matching the current task's file_blueprint) gets full
+        content to prevent truncation of critical method signatures. Dependency
+        files are truncated at 4000 chars to stay within token budget.
+        """
         parts: list[str] = []
 
         if context.architecture_summary:
@@ -511,9 +516,14 @@ class BaseAgent(ABC):
 
         if context.related_files:
             parts.append("## Related Files")
+            # Determine the primary file path to give it full content
+            primary_path = context.file_blueprint.path if context.file_blueprint else None
             for path, content in context.related_files.items():
-                # Truncate large files
-                truncated = content[:4000] if len(content) > 4000 else content
+                # Primary file gets full content; dependencies get truncated
+                if path == primary_path:
+                    truncated = content
+                else:
+                    truncated = content[:4000] if len(content) > 4000 else content
                 # Detect language from file extension for correct code fencing
                 lang_name = ""
                 if context.file_blueprint:

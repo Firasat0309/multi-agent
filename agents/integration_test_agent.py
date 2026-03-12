@@ -42,15 +42,31 @@ class IntegrationTestAgent(BaseAgent):
     def system_prompt(self) -> str:
         return (
             "You are an integration test engineering agent.\n\n"
-            "Rules:\n"
-            "- Output ONLY the test file content — no markdown fences, no explanations\n"
-            "- Tests must call real application code end-to-end, mocking ONLY external\n"
-            "  boundaries (database connections, HTTP clients, message brokers)\n"
+            "YOUR TASK: Generate complete, compilable, runnable integration tests that "
+            "verify cross-module interactions end-to-end.\n\n"
+            "CRITICAL REQUIREMENTS:\n"
+            "1. Output ONLY the test file content — no markdown fences, no explanations\n"
+            "2. The test file MUST compile and run independently\n"
+            "3. Every import MUST match the actual package/module path of the source file\n"
+            "4. Tests must call real application code end-to-end through "
+            "controller → service → repository layers\n"
+            "5. Mock ONLY external boundaries (database connections, HTTP clients to "
+            "external services, message brokers) — NEVER mock the class under test\n\n"
+            "TEST STRUCTURE:\n"
             "- Each test must have a clear arrange / act / assert structure\n"
-            "- Cover at least: the happy path, one error/edge case, and one boundary value\n"
-            "- Use the same test framework as the project's unit tests\n"
-            "- Keep tests independent — each test sets up and tears down its own state\n"
-            "- Prefer realistic data over minimal stubs to catch data-shape mismatches\n"
+            "- Include at least:\n"
+            "  a) Happy-path test for each main endpoint (create, read, update, delete)\n"
+            "  b) One error-path test (e.g., 404 for missing resource, 400 for invalid input)\n"
+            "  c) One boundary test (empty collection, max-length input, concurrent access)\n"
+            "- Each test must set up its own data and clean up after itself\n"
+            "- Use realistic test data (real names, valid emails, proper dates) — not "
+            "'test', 'foo', 'bar'\n"
+            "- Keep tests independent — no test should depend on another test's state\n\n"
+            "ASSERTION RULES:\n"
+            "- Assert on HTTP status codes, response body structure, AND specific field values\n"
+            "- Assert collection sizes and contents, not just non-emptiness\n"
+            "- Verify error responses include appropriate error messages and status codes\n"
+            "- NEVER use assertTrue(true) or assertNotNull(result) as the only assertion"
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
@@ -67,20 +83,39 @@ class IntegrationTestAgent(BaseAgent):
         test_file = f"{output_dir}/test_integration.{profile.file_extensions[0].lstrip('.')}"
 
         prompt = (
-            f"Generate integration tests for a {profile.display_name} project.\n\n"
-            f"Architecture style: {context.blueprint.architecture_style}\n"
+            f"Generate integration tests for a {profile.display_name} "
+            f"{context.blueprint.architecture_style} project.\n\n"
+            f"Project: {context.blueprint.name}\n"
             f"Tech stack: {context.blueprint.tech_stack}\n\n"
         )
         if arch_summary:
-            prompt += f"Architecture overview:\n{arch_summary[:2000]}\n\n"
+            prompt += f"Architecture overview:\n{arch_summary[:3000]}\n\n"
+
+        # Include actual controller/endpoint code for accurate test generation
+        endpoint_code = self._extract_endpoint_code(context)
+        if endpoint_code:
+            prompt += f"Endpoint definitions (use these EXACT signatures):\n{endpoint_code}\n\n"
+
+        # Add language-specific test hints
+        test_hints = self._build_test_hints(profile)
+
         prompt += (
             f"Source modules:\n{source_summary}\n\n"
-            f"Requirements:\n"
+            f"Language-specific guidance:\n{test_hints}\n\n"
+            f"REQUIREMENTS:\n"
             f"- Test file: {test_file}\n"
-            f"- Test the primary entry points / public APIs end-to-end\n"
-            f"- Mock only external I/O (DB, HTTP, queues) at the boundary\n"
-            f"- Include at least 3 integration test cases\n"
-            f"- Output only the complete test file, no fences or commentary\n"
+            f"- Test the PRIMARY API endpoints end-to-end through "
+            f"controller → service → repository\n"
+            f"- Mock ONLY external boundaries: database connections, HTTP clients "
+            f"to external services\n"
+            f"- Include at least:\n"
+            f"  1. Happy-path test for each main endpoint (create, read, update, delete)\n"
+            f"  2. One error-path test (e.g., 404 for missing resource, 400 for invalid input)\n"
+            f"  3. One boundary test (empty collection, max-length input)\n"
+            f"- Each test must set up its own data and clean up after itself\n"
+            f"- Use realistic test data (real names, valid emails, proper dates)\n"
+            f"- Assert on HTTP status codes, response body structure, and specific field values\n"
+            f"- Output ONLY the complete test file — no fences, no commentary\n"
         )
 
         test_code = await self._call_llm(prompt)
@@ -146,6 +181,67 @@ class IntegrationTestAgent(BaseAgent):
         if code.endswith("```"):
             code = code[:-3]
         return code.strip() + "\n"
+
+    def _extract_endpoint_code(self, context: AgentContext) -> str:
+        """Extract controller/endpoint source code from related files for the prompt."""
+        endpoint_keywords = ("controller", "router", "handler", "endpoint", "route", "api")
+        sections: list[str] = []
+        total = 0
+        max_chars = 6000
+
+        for fb in context.blueprint.file_blueprints:
+            if fb.layer == "controller" or any(kw in fb.path.lower() for kw in endpoint_keywords):
+                content = context.related_files.get(fb.path, "")
+                if content:
+                    chunk = content[:2000]
+                    sections.append(f"--- {fb.path} ---\n{chunk}")
+                    total += len(chunk)
+                    if total >= max_chars:
+                        break
+
+        return "\n\n".join(sections) if sections else ""
+
+    def _build_test_hints(self, profile: LanguageProfile) -> str:
+        """Return language-specific integration test guidance."""
+        hints = {
+            "python": (
+                "- Use pytest with httpx.AsyncClient or TestClient (FastAPI/Starlette)\n"
+                "- Use unittest.mock.patch or pytest-mock for mocking external services\n"
+                "- Use fixtures for test data setup and teardown\n"
+                "- For Django, use django.test.TestCase with self.client"
+            ),
+            "java": (
+                "- Use @SpringBootTest with @AutoConfigureMockMvc\n"
+                "- Use MockMvc for HTTP endpoint testing\n"
+                "- Use @MockBean for external service mocking\n"
+                "- Use @Transactional for automatic rollback after each test\n"
+                "- Assert with MockMvcResultMatchers: status(), jsonPath(), content()"
+            ),
+            "go": (
+                "- Use net/http/httptest.NewServer for test HTTP server\n"
+                "- Use httptest.NewRecorder for response recording\n"
+                "- Use testify/assert for assertions\n"
+                "- Use interfaces for dependency injection and mocking"
+            ),
+            "typescript": (
+                "- Use supertest for HTTP endpoint testing\n"
+                "- Use jest.mock() for external service mocking\n"
+                "- Use beforeEach/afterEach for setup/teardown\n"
+                "- Assert response.status, response.body, and specific fields"
+            ),
+            "rust": (
+                "- Use actix_web::test or axum::test for HTTP testing\n"
+                "- Use #[tokio::test] for async tests\n"
+                "- Use mockall for trait mocking"
+            ),
+            "csharp": (
+                "- Use WebApplicationFactory<Program> for integration testing\n"
+                "- Use HttpClient from factory.CreateClient()\n"
+                "- Use Moq for external service mocking\n"
+                "- Use [Fact] or [Theory] attributes for test methods"
+            ),
+        }
+        return hints.get(profile.name, "- Use the standard test framework for this language")
 
     async def _run_integration_tests(
         self, test_file: str, profile: LanguageProfile
