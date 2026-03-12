@@ -279,7 +279,8 @@ class FileTools:
 
     def _resolve(self, path: str) -> Path:
         """Resolve a path relative to workspace root, preventing path traversal."""
+        root_resolved = self.root.resolve()
         resolved = (self.root / path).resolve()
-        if not str(resolved).startswith(str(self.root.resolve())):
+        if not (resolved == root_resolved or resolved.is_relative_to(root_resolved)):
             raise PermissionError(f"Path traversal detected: {path}")
         return resolved

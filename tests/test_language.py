@@ -40,7 +40,7 @@ class TestLanguageProfiles:
         assert "go test" in GO.test_command
 
     def test_typescript_profile(self):
-        assert TYPESCRIPT.file_extensions == [".ts"]
+        assert TYPESCRIPT.file_extensions == [".ts", ".tsx"]
         assert "jest" in TYPESCRIPT.test_command
         assert "node" in TYPESCRIPT.docker_image
 

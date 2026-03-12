@@ -130,12 +130,17 @@ class RepositoryManager:
             return self.workspace / Path(rel_path).name  # preserve original case
 
         if root == self.workspace:
-            return self.workspace / rel_path
-        root_prefix = str(root.relative_to(self.workspace)).replace("\\", "/")
-        if rel_path.startswith(root_prefix + "/") or rel_path == root_prefix:
-            # Path already includes the root prefix — write relative to workspace
-            return self.workspace / rel_path
-        return root / rel_path
+            resolved = (self.workspace / rel_path).resolve()
+        else:
+            root_prefix = str(root.relative_to(self.workspace)).replace("\\", "/")
+            if rel_path.startswith(root_prefix + "/") or rel_path == root_prefix:
+                resolved = (self.workspace / rel_path).resolve()
+            else:
+                resolved = (root / rel_path).resolve()
+        workspace_resolved = self.workspace.resolve()
+        if not (resolved == workspace_resolved or resolved.is_relative_to(workspace_resolved)):
+            raise ValueError(f"Path traversal blocked: {rel_path!r}")
+        return resolved
 
     @staticmethod
     def _write_atomic(file_path: Path, content: str) -> None:

@@ -109,7 +109,7 @@ class DesignParserAgent(BaseAgent):
                         f"Figma design structure (from REST API):\n"
                         f"{self._summarise_figma_nodes(figma_data)}\n"
                     )
-                    self._metrics["figma_api_call"] = 1
+                    self._metrics["figma_api_call"] = self._metrics.get("figma_api_call", 0) + 1
                     logger.info("Fetched Figma file data for key %s", file_key)
                 except Exception as exc:
                     logger.warning(
@@ -144,7 +144,13 @@ class DesignParserAgent(BaseAgent):
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(api_url, headers={"X-Figma-Token": token})
             resp.raise_for_status()
-            return resp.json()
+            data = resp.json()
+        if "document" not in data:
+            raise ValueError(
+                f"Figma API response missing 'document' key — "
+                f"unexpected schema (keys: {list(data)[:10]})"
+            )
+        return data
 
     @staticmethod
     def _summarise_figma_nodes(data: dict) -> str:

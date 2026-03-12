@@ -347,7 +347,7 @@ class BaseAgent(ABC):
                 except ValueError:
                     return "Error: access denied (path escapes workspace)"
             target = (workspace / directory).resolve()
-            if not str(target).startswith(str(workspace)):
+            if not (target == workspace or target.is_relative_to(workspace)):
                 return "Error: access denied (path escapes workspace)"
             base = target
         if not base.exists():
