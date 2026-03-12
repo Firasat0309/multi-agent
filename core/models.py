@@ -53,6 +53,15 @@ class TaskType(str, Enum):
     DESIGN_ARCHITECTURE = "design_architecture"
     CREATE_PLAN = "create_plan"
     VERIFY_BUILD = "verify_build"
+    # ── Fullstack / Frontend task types ──
+    PLAN_PRODUCT = "plan_product"
+    GENERATE_API_CONTRACT = "generate_api_contract"
+    PARSE_DESIGN = "parse_design"
+    PLAN_COMPONENTS = "plan_components"
+    BUILD_COMPONENT_DAG = "build_component_dag"
+    GENERATE_COMPONENT = "generate_component"
+    INTEGRATE_API = "integrate_api"
+    MANAGE_STATE = "manage_state"
 
 
 class TaskStatus(str, Enum):
@@ -105,6 +114,15 @@ class AgentRole(str, Enum):
     CHANGE_PLANNER = "change_planner"
     INTEGRATION_TESTER = "integration_tester"
     BUILD_VERIFIER = "build_verifier"
+    # ── Fullstack / Frontend agent roles ──
+    PRODUCT_PLANNER = "product_planner"
+    API_CONTRACT_GENERATOR = "api_contract_generator"
+    DESIGN_PARSER = "design_parser"
+    COMPONENT_PLANNER = "component_planner"
+    COMPONENT_DAG_BUILDER = "component_dag_builder"
+    COMPONENT_GENERATOR = "component_generator"
+    API_INTEGRATOR = "api_integrator"
+    STATE_MANAGER = "state_manager"
 
 
 @dataclass
@@ -270,3 +288,93 @@ class ReviewResult:
     passed: bool
     findings: list[ReviewFinding] = field(default_factory=list)
     summary: str = ""
+
+
+# ── Fullstack / Frontend Models ───────────────────────────────────────────────
+
+
+@dataclass
+class ProductRequirements:
+    """High-level product requirements extracted from a user prompt."""
+    title: str
+    description: str
+    user_stories: list[str] = field(default_factory=list)
+    features: list[str] = field(default_factory=list)
+    # e.g. {"frontend": "React/Next.js", "backend": "FastAPI", "db": "PostgreSQL"}
+    tech_preferences: dict[str, str] = field(default_factory=dict)
+    has_frontend: bool = True
+    has_backend: bool = True
+
+
+@dataclass
+class APIEndpoint:
+    """A single REST or GraphQL endpoint contract."""
+    path: str
+    method: str  # GET, POST, PUT, DELETE, PATCH
+    description: str
+    request_schema: dict[str, Any] = field(default_factory=dict)
+    response_schema: dict[str, Any] = field(default_factory=dict)
+    auth_required: bool = False
+    tags: list[str] = field(default_factory=list)
+
+
+@dataclass
+class APIContract:
+    """API contract (OpenAPI or GraphQL) shared between frontend and backend."""
+    title: str
+    version: str = "1.0.0"
+    base_url: str = "/api/v1"
+    endpoints: list[APIEndpoint] = field(default_factory=list)
+    # Named reusable schemas (JSON Schema objects)
+    schemas: dict[str, Any] = field(default_factory=dict)
+    openapi_spec: str = ""   # Full OpenAPI 3.x YAML/JSON string
+    contract_format: str = "openapi"  # "openapi" | "graphql"
+
+
+@dataclass
+class UIComponent:
+    """Blueprint for a single UI component."""
+    name: str
+    file_path: str
+    component_type: str  # "page", "layout", "feature", "ui", "shared"
+    description: str
+    props: list[str] = field(default_factory=list)
+    state_needs: list[str] = field(default_factory=list)   # state slices needed
+    api_calls: list[str] = field(default_factory=list)     # endpoint paths consumed
+    depends_on: list[str] = field(default_factory=list)    # other component names
+    children: list[str] = field(default_factory=list)
+    layer: str = ""  # pages, components/feature, components/ui, layouts
+
+
+@dataclass
+class UIDesignSpec:
+    """Parsed representation of a UI design (from Figma URL or text description)."""
+    framework: str = "react"   # "react", "nextjs", "vue", "angular"
+    design_description: str = ""
+    figma_url: str = ""        # Original Figma URL if provided
+    pages: list[str] = field(default_factory=list)
+    global_styles: dict[str, str] = field(default_factory=dict)
+    design_tokens: dict[str, Any] = field(default_factory=dict)  # colors, spacing, etc.
+
+
+@dataclass
+class ComponentPlan:
+    """Complete plan for all frontend components."""
+    components: list[UIComponent] = field(default_factory=list)
+    framework: str = "react"
+    state_solution: str = "zustand"   # "redux", "zustand", "context"
+    api_base_url: str = "/api/v1"
+    routing_solution: str = ""        # "react-router", "nextjs", "vue-router"
+    package_json: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class FullstackBlueprint:
+    """Combined blueprint for the entire fullstack application."""
+    product_requirements: ProductRequirements | None = None
+    backend_blueprint: RepositoryBlueprint | None = None
+    frontend_blueprint: RepositoryBlueprint | None = None
+    api_contract: APIContract | None = None
+    component_plan: ComponentPlan | None = None
+    workspace_root: str = ""
+

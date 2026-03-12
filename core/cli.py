@@ -208,6 +208,82 @@ def enhance(
     sys.exit(0 if result.success else 1)
 
 
+@cli.command()
+@click.argument("prompt")
+@click.option("--workspace", "-w", default="workspace", help="Output directory")
+@click.option("--model", "-m", default="claude-sonnet-4-20250514", help="LLM model")
+@click.option("--provider", "-p", default="anthropic", help="LLM provider")
+@click.option("--sandbox", "-s", default="docker", help="Sandbox type (docker/local)")
+@click.option("--max-agents", default=4, help="Max concurrent agents")
+@click.option("--no-interactive", is_flag=True, default=False, help="Disable live display")
+@click.option("--figma-url", default="", help="Figma design URL for the UI design parser")
+@click.option(
+    "--allow-host-execution",
+    is_flag=True,
+    default=False,
+    help="Allow running without Docker isolation (NOT recommended for untrusted prompts)",
+)
+def fullstack(
+    prompt: str,
+    workspace: str,
+    model: str,
+    provider: str,
+    sandbox: str,
+    max_agents: int,
+    no_interactive: bool,
+    figma_url: str,
+    allow_host_execution: bool,
+) -> None:
+    """Generate a complete fullstack project (backend + frontend) from a prompt.
+
+    Runs product planning, backend architecture, API contract generation,
+    and then the backend and frontend pipelines **in parallel**:
+
+    \b
+      workspace/backend/   — generated backend API
+      workspace/frontend/  — generated React/Next.js/Vue UI
+
+    Optionally supply a Figma design URL via --figma-url for richer UI design.
+
+    Example:
+        python -m core.cli fullstack "Build a Task Manager SaaS app" -w ./my-app
+    """
+    try:
+        settings = Settings(
+            workspace_dir=Path(workspace).resolve(),
+            llm=LLMConfig(
+                provider=LLMProvider(provider),
+                model=model,
+            ),
+            sandbox=SandboxConfig(sandbox_type=SandboxType(sandbox)),
+            max_concurrent_agents=max_agents,
+            allow_host_execution=allow_host_execution or sandbox == "local",
+        )
+
+        pipeline = Pipeline(settings, interactive=not no_interactive)
+    except LLMConfigError as e:
+        console.print(Panel(
+            f"[bold red]{str(e)}[/bold red]",
+            title="❌ Configuration Error",
+            border_style="red",
+        ))
+        sys.exit(1)
+    except ValueError as e:
+        console.print(Panel(
+            f"[bold red]Invalid configuration: {e}[/bold red]\n\n"
+            f"Valid providers: anthropic, openai, gemini\n"
+            f"Valid sandbox types: docker, local",
+            title="❌ Configuration Error",
+            border_style="red",
+        ))
+        sys.exit(1)
+
+    result = asyncio.run(pipeline.run_fullstack(prompt, figma_url=figma_url))
+    _display_fullstack_result(result)
+
+    sys.exit(0 if result.success else 1)
+
+
 def _display_enhance_result(result: PipelineResult) -> None:
     """Display modification pipeline results."""
     if result.success:
@@ -245,6 +321,48 @@ def _display_enhance_result(result: PipelineResult) -> None:
         error_text = "\n".join(result.errors[:3])
         if len(result.errors) > 3:
             error_text += f"\n... and {len(result.errors) - 3} more"
+        table.add_row("Errors", error_text)
+
+    console.print(table)
+
+
+def _display_fullstack_result(result: PipelineResult) -> None:
+    """Display fullstack pipeline results."""
+    if result.success:
+        console.print(Panel.fit(
+            "[bold green]Fullstack project generated successfully![/bold green]",
+            title="✅ Fullstack Complete",
+        ))
+    else:
+        console.print(Panel.fit(
+            "[bold yellow]Fullstack generation completed with issues[/bold yellow]",
+            title="⚠️  Warning",
+        ))
+
+    table = Table(title="Fullstack Pipeline Results")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", style="white")
+
+    table.add_row("Workspace", str(result.workspace_path))
+    table.add_row("Backend", str(result.workspace_path / "backend"))
+    table.add_row("Frontend", str(result.workspace_path / "frontend"))
+    table.add_row("Elapsed", f"{result.elapsed_seconds:.1f}s")
+
+    m = result.metrics or {}
+    if m.get("api_endpoints"):
+        table.add_row("API endpoints", str(m["api_endpoints"]))
+    if m.get("components_planned"):
+        table.add_row("Components planned", str(m["components_planned"]))
+    if m.get("components_generated") is not None:
+        table.add_row("Components generated", str(m["components_generated"]))
+
+    for status_name, count in result.task_stats.items():
+        table.add_row(f"BE tasks ({status_name})", str(count))
+
+    if result.errors:
+        error_text = "\n".join(result.errors[:5])
+        if len(result.errors) > 5:
+            error_text += f"\n... and {len(result.errors) - 5} more"
         table.add_row("Errors", error_text)
 
     console.print(table)

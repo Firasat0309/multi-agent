@@ -80,6 +80,32 @@ class Pipeline:
             self._stop_live()
             self._stop_file_logging(fh)
 
+    async def run_fullstack(
+        self,
+        user_prompt: str,
+        figma_url: str = "",
+    ) -> PipelineResult:
+        """Generate a complete fullstack project (backend + frontend) from *user_prompt*.
+
+        Optionally accepts a *figma_url* for design parsing.  The pipeline
+        generates:
+          - `workspace/backend/`  — the backend API (via RunPipeline)
+          - `workspace/frontend/` — the React/Next.js/Vue UI (via FrontendPipeline)
+        with a shared OpenAPI contract as the handshake between the two.
+        """
+        from core.pipeline_fullstack import FullstackPipeline
+
+        start_time = time.monotonic()
+        self._start_live()
+        fh = self._start_file_logging(self.settings.workspace_dir)
+        try:
+            return await FullstackPipeline(
+                self.settings, self.llm, self._live, self.interactive,
+            ).execute(user_prompt, start_time, figma_url=figma_url)
+        finally:
+            self._stop_live()
+            self._stop_file_logging(fh)
+
     # ── Console / logging lifecycle ───────────────────────────────────────────
 
     def _start_live(self) -> None:

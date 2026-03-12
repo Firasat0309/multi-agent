@@ -19,6 +19,15 @@ from agents.security_agent import SecurityAgent
 from agents.test_agent import TestAgent
 from agents.planner_agent import PlannerAgent
 from agents.writer_agent import WriterAgent
+# ── Fullstack / Frontend agents ───────────────────────────────────────────────
+from agents.product_planner_agent import ProductPlannerAgent
+from agents.api_contract_agent import APIContractAgent
+from agents.design_parser_agent import DesignParserAgent
+from agents.component_planner_agent import ComponentPlannerAgent
+from agents.component_dag_agent import ComponentDAGAgent
+from agents.component_generator_agent import ComponentGeneratorAgent
+from agents.api_integration_agent import APIIntegrationAgent
+from agents.state_management_agent import StateManagementAgent
 from config.settings import Settings
 from core.context_builder import ContextBuilder
 from core.event_bus import AgentEvent, BusEventType, EventBus
@@ -62,6 +71,15 @@ TASK_AGENT_MAP: dict[TaskType, type[BaseAgent]] = {
     TaskType.DESIGN_ARCHITECTURE: ArchitectAgent,
     TaskType.CREATE_PLAN: PlannerAgent,
     TaskType.VERIFY_BUILD: BuildVerifierAgent,
+    # ── Fullstack / Frontend task types ──────────────────────────────────────
+    TaskType.PLAN_PRODUCT: ProductPlannerAgent,
+    TaskType.GENERATE_API_CONTRACT: APIContractAgent,
+    TaskType.PARSE_DESIGN: DesignParserAgent,
+    TaskType.PLAN_COMPONENTS: ComponentPlannerAgent,
+    TaskType.BUILD_COMPONENT_DAG: ComponentDAGAgent,
+    TaskType.GENERATE_COMPONENT: ComponentGeneratorAgent,
+    TaskType.INTEGRATE_API: APIIntegrationAgent,
+    TaskType.MANAGE_STATE: StateManagementAgent,
 }
 
 
