@@ -37,6 +37,7 @@ class DesignParserAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
+        return (
             "You are a senior UI/UX design parser agent.  Your job is to read a design\n"
             "description (or Figma URL context) and produce a structured UIDesignSpec.\n\n"
             "If a Figma URL is provided, YOU MUST USE YOUR TOOLS to query the Figma design "
