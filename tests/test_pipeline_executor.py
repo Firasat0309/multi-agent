@@ -365,3 +365,39 @@ class TestPhaseSkipForInterpreted:
             "_run_checkpoint should never be called for an interpreted language "
             "when skip_for_interpreted=True"
         )
+
+
+@pytest.mark.anyio
+async def test_tier_local_cycle_files_are_dispatched() -> None:
+    """Files in the same tier with cyclic deps should still run in tier loop.
+
+    TierScheduler can place cycle-broken files together. The executor must
+    not deadlock those files in PENDING just because checkpoint_mode dep
+    readiness expects TESTING/PASSED globally.
+    """
+    engine = LifecycleEngine(
+        file_paths=["A.java", "B.java"],
+        file_deps={"A.java": ["B.java"], "B.java": ["A.java"]},
+        compiled=True,
+        checkpoint_mode=True,
+    )
+
+    executor = _make_executor(compiled=True)
+
+    async def _advance(engine_arg: LifecycleEngine, path: str, phase: FilePhase) -> None:
+        if phase == FilePhase.PENDING:
+            engine_arg.process_event(path, EventType.DEPS_MET)
+            return
+        if phase == FilePhase.GENERATING:
+            engine_arg.process_event(path, EventType.CODE_GENERATED)
+            return
+        if phase == FilePhase.REVIEWING:
+            engine_arg.process_event(path, EventType.REVIEW_PASSED)
+            return
+
+    executor._am._execute_lifecycle_phase = AsyncMock(side_effect=_advance)
+
+    await executor._run_tier_lifecycles(engine, Tier(index=0, files=["A.java", "B.java"]))
+
+    assert engine.get_lifecycle("A.java").phase == FilePhase.BUILDING
+    assert engine.get_lifecycle("B.java").phase == FilePhase.BUILDING

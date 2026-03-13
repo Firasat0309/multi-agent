@@ -442,6 +442,45 @@ class PipelineExecutor:
                 and phase not in deferred_phases
             ]
 
+            # Tier-local dependency override (simple flow):
+            # 1) Ask LifecycleEngine for actionable files as usual.
+            # 2) If none are actionable, inspect only PENDING files in this tier.
+            # 3) Ignore dependencies that are also in this same tier.
+            # 4) Check readiness only against external dependencies.
+            # 5) If external deps are ready, dispatch the file from PENDING.
+            #
+            # Why: when TierScheduler breaks a cycle, mutually dependent files can
+            # land in one tier. Global checkpoint_mode gating would otherwise keep
+            # both files in PENDING forever.
+            if not actionable:
+                tier_pending: list[tuple[str, FilePhase]] = []
+                for path in tier.files:
+                    if path in in_flight:
+                        continue
+                    lc = engine.get_lifecycle(path)
+                    if lc.phase != FilePhase.PENDING:
+                        continue
+
+                    deps = engine._deps.get(path, [])
+                    external_deps = [d for d in deps if d not in tier_files]
+                    if engine.checkpoint_mode:
+                        external_ready = all(
+                            d not in engine._lifecycles
+                            or engine.get_lifecycle(d).phase in (FilePhase.TESTING, FilePhase.PASSED)
+                            for d in external_deps
+                        )
+                    else:
+                        external_ready = all(
+                            d not in engine._lifecycles
+                            or engine.get_lifecycle(d).phase not in (FilePhase.PENDING, FilePhase.GENERATING)
+                            for d in external_deps
+                        )
+
+                    if external_ready:
+                        tier_pending.append((path, FilePhase.PENDING))
+
+                actionable.extend(tier_pending)
+
             for path, phase in actionable:
                 in_flight.add(path)
                 t = asyncio.create_task(

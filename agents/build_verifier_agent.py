@@ -78,12 +78,39 @@ class BuildVerifierAgent(BaseAgent):
             )
 
         compiler_output = "\n".join(filter(None, [result.stdout, result.stderr])).strip()
-        logger.warning(
-            "Build failed for %s:\n%s", context.task.file, compiler_output[:500]
+
+        # Build a coder-friendly payload for FIX_CODE prompts.
+        # Compiler logs are often very large/noisy; the actionable diagnostics
+        # are typically near the end.
+        max_tail = 4000
+        output_tail = compiler_output[-max_tail:] if compiler_output else ""
+        # Target path comes from the lifecycle task currently being verified.
+        # For FilePhase.BUILDING, AgentManager creates Task(file=<current file>)
+        # and passes it into this agent as context.task.file.
+        # Fallback to file_blueprint.path for non-lifecycle invocations.
+        target_path = context.task.file or (
+            context.file_blueprint.path if context.file_blueprint else ""
         )
+        mentions_target = bool(target_path and target_path in compiler_output)
+        summary = (
+            f"Build failed for {target_path} using '{build_cmd}' "
+            f"(exit={result.exit_code}, target_mentioned={mentions_target})"
+        )
+        prompt_payload = (
+            f"{summary}\n\n"
+            f"--- compiler_output_tail ---\n{output_tail or '(no output captured)'}"
+        )
+
+        logger.warning("%s", summary)
         return TaskResult(
             success=False,
-            output=f"Build failed: {build_cmd}",
-            errors=[compiler_output or "Build command exited with non-zero status"],
-            metrics=self.get_metrics(),
+            output=summary,
+            errors=[prompt_payload],
+            metrics={
+                **self.get_metrics(),
+                "build_command": build_cmd,
+                "exit_code": result.exit_code,
+                "target_path": target_path,
+                "target_mentioned": mentions_target,
+            },
         )
