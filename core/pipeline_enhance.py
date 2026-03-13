@@ -14,7 +14,7 @@ from core.agent_manager import AgentManager
 from core.event_bus import EventBus
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient, calculate_cost
-from core.models import ChangeAction, ChangeActionType, FileBlueprint, RepositoryBlueprint, TaskType, TokenCost
+from core.models import ChangeAction, ChangeActionType, FileBlueprint, RepositoryBlueprint, TokenCost
 from core.pipeline_definition import ENHANCE_PIPELINE
 from core.plan_approver import PlanApprover, PlanPendingApprovalError
 from core.repository_manager import RepositoryManager

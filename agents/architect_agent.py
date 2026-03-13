@@ -8,16 +8,13 @@ from typing import Any
 
 from agents.base_agent import BaseAgent
 from core.language import detect_language_from_blueprint
-from core.llm_client import LLMClient
 from core.models import (
     AgentContext,
     AgentRole,
     FileBlueprint,
     RepositoryBlueprint,
-    Task,
     TaskResult,
 )
-from core.repository_manager import RepositoryManager
 
 logger = logging.getLogger(__name__)
 
@@ -185,7 +182,6 @@ class ArchitectAgent(BaseAgent):
             return {}
 
     def _parse_blueprint(self, data: dict[str, Any]) -> RepositoryBlueprint:
-        from core.language import detect_language_from_blueprint, get_language_profile
         from core.llm_schema import validate_architecture_response
 
         # Raises pydantic.ValidationError on structurally invalid data.

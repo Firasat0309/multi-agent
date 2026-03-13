@@ -1,7 +1,7 @@
 """Tests for the AST-based signature extractor."""
 
 import pytest
-from core.ast_extractor import ASTExtractor, FileSignature
+from core.ast_extractor import ASTExtractor
 
 
 @pytest.fixture

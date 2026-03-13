@@ -13,11 +13,11 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 import networkx as nx
 
-from core.models import Task, TaskStatus, TaskType, RepositoryBlueprint, FileBlueprint, ChangePlan, ChangeAction
+from core.models import Task, TaskStatus, TaskType, RepositoryBlueprint, ChangePlan, ChangeAction
 from core.state_machine import LifecycleEngine
 
 if TYPE_CHECKING:

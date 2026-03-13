@@ -6,7 +6,7 @@ import logging
 from typing import Any
 
 from agents.base_agent import BaseAgent
-from core.language import detect_language_from_blueprint, get_language_profile, LanguageProfile
+from core.language import get_language_profile, LanguageProfile
 from core.models import AgentContext, AgentRole, TaskResult
 from tools.terminal_tools import TerminalTools
 
@@ -175,7 +175,7 @@ class IntegrationTestAgent(BaseAgent):
         elif profile.name == "go":
             return f"go test -v -tags=integration ./{test_file.rsplit('/', 1)[0]}/..."
         elif profile.name in ("typescript", "ts"):
-            return f"npx jest --verbose --testPathPattern=integration"
+            return "npx jest --verbose --testPathPattern=integration"
         elif profile.name == "rust":
             return "cargo test --test '*'"
         elif profile.name in ("csharp", "c#"):

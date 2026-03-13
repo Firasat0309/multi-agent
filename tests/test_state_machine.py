@@ -2,7 +2,6 @@
 
 import pytest
 from core.state_machine import (
-    Event,
     EventType,
     FileLifecycle,
     FilePhase,

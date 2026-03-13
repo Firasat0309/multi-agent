@@ -1,9 +1,7 @@
 """Tests for the stub generator."""
 
-import tempfile
 from pathlib import Path
 
-import pytest
 from core.stub_generator import StubGenerator
 
 

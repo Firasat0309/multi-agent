@@ -1,6 +1,5 @@
 """Model Context Protocol (MCP) client integration."""
 
-import asyncio
 import logging
 from typing import Any
 from contextlib import AsyncExitStack

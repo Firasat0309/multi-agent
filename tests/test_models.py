@@ -1,15 +1,11 @@
 """Tests for core domain models."""
 
-import pytest
 from core.models import (
     FileBlueprint,
     FileIndex,
     RepositoryBlueprint,
     RepositoryIndex,
-    ReviewFinding,
-    ReviewLevel,
     Task,
-    TaskResult,
     TaskStatus,
     TaskType,
 )

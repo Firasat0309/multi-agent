@@ -84,7 +84,6 @@ class DockerSandbox(SandboxBase):
         cache_dir: Path | None = None,
     ) -> SandboxInfo:
         import docker
-        import os
         client = docker.from_env()
 
         # Auto-detect image from language profile when not explicitly configured
@@ -222,7 +221,8 @@ class DockerSandbox(SandboxBase):
     async def copy_to(self, sandbox_id: str, src: Path, dest: str) -> None:
         container = self._containers.get(sandbox_id)
         if container:
-            import tarfile, io
+            import tarfile
+            import io
             tar_stream = io.BytesIO()
             with tarfile.open(fileobj=tar_stream, mode="w") as tar:
                 tar.add(str(src), arcname=Path(dest).name)
@@ -232,7 +232,8 @@ class DockerSandbox(SandboxBase):
     async def copy_from(self, sandbox_id: str, src: str, dest: Path) -> None:
         container = self._containers.get(sandbox_id)
         if container:
-            import tarfile, io
+            import tarfile
+            import io
             bits, _ = container.get_archive(src)
             tar_stream = io.BytesIO()
             for chunk in bits:

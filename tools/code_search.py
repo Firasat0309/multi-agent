@@ -120,7 +120,6 @@ class CodeSearch:
 
         Returns a dict with keys: path, imports, classes, functions, first_lines.
         """
-        from typing import Any
         resolved = self.root / file_path
         if not resolved.is_file():
             return {"path": file_path, "error": "File not found"}

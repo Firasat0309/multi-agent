@@ -109,7 +109,6 @@ def status(workspace: str) -> None:
         console.print(f"[red]Workspace not found: {workspace}[/red]")
         return
 
-    import json
     table = Table(title=f"Workspace: {workspace}")
     table.add_column("File", style="cyan")
     table.add_column("Exists", style="green")

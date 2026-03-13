@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from config.settings import Settings
-from core.llm_client import LLMClient, LLMConfigError
+from core.llm_client import LLMClient
 from core.live_console import LiveConsole, LiveConsoleHandler
 from core.models import RepositoryBlueprint, ChangePlan, RepoAnalysis, TokenCost
 

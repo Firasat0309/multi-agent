@@ -1,7 +1,6 @@
 """Tests for the context builder."""
 
 import pytest
-from pathlib import Path
 
 from core.context_builder import ContextBuilder
 from core.models import (

@@ -35,8 +35,8 @@ from typing import Any, TYPE_CHECKING
 from core.checkpoint import BuildCheckpoint, CheckpointCycleResult, CheckpointResult
 from core.error_attributor import CompilerErrorAttributor
 from core.event_bus import AgentEvent, BusEventType
-from core.models import Task, TaskType, TaskResult
-from core.state_machine import EventType, FilePhase, FileLifecycle, LifecycleEngine
+from core.models import Task, TaskType
+from core.state_machine import EventType, FilePhase, LifecycleEngine
 from core.stub_generator import StubGenerator
 from core.tier_scheduler import Tier, TierScheduler
 
@@ -47,7 +47,6 @@ if TYPE_CHECKING:
     from core.language import LanguageProfile
     from core.pipeline_definition import CheckpointDef, PipelineDefinition
     from core.task_engine import TaskGraph
-    from tools.terminal_tools import TerminalTools
 
 logger = logging.getLogger(__name__)
 

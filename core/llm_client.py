@@ -158,26 +158,26 @@ class LLMClient:
         if provider == LLMProvider.ANTHROPIC:
             if not self.config.api_key or self.config.api_key.strip() == "":
                 raise LLMConfigError(
-                    f"❌ Missing API key for Anthropic\n\n"
-                    f"Set your API key with:\n"
-                    f"  export ANTHROPIC_API_KEY=\"sk-ant-your-key-here\"\n\n"
-                    f"Get your key at: https://console.anthropic.com"
+                    "❌ Missing API key for Anthropic\n\n"
+                    "Set your API key with:\n"
+                    "  export ANTHROPIC_API_KEY=\"sk-ant-your-key-here\"\n\n"
+                    "Get your key at: https://console.anthropic.com"
                 )
         elif provider == LLMProvider.OPENAI:
             if not self.config.openai_api_key or self.config.openai_api_key.strip() == "":
                 raise LLMConfigError(
-                    f"❌ Missing API key for OpenAI\n\n"
-                    f"Set your API key with:\n"
-                    f"  export OPENAI_API_KEY=\"sk-proj-your-key-here\"\n\n"
-                    f"Get your key at: https://platform.openai.com/api-keys"
+                    "❌ Missing API key for OpenAI\n\n"
+                    "Set your API key with:\n"
+                    "  export OPENAI_API_KEY=\"sk-proj-your-key-here\"\n\n"
+                    "Get your key at: https://platform.openai.com/api-keys"
                 )
         elif provider == LLMProvider.GEMINI:
             if not self.config.gemini_api_key or self.config.gemini_api_key.strip() == "":
                 raise LLMConfigError(
-                    f"❌ Missing API key for Google Gemini\n\n"
-                    f"Set your API key with:\n"
-                    f"  export GEMINI_API_KEY=\"your-api-key-here\"\n\n"
-                    f"Get your key at: https://aistudio.google.com/app/apikey"
+                    "❌ Missing API key for Google Gemini\n\n"
+                    "Set your API key with:\n"
+                    "  export GEMINI_API_KEY=\"your-api-key-here\"\n\n"
+                    "Get your key at: https://aistudio.google.com/app/apikey"
                 )
 
         # Check model validity
@@ -316,7 +316,6 @@ class LLMClient:
     async def _anthropic_generate(
         self, client: Any, system: str, user: str, temperature: float, max_tokens: int
     ) -> LLMResponse:
-        import anthropic
 
         def _sync() -> Any:
             try:
@@ -330,10 +329,10 @@ class LLMClient:
             except TypeError as e:
                 if "authentication" in str(e).lower() or "api_key" in str(e).lower():
                     raise LLMConfigError(
-                        f"❌ Anthropic authentication failed\n\n"
-                        f"Your API key is missing or invalid.\n"
-                        f"Set: export ANTHROPIC_API_KEY=\"sk-ant-your-key\"\n"
-                        f"Get key at: https://console.anthropic.com"
+                        "❌ Anthropic authentication failed\n\n"
+                        "Your API key is missing or invalid.\n"
+                        "Set: export ANTHROPIC_API_KEY=\"sk-ant-your-key\"\n"
+                        "Get key at: https://console.anthropic.com"
                     ) from e
                 raise
 
@@ -416,10 +415,10 @@ class LLMClient:
                     ) from e
             elif "unauthenticated" in error_str or "authentication" in error_str or "api_key" in error_str or "401" in str(e):
                 raise LLMConfigError(
-                    f"❌ Gemini authentication failed\n\n"
-                    f"Your API key is missing or invalid.\n"
-                    f"Set: export GEMINI_API_KEY=\"your-api-key\"\n"
-                    f"Get key at: https://aistudio.google.com/app/apikey"
+                    "❌ Gemini authentication failed\n\n"
+                    "Your API key is missing or invalid.\n"
+                    "Set: export GEMINI_API_KEY=\"your-api-key\"\n"
+                    "Get key at: https://aistudio.google.com/app/apikey"
                 ) from e
             elif any(code in str(e) for code in ("500", "502", "503", "529")) or "overloaded" in error_str or "resource_exhausted" in error_str or "429" in str(e):
                 # Transient server / rate-limit errors — re-raise the original
@@ -465,7 +464,6 @@ class LLMClient:
         client = self._get_client()
 
         if self.config.provider == LLMProvider.ANTHROPIC:
-            import anthropic
 
             collected: list[str] = []
             usage: dict[str, int] = {}

@@ -9,18 +9,15 @@ from pathlib import Path
 from typing import Any
 
 from agents.base_agent import BaseAgent
-from core.language import detect_language_from_extensions, LanguageProfile, PYTHON
+from core.language import detect_language_from_extensions, LanguageProfile
 from core.models import (
     AgentContext,
     AgentRole,
     FileIndex,
     ModuleInfo,
     RepoAnalysis,
-    RepositoryBlueprint,
-    RepositoryIndex,
     TaskResult,
 )
-from core.repository_manager import RepositoryManager
 
 logger = logging.getLogger(__name__)
 

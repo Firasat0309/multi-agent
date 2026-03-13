@@ -23,7 +23,6 @@ from core.state_machine import EventType, FilePhase
 
 if TYPE_CHECKING:
     from core.agent_manager import AgentManager
-    from core.pipeline_definition import PipelineDefinition
     from core.state_machine import LifecycleEngine
     from core.task_engine import TaskGraph
     from core.tier_scheduler import Tier

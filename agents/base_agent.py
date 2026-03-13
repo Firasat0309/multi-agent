@@ -15,8 +15,8 @@ _READ_CHUNK_LINES = 150
 
 from core.agent_tools import ToolDefinition
 from core.language import get_language_profile
-from core.llm_client import LLMClient, LLMResponse, ToolCall
-from core.models import AgentContext, AgentRole, Task, TaskResult
+from core.llm_client import LLMClient, ToolCall
+from core.models import AgentContext, AgentRole, TaskResult
 from core.repository_manager import RepositoryManager
 from core.mcp_client import MCPClient
 from tools.code_search import CodeSearch

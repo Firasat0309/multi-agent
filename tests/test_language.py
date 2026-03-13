@@ -1,10 +1,8 @@
 """Tests for language profile system."""
 
-import pytest
 
 from core.language import (
     PYTHON, JAVA, GO, TYPESCRIPT, RUST, CSHARP,
-    LanguageProfile,
     get_language_profile,
     detect_language_from_blueprint,
 )

@@ -3,8 +3,7 @@
 from __future__ import annotations
 
 import logging
-from collections import defaultdict, deque
-from typing import Any
+from collections import deque
 
 from agents.base_agent import BaseAgent
 from core.models import (

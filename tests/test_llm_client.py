@@ -5,7 +5,7 @@ import pytest
 from unittest.mock import MagicMock
 
 from config.settings import LLMConfig, LLMProvider
-from core.llm_client import LLMClient, LLMResponse
+from core.llm_client import LLMClient
 
 
 def make_client(provider: str, model: str = "test-model") -> LLMClient:

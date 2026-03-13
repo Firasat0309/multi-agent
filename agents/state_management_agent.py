@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from agents.base_agent import BaseAgent
 from core.agent_tools import ToolDefinition
@@ -12,7 +11,6 @@ from core.models import (
     AgentRole,
     ComponentPlan,
     TaskResult,
-    UIComponent,
 )
 
 logger = logging.getLogger(__name__)

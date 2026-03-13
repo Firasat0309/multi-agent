@@ -4,12 +4,6 @@ import pytest
 from pydantic import ValidationError
 
 from core.llm_schema import (
-    ArchitectureResponse,
-    FileBlueprintSchema,
-    ReviewFindingSchema,
-    ReviewResponse,
-    SecurityResponse,
-    SecurityVulnerability,
     validate_architecture_response,
     validate_review_response,
     validate_security_response,

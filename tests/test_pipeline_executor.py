@@ -470,12 +470,9 @@ class TestCheckpointRetrySimulation:
         so we can verify the file_error_hashes dict prevents a second identical
         fix from being dispatched.
         """
-        import hashlib
-        from core.checkpoint import BuildCheckpoint, CheckpointCycleResult, CheckpointResult
-        from core.error_attributor import AttributionResult, AttributedError, CompilerErrorAttributor
+        from core.checkpoint import BuildCheckpoint, CheckpointResult
+        from core.error_attributor import AttributionResult, AttributedError
         from core.pipeline_definition import CheckpointDef
-        from core.pipeline_executor import PipelineExecutor
-        from core.tier_scheduler import Tier
 
         executor = _make_executor()
         engine = _make_engine()
@@ -564,7 +561,6 @@ class TestConcurrentExecution:
     async def test_independent_file_locks_do_not_block_each_other(self) -> None:
         """Two tasks targeting *different* files must run truly concurrently."""
         import asyncio
-        import time
         from core.file_lock_manager import FileLockManager
 
         manager = FileLockManager()

@@ -18,8 +18,7 @@ from agents.api_integration_agent import APIIntegrationAgent
 from agents.state_management_agent import StateManagementAgent
 from config.settings import Settings
 from core.import_validator import ImportValidator
-from core.language import TYPESCRIPT
-from core.llm_client import LLMClient, LLMConfigError
+from core.llm_client import LLMClient
 from core.tsx_compiler import TSXCompiler
 from core.models import (
     APIContract,
@@ -28,8 +27,6 @@ from core.models import (
     ProductRequirements,
     RepositoryBlueprint,
     Task,
-    TaskResult,
-    TaskStatus,
     TaskType,
     UIDesignSpec,
     AgentContext,
@@ -120,13 +117,12 @@ class FrontendPipeline:
             self._phase("FE: Design Parsing", "running")
             logger.info("[FE Phase 1] Parsing design spec...")
             design_spec: UIDesignSpec | None = None
-            try:
-                parser = DesignParserAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
-                design_spec = await parser.parse_design(requirements, figma_url)
-                logger.info(
-                    "UIDesignSpec: %d pages, framework=%s",
-                    len(design_spec.pages), design_spec.framework,
-                )
+            parser = DesignParserAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
+            design_spec = await parser.parse_design(requirements, figma_url)
+            logger.info(
+                "UIDesignSpec: %d pages, framework=%s",
+                len(design_spec.pages), design_spec.framework,
+            )
             self._complete_phase("FE: Design Parsing")
         except Exception as exc:
             logger.exception("Design parsing failed")

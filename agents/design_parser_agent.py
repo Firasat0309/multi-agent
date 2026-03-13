@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 from typing import Any
 
-import httpx
 
 _FIGMA_FILE_RE = re.compile(r"figma\.com/(?:file|design)/([A-Za-z0-9_-]+)")
 _FIGMA_API_BASE = "https://api.figma.com/v1"
