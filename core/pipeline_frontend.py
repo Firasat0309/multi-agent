@@ -427,12 +427,20 @@ class FrontendPipeline:
 
     def _phase(self, name: str, status: str) -> None:
         if self._live:
-            self._live.update_phase(name, status)
+            if status in ("completed", "done"):
+                self._live.complete_phase(name)
+            elif status == "failed":
+                self._live.fail_phase(name)
+            else:
+                self._live.set_phase(name, status)
         logger.debug("Phase %s: %s", name, status)
 
     def _complete_phase(self, name: str) -> None:
-        self._phase(name, "completed")
+        if self._live:
+            self._live.complete_phase(name)
+        logger.debug("Phase %s: done", name)
 
     def _fail_phase(self, name: str, reason: str) -> None:
         logger.error("Phase %s failed: %s", name, reason)
-        self._phase(name, "failed")
+        if self._live:
+            self._live.fail_phase(name, reason)
