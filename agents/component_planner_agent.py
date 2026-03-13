@@ -50,6 +50,7 @@ class ComponentPlannerAgent(BaseAgent):
             '      "file_path": "src/components/feature/UserList.tsx",\n'
             '      "component_type": "feature",\n'
             '      "description": "Displays paginated list of users",\n'
+            '      "figma_node_id": "1:23",\n'
             '      "props": ["users: User[]", "onSelect: (id: number) => void"],\n'
             '      "state_needs": ["userStore"],\n'
             '      "api_calls": ["/api/v1/users"],\n'
@@ -67,6 +68,7 @@ class ComponentPlannerAgent(BaseAgent):
             "  shared    → Cross-cutting utilities (ErrorBoundary, SEO, ThemeProvider)\n\n"
             "Rules:\n"
             "- Every page from the design spec must map to at least one 'pages' component.\n"
+            "- Preserve exact `figma_node_id` strings if the spec lists them, otherwise null.\n"
             "- All components must have explicit file_path with correct extension (.tsx/.vue).\n"
             "- Use TypeScript for React/Next.js/Angular; use <script setup lang='ts'> for Vue.\n"
             "- api_calls must be populated for any component that fetches data.\n"
@@ -141,6 +143,7 @@ class ComponentPlannerAgent(BaseAgent):
                 file_path=str(c.get("file_path", "")),
                 component_type=str(c.get("component_type", "ui")),
                 description=str(c.get("description", "")),
+                figma_node_id=str(c.get("figma_node_id", "")) if c.get("figma_node_id") else None,
                 props=[str(p) for p in c.get("props", [])],
                 state_needs=[str(s) for s in c.get("state_needs", [])],
                 api_calls=[str(a) for a in c.get("api_calls", [])],

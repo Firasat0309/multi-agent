@@ -67,7 +67,7 @@ class ComponentGeneratorAgent(BaseAgent):
             "Your task is to generate a single, production-quality UI component file.\n\n"
             "Rules:\n"
             "- Use TypeScript throughout (.tsx for React, <script setup lang='ts'> for Vue).\n"
-            "- Apply Tailwind CSS utility classes for styling unless the plan specifies otherwise.\n"
+            "- If the component has a `figma_node_id`, use your MCP tools to fetch its code skeleton FIRST.\n"
             "- Keep components focused on a single responsibility.\n"
             "- Use named exports for components and types.\n"
             "- Import child components by relative path from the same src/ tree.\n"
@@ -91,6 +91,7 @@ class ComponentGeneratorAgent(BaseAgent):
                 f"File path: {component.file_path}\n"
                 f"Type: {component.component_type}\n"
                 f"Description: {component.description}\n"
+                f"Figma Node ID: {getattr(component, 'figma_node_id', 'None')}\n"
                 f"Props: {component.props}\n"
                 f"State needs: {component.state_needs}\n"
                 f"API calls: {component.api_calls}\n"
@@ -122,7 +123,9 @@ class ComponentGeneratorAgent(BaseAgent):
 
         return (
             f"{comp_text}\n{plan_text}\n{contract_text}\n"
-            "Generate the complete component source code and write it to disk using write_file."
+            "If a Figma Node ID is provided, use your tools to fetch the structural code skeleton FIRST. "
+            "Hydrate the skeleton with the described API and state handlers, then generate "
+            "the complete component source code and write it to disk using write_file."
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:

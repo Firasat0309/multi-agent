@@ -89,6 +89,9 @@ class Settings:
     # Number of build attempts per tier checkpoint (1 initial + retries).
     # Increase for flaky compilers; decrease to fail-fast during development.
     build_checkpoint_retries: int = 3
+    
+    # Optional command to start a local embedded MCP server (e.g. ['npx', '-y', '@figma/mcp-server'])
+    mcp_server_command: list[str] = field(default_factory=list)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -106,6 +109,7 @@ class Settings:
             ),
             max_concurrent_agents=int(os.environ.get("MAX_CONCURRENT_AGENTS", "4")),
             build_checkpoint_retries=int(os.environ.get("BUILD_CHECKPOINT_RETRIES", "3")),
+            mcp_server_command=os.environ.get("MCP_SERVER_COMMAND", "").split() if os.environ.get("MCP_SERVER_COMMAND") else [],
         )
 
 

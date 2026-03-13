@@ -206,6 +206,10 @@ EMBEDDING_MODEL=all-MiniLM-L6-v2             # sentence-transformers model
 MAX_CONTEXT_TOKENS=6000
 MAX_RELATED_FILES=10
 
+# ── Figma UI Generation (Optional) ────────────────────────────────────────────
+MCP_SERVER_COMMAND="npx -y @modelcontextprotocol/server-figma"
+FIGMA_TOKEN="figd_..."                              # Personal Access Token from Figma
+
 # ── Observability ─────────────────────────────────────────────────────────────
 PROMETHEUS_PORT=9090
 OTLP_ENDPOINT=http://localhost:4317           # OpenTelemetry collector endpoint

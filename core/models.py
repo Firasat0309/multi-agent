@@ -338,6 +338,7 @@ class UIComponent:
     file_path: str
     component_type: str  # "page", "layout", "feature", "ui", "shared"
     description: str
+    figma_node_id: str | None = None
     props: list[str] = field(default_factory=list)
     state_needs: list[str] = field(default_factory=list)   # state slices needed
     api_calls: list[str] = field(default_factory=list)     # endpoint paths consumed

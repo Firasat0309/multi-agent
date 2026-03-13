@@ -58,6 +58,7 @@ from core.task_dispatcher import TaskDispatcher
 from core.task_engine import TaskGraph
 from core.tier_scheduler import Tier
 from tools.terminal_tools import TerminalTools
+from core.mcp_client import MCPClient
 
 if TYPE_CHECKING:
     from core.live_console import LiveConsole
@@ -117,6 +118,7 @@ class AgentManager:
         dep_store: DependencyGraphStore | None = None,
         embedding_store: EmbeddingStore | None = None,
         event_bus: EventBus | None = None,
+        mcp_client: MCPClient | None = None,
     ) -> None:
         self.settings = settings
         self.llm = llm_client
@@ -127,6 +129,7 @@ class AgentManager:
         self._dep_store = dep_store
         self._embedding_store = embedding_store
         self._event_bus = event_bus
+        self.mcp_client = mcp_client
 
         # Two-tier terminal tools: build (network-capable) and test (isolated).
         # TestAgent gets the test terminal; all other agents that need a
@@ -172,20 +175,23 @@ class AgentManager:
                 llm_client=self.llm,
                 repo_manager=self.repo,
                 terminal=self.test_terminal,
+                mcp_client=self.mcp_client,
             )
         if agent_cls is SecurityAgent:
             return agent_cls(
                 llm_client=self.llm,
                 repo_manager=self.repo,
                 terminal=self.build_terminal,
+                mcp_client=self.mcp_client,
             )
         if agent_cls is BuildVerifierAgent:
             return agent_cls(
                 llm_client=self.llm,
                 repo_manager=self.repo,
                 terminal=self.build_terminal,
+                mcp_client=self.mcp_client,
             )
-        return agent_cls(llm_client=self.llm, repo_manager=self.repo)
+        return agent_cls(llm_client=self.llm, repo_manager=self.repo, mcp_client=self.mcp_client)
 
     # ── Public execution API — all implementation lives in the collaborators ──
 

@@ -16,8 +16,6 @@ from core.event_bus import EventBus
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient, LLMConfigError, calculate_cost
 from core.models import TokenCost
-from core.observability import setup_tracing
-from core.repository_manager import RepositoryManager
 from core.run_reporter import RunReporter
 from core.sandbox_orchestrator import SandboxOrchestrator, SandboxUnavailableError
 from core.pipeline_definition import GENERATE_PIPELINE
@@ -27,6 +25,7 @@ from core.tier_scheduler import TierScheduler
 from core.workspace_indexer import index_workspace
 from memory.dependency_graph import DependencyGraphStore
 from memory.embedding_store import EmbeddingStore
+from core.mcp_client import MCPClient
 
 if TYPE_CHECKING:
     from core.live_console import LiveConsole
@@ -69,14 +68,24 @@ class RunPipeline:
         except Exception:
             logger.warning("Failed to initialise observability, continuing without it")
 
-        # ── Phase 1: Architecture ─────────────────────────────────────────────
-        self._phase("Architecture Design", "running")
-        logger.info("[Phase 1] Designing architecture...")
+        mcp_client: MCPClient | None = None
+        if self._settings.mcp_server_command:
+            try:
+                mcp_client = MCPClient(self._settings.mcp_server_command)
+                await mcp_client.initialize()
+            except Exception as e:
+                logger.error("Failed to initialize MCP client in run pipeline: %e", e)
+                mcp_client = None
 
-        repo_manager = RepositoryManager(self._settings.workspace_dir)
-        if self._root_write_lock is not None:
-            repo_manager._root_write_lock = self._root_write_lock
-        architect = ArchitectAgent(llm_client=self._llm, repo_manager=repo_manager)
+        try:
+            # ── Phase 1: Architecture ─────────────────────────────────────────────
+            self._phase("Architecture Design", "running")
+            logger.info("[Phase 1] Designing architecture...")
+    
+            repo_manager = RepositoryManager(self._settings.workspace_dir)
+            if self._root_write_lock is not None:
+                repo_manager._root_write_lock = self._root_write_lock
+            architect = ArchitectAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
 
         try:
             blueprint = await architect.design_architecture(user_prompt)
@@ -113,7 +122,7 @@ class RunPipeline:
         self._phase("Task Planning", "running")
         logger.info("[Phase 2] Building lifecycle plan...")
 
-        planner = PlannerAgent(llm_client=self._llm, repo_manager=repo_manager)
+        planner = PlannerAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
         try:
             is_compiled = bool(lang_profile.build_command)
             review_fixes = 2  # 2 review-fix cycles per file; pipeline only fails on build
@@ -188,6 +197,7 @@ class RunPipeline:
             dep_store=run_dep_store,
             embedding_store=run_embedding_store,
             event_bus=event_bus,
+            mcp_client=mcp_client,
         )
 
         # Compute dependency tiers for incremental build verification.
@@ -289,6 +299,12 @@ class RunPipeline:
             elapsed_seconds=elapsed,
             token_cost=token_cost,
         )
+        except Exception as flow_err:
+            logger.error("Unhandled error in run pipeline: %e", flow_err)
+            raise
+        finally:
+            if mcp_client:
+                await mcp_client.close()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 

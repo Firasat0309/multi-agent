@@ -28,18 +28,20 @@ class DesignParserAgent(BaseAgent):
     """Converts a Figma design URL or a prose UI description into a structured
     UIDesignSpec that subsequent frontend agents can consume.
 
-    When a Figma URL is supplied the agent produces an approximate layout tree
-    from the URL structure and any description context.  For prose descriptions
-    it relies entirely on LLM interpretation.
+    When a Figma URL is supplied the agent uses its MCP tools to explore
+    the layout tree from the URL. For prose descriptions it relies entirely 
+    on LLM interpretation.
     """
 
     role = AgentRole.DESIGN_PARSER
 
     @property
     def system_prompt(self) -> str:
-        return (
             "You are a senior UI/UX design parser agent.  Your job is to read a design\n"
             "description (or Figma URL context) and produce a structured UIDesignSpec.\n\n"
+            "If a Figma URL is provided, YOU MUST USE YOUR TOOLS to query the Figma design "
+            "to extract the necessary metadata (pages, core styles, overall structure) "
+            "BEFORE generating your final response.\n\n"
             "Respond with a JSON object matching this schema:\n"
             "{\n"
             '  "framework": "react|nextjs|vue|angular",\n'
@@ -64,28 +66,10 @@ class DesignParserAgent(BaseAgent):
             "- Output ONLY the JSON object — no markdown code fences."
         )
 
-    async def execute(self, context: AgentContext) -> TaskResult:
+    def _build_prompt(self, context: AgentContext) -> str:
         requirements: ProductRequirements | None = context.task.metadata.get("requirements")
         figma_url: str = context.task.metadata.get("figma_url", "")
-        try:
-            spec = await self.parse_design(requirements, figma_url)
-            return TaskResult(
-                success=True,
-                output=f"Design parsed: {len(spec.pages)} pages, framework={spec.framework}",
-                metrics={**self.get_metrics(), "pages": len(spec.pages)},
-            )
-        except Exception as exc:
-            logger.exception("DesignParserAgent.execute failed")
-            return TaskResult(success=False, errors=[str(exc)])
-
-    async def parse_design(
-        self,
-        requirements: ProductRequirements | None,
-        figma_url: str = "",
-    ) -> UIDesignSpec:
-        """Parse design information into a UIDesignSpec."""
-        logger.info("DesignParserAgent: parsing design")
-
+        
         req_text = ""
         if requirements:
             fw = requirements.tech_preferences.get("frontend", "nextjs").lower()
@@ -97,39 +81,55 @@ class DesignParserAgent(BaseAgent):
                 f"Preferred styling: {requirements.tech_preferences.get('styling', 'tailwind')}\n"
             )
 
-        figma_context = ""
+        figma_context = f"Figma URL provided: {figma_url}\n" if figma_url else "No Figma URL provided.\n"
         if figma_url:
             file_key = self._extract_figma_key(figma_url)
-            token = os.environ.get("FIGMA_TOKEN", "")
-            if file_key and token:
-                try:
-                    figma_data = await self._fetch_figma_nodes(file_key, token)
-                    figma_context = (
-                        f"Figma URL: {figma_url}\n"
-                        f"Figma design structure (from REST API):\n"
-                        f"{self._summarise_figma_nodes(figma_data)}\n"
-                    )
-                    self._metrics["figma_api_call"] = self._metrics.get("figma_api_call", 0) + 1
-                    logger.info("Fetched Figma file data for key %s", file_key)
-                except Exception as exc:
-                    logger.warning(
-                        "Figma API fetch failed (%s) — falling back to URL-as-text context", exc
-                    )
-                    figma_context = f"Figma URL: {figma_url}\n"
-            else:
-                figma_context = f"Figma URL: {figma_url}\n"
-                if file_key and not token:
-                    logger.info(
-                        "FIGMA_TOKEN not set — LLM will interpret URL without real design data"
-                    )
+            if file_key:
+                figma_context += f"The Figma File Key is: {file_key}. Use your MCP tools to get a summary of this file.\n"
 
-        raw = await self._call_llm_json(
+        return (
             f"{req_text}{figma_context}\n"
-            "Parse the design and return the UIDesignSpec JSON object now."
+            "Use your tools to explore the design if necessary, then output the UIDesignSpec JSON object."
         )
-        self._metrics["llm_calls"] += 1
-        return self._parse_spec(raw, requirements, figma_url)
 
+    async def execute(self, context: AgentContext) -> TaskResult:
+        figma_url: str = context.task.metadata.get("figma_url", "")
+        try:
+            # Drop into the standard agentic tool loop instead of calling LLM once
+            result = await self.execute_agentic(context)
+            if not result.success:
+                return result
+                
+            # Parse the final text output into the UIDesignSpec
+            import json
+            try:
+                # Basic string cleanup to extract JSON if the LLM wrapped it
+                content = result.output.strip()
+                if content.startswith("```"):
+                    content = content.split("\n", 1)[1]
+                    if content.endswith("```"):
+                        content = content[:-3].rsplit("```", 1)[0].rsplit("\n", 1)[0]
+                
+                raw = json.loads(content)
+                requirements: ProductRequirements | None = context.task.metadata.get("requirements")
+                spec = self._parse_spec(raw, requirements, figma_url)
+                
+                # Overwrite metadata so next agent in DAG has it
+                context.task.metadata["design_spec"] = spec
+                
+                return TaskResult(
+                    success=True,
+                    output=f"Design parsed: {len(spec.pages)} pages, framework={spec.framework}",
+                    metrics={**self.get_metrics(), "pages": len(spec.pages)},
+                )
+            except json.JSONDecodeError as exc:
+                logger.error(f"DesignParserAgent failed to parse JSON from output: {result.output[:100]}...")
+                return TaskResult(success=False, errors=[f"Invalid JSON returned: {exc}"])
+
+        except Exception as exc:
+            logger.exception("DesignParserAgent.execute failed")
+            return TaskResult(success=False, errors=[str(exc)])
+            
     # ── Figma REST API helpers ─────────────────────────────────────────────────
 
     @staticmethod
@@ -137,53 +137,6 @@ class DesignParserAgent(BaseAgent):
         """Return the Figma file key from a figma.com URL, or None."""
         m = _FIGMA_FILE_RE.search(url)
         return m.group(1) if m else None
-
-    async def _fetch_figma_nodes(self, file_key: str, token: str) -> dict:
-        """Call the Figma REST API and return the raw file JSON."""
-        api_url = f"{_FIGMA_API_BASE}/files/{file_key}?depth=2"
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(api_url, headers={"X-Figma-Token": token})
-            resp.raise_for_status()
-            data = resp.json()
-        if "document" not in data:
-            raise ValueError(
-                f"Figma API response missing 'document' key — "
-                f"unexpected schema (keys: {list(data)[:10]})"
-            )
-        return data
-
-    @staticmethod
-    def _summarise_figma_nodes(data: dict) -> str:
-        """Convert Figma file JSON to a compact LLM-readable design summary."""
-        lines: list[str] = []
-        document = data.get("document", {})
-
-        pages = [
-            c["name"]
-            for c in document.get("children", [])
-            if c.get("type") == "CANVAS"
-        ]
-        if pages:
-            lines.append(f"Pages: {', '.join(pages)}")
-
-        for canvas in document.get("children", []):
-            if canvas.get("type") != "CANVAS":
-                continue
-            for child in canvas.get("children", [])[:20]:
-                node_type = child.get("type", "")
-                name = child.get("name", "")
-                if node_type in ("FRAME", "COMPONENT", "COMPONENT_SET", "GROUP"):
-                    lines.append(f"  {canvas['name']} / {node_type}: {name}")
-
-        styles = data.get("styles", {})
-        fill_styles = [v["name"] for v in styles.values() if v.get("styleType") == "FILL"][:10]
-        if fill_styles:
-            lines.append(f"Colour styles: {', '.join(fill_styles)}")
-        text_styles = [v["name"] for v in styles.values() if v.get("styleType") == "TEXT"][:8]
-        if text_styles:
-            lines.append(f"Text styles: {', '.join(text_styles)}")
-
-        return "\n".join(lines) if lines else "(no structured nodes found)"
 
     # ─────────────────────────────────────────────────────────────────────────
 

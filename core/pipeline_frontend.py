@@ -37,6 +37,7 @@ from core.models import (
 from core.repository_manager import RepositoryManager
 from core.workspace_indexer import index_workspace
 from memory.embedding_store import EmbeddingStore
+from core.mcp_client import MCPClient
 
 if TYPE_CHECKING:
     from core.live_console import LiveConsole
@@ -104,17 +105,28 @@ class FrontendPipeline:
         metrics: dict = {}
         component_plan: ComponentPlan | None = None
 
-        # ── Phase 1: Design Parsing ───────────────────────────────────────────
-        self._phase("FE: Design Parsing", "running")
-        logger.info("[FE Phase 1] Parsing design spec...")
-        design_spec: UIDesignSpec | None = None
+        # Initialize embedded MCP client if configured
+        mcp_client: MCPClient | None = None
+        if self._settings.mcp_server_command:
+            try:
+                mcp_client = MCPClient(self._settings.mcp_server_command)
+                await mcp_client.initialize()
+            except Exception as e:
+                logger.error("Failed to initialize MCP client in frontend pipeline: %e", e)
+                mcp_client = None
+
         try:
-            parser = DesignParserAgent(llm_client=self._llm, repo_manager=repo_manager)
-            design_spec = await parser.parse_design(requirements, figma_url)
-            logger.info(
-                "UIDesignSpec: %d pages, framework=%s",
-                len(design_spec.pages), design_spec.framework,
-            )
+            # ── Phase 1: Design Parsing ───────────────────────────────────────────
+            self._phase("FE: Design Parsing", "running")
+            logger.info("[FE Phase 1] Parsing design spec...")
+            design_spec: UIDesignSpec | None = None
+            try:
+                parser = DesignParserAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
+                design_spec = await parser.parse_design(requirements, figma_url)
+                logger.info(
+                    "UIDesignSpec: %d pages, framework=%s",
+                    len(design_spec.pages), design_spec.framework,
+                )
             self._complete_phase("FE: Design Parsing")
         except Exception as exc:
             logger.exception("Design parsing failed")
@@ -127,7 +139,7 @@ class FrontendPipeline:
         self._phase("FE: Component Planning", "running")
         logger.info("[FE Phase 2] Planning components...")
         try:
-            planner = ComponentPlannerAgent(llm_client=self._llm, repo_manager=repo_manager)
+            planner = ComponentPlannerAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
             component_plan = await planner.plan_components(design_spec, api_contract, requirements)
             logger.info(
                 "ComponentPlan: %d components, state=%s",
@@ -173,7 +185,7 @@ class FrontendPipeline:
         # ── Phase 4: Component Generation (tier-by-tier) ──────────────────────
         self._phase("FE: Component Generation", "running")
         logger.info("[FE Phase 4] Generating %d components...", len(ordered_components))
-        generator = ComponentGeneratorAgent(llm_client=self._llm, repo_manager=repo_manager)
+        generator = ComponentGeneratorAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
         max_tier = max(tier_map.values()) + 1 if tier_map else 1
         gen_errors: list[str] = []
 
@@ -320,18 +332,21 @@ class FrontendPipeline:
         except Exception:
             logger.warning("Frontend workspace indexing failed", exc_info=True)
 
-        success = not any(
-            e for e in errors
-            if "Component planning failed" in e
-        )
-        return PipelineResult(
-            success=success,
-            workspace_path=workspace,
-            blueprint=frontend_blueprint,
-            metrics=metrics,
-            errors=errors,
-            elapsed_seconds=time.monotonic() - start_time,
-        )
+            success = not any(
+                e for e in errors
+                if "Component planning failed" in e
+            )
+            return PipelineResult(
+                success=success,
+                workspace_path=workspace,
+                blueprint=frontend_blueprint,
+                metrics=metrics,
+                errors=errors,
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+        finally:
+            if mcp_client:
+                await mcp_client.close()
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
