@@ -120,6 +120,30 @@ class ReviewerAgent(BaseAgent):
     async def _review_file(self, context: AgentContext) -> ReviewResult:
         """Review a single file."""
         formatted = self._format_context(context)
+        
+        # Explicitly append the target file content with line numbers for the reviewer
+        target_file_content = await self.repo.async_read_file(context.task.file)
+        if target_file_content:
+            numbered_lines = []
+            for i, line in enumerate(target_file_content.splitlines(), start=1):
+                numbered_lines.append(f"{i:4d} | {line}")
+            numbered_content = "\n".join(numbered_lines)
+            
+            # Extract language name for code fence
+            lang_name = ""
+            if context.file_blueprint and context.file_blueprint.language:
+                from core.language import get_language_profile
+                lang_name = get_language_profile(context.file_blueprint.language).code_fence_name
+            else:
+                lang_name = "code"
+
+            formatted += (
+                f"\n\n## TARGET FILE ({context.task.file})\n"
+                f"```{lang_name}\n"
+                f"{numbered_content}\n"
+                f"```"
+            )
+
         fb = context.file_blueprint
 
         blueprint_checklist = ""

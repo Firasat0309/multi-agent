@@ -17,6 +17,7 @@ from typing import Any
 from agents.base_agent import BaseAgent
 from core.language import detect_language_from_blueprint
 from core.models import AgentContext, AgentRole, TaskResult
+from core.error_attributor import CompilerErrorAttributor
 from tools.terminal_tools import TerminalTools
 
 logger = logging.getLogger(__name__)
@@ -78,12 +79,28 @@ class BuildVerifierAgent(BaseAgent):
             )
 
         compiler_output = "\n".join(filter(None, [result.stdout, result.stderr])).strip()
+        
+        # Extract targeted error message using CompilerErrorAttributor
+        attributor = CompilerErrorAttributor()
+        attribution_result = attributor.attribute(
+            compiler_output,
+            known_files={context.task.file}
+        )
+        
+        targeted_errors = attribution_result.errors_for_file(context.task.file)
+        
+        if targeted_errors:
+            error_message = "\n".join(targeted_errors)
+        else:
+            # Fallback to the truncated compiler output if error lines couldn't be correctly mapped 
+            error_message = compiler_output[:1000]
+
         logger.warning(
-            "Build failed for %s:\n%s", context.task.file, compiler_output[:500]
+            "Build failed for %s:\n%s", context.task.file, error_message
         )
         return TaskResult(
             success=False,
             output=f"Build failed: {build_cmd}",
-            errors=[compiler_output or "Build command exited with non-zero status"],
+            errors=[error_message or "Build command exited with non-zero status"],
             metrics=self.get_metrics(),
         )
