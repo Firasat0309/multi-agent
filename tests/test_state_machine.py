@@ -116,6 +116,30 @@ class TestReviewFixCycle:
         assert lc.review_fix_count == 3
 
 
+# ── FileLifecycle: build fix cycle ──────────────────────────────────────
+
+class TestBuildFixCycle:
+    """BUILDING → FIXING → BUILDING cycle with max_build_fixes exhaustion."""
+
+    def test_max_build_fixes_marks_failed(self):
+        lc = FileLifecycle("svc.java", max_build_fixes=2)
+        lc.process_event(EventType.DEPS_MET)
+        lc.process_event(EventType.CODE_GENERATED)
+        lc.process_event(EventType.REVIEW_PASSED)
+
+        # Fix cycle 1
+        lc.process_event(EventType.BUILD_FAILED)
+        lc.process_event(EventType.FIX_APPLIED)
+        # Fix cycle 2
+        lc.process_event(EventType.BUILD_FAILED)
+        lc.process_event(EventType.FIX_APPLIED)
+        # 3rd failure exceeds limit → mark file as failed
+        lc.process_event(EventType.BUILD_FAILED)
+
+        assert lc.phase == FilePhase.FAILED
+        assert lc.build_fix_count == 3
+
+
 # ── FileLifecycle: test fix cycle ───────────────────────────────────────
 
 class TestTestFixCycle:
