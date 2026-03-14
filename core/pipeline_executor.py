@@ -871,14 +871,19 @@ class PipelineExecutor:
             metadata=fix_context,
         )
 
-        context_builder = ContextBuilder(
-            workspace_dir=self._am.repo.workspace,
-            blueprint=self._am.blueprint,
-            repo_index=self._am.repo.get_repo_index(),
-            dep_store=self._am._dep_store,
-            embedding_store=self._am._embedding_store,
-        )
-        context = context_builder.build(task)
+        try:
+            context_builder = ContextBuilder(
+                workspace_dir=self._am.repo.workspace,
+                blueprint=self._am.blueprint,
+                repo_index=self._am.repo.get_repo_index(),
+                dep_store=self._am._dep_store,
+                embedding_store=self._am._embedding_store,
+            )
+            context = await asyncio.to_thread(context_builder.build, task)
+        except Exception:
+            logger.exception("[%s] Context build failed for %s", label, file_path)
+            self._am._metrics["tasks_failed"] += 1
+            return False
 
         try:
             agent = self._am._create_agent(TaskType.FIX_CODE)
