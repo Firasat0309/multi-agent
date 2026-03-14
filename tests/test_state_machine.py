@@ -197,6 +197,74 @@ class TestTestFixCycle:
         assert lc.test_fix_count == 1
 
 
+# ── FileLifecycle: build fix cycle ──────────────────────────────────────
+
+class TestBuildFixCycle:
+    """BUILDING → FIXING → BUILDING cycle."""
+
+    def _reach_building(self, lc: FileLifecycle) -> None:
+        """Advance lifecycle to the BUILDING phase via the happy path."""
+        lc.process_event(EventType.DEPS_MET)
+        lc.process_event(EventType.CODE_GENERATED)
+        lc.process_event(EventType.REVIEW_PASSED)
+
+    def test_build_fail_routes_to_fixing(self):
+        lc = FileLifecycle("svc.java")
+        self._reach_building(lc)
+        lc.process_event(EventType.BUILD_FAILED, {"errors": "CompilationError: ';' expected"})
+
+        assert lc.phase == FilePhase.FIXING
+        assert lc.fix_trigger == "build"
+        assert lc.build_fix_count == 1
+        assert lc.build_errors == "CompilationError: ';' expected"
+
+    def test_fix_applied_routes_back_to_building(self):
+        lc = FileLifecycle("svc.java")
+        self._reach_building(lc)
+        lc.process_event(EventType.BUILD_FAILED)
+        lc.process_event(EventType.FIX_APPLIED)
+
+        assert lc.phase == FilePhase.BUILDING
+
+    def test_build_pass_after_fix_goes_to_testing(self):
+        lc = FileLifecycle("svc.java")
+        self._reach_building(lc)
+        lc.process_event(EventType.BUILD_FAILED)
+        lc.process_event(EventType.FIX_APPLIED)
+        lc.process_event(EventType.BUILD_PASSED)
+
+        assert lc.phase == FilePhase.TESTING
+
+    def test_max_build_fixes_marks_failed(self):
+        lc = FileLifecycle("svc.java", max_build_fixes=2)
+        self._reach_building(lc)
+
+        # Fix cycles 1, 2
+        lc.process_event(EventType.BUILD_FAILED)
+        lc.process_event(EventType.FIX_APPLIED)
+        lc.process_event(EventType.BUILD_FAILED)
+        lc.process_event(EventType.FIX_APPLIED)
+
+        # 3rd failure exceeds limit → mark as failed
+        lc.process_event(EventType.BUILD_FAILED)
+
+        assert lc.phase == FilePhase.FAILED
+        assert lc.build_fix_count == 3
+
+    def test_full_build_fix_then_pass(self):
+        lc = FileLifecycle("svc.java")
+        self._reach_building(lc)
+
+        # Build fails, fix, re-build passes, test passes
+        lc.process_event(EventType.BUILD_FAILED)
+        lc.process_event(EventType.FIX_APPLIED)
+        lc.process_event(EventType.BUILD_PASSED)
+        lc.process_event(EventType.TEST_PASSED)
+
+        assert lc.phase == FilePhase.PASSED
+        assert lc.build_fix_count == 1
+
+
 # ── FileLifecycle: combined review + test fixes ─────────────────────────
 
 class TestCombinedFixCycles:
