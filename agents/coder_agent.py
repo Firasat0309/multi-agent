@@ -50,6 +50,9 @@ def _has_duplicate_definitions(content: str, language: str) -> bool:
     if not pattern:
         return False
     names = pattern.findall(content)
+    if language == "go":
+        # Go permits multiple init functions per file; they should not be treated as duplicates.
+        names = [name for name in names if name != "init"]
     return len(names) != len(set(names))
 
 
