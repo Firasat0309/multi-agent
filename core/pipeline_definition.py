@@ -122,16 +122,18 @@ class Phase:
     Attributes:
         name: Human-readable phase identifier for logging.
         file_tasks: Per-file task definitions dispatched during this phase.
-        checkpoint: Optional build checkpoint config.  Only runs for compiled
-            languages unless ``skip_for_interpreted`` is False.
+        checkpoint: Optional build checkpoint config.  Checkpoints only run
+            when the target language has a build command (i.e., for compiled
+            languages); they are always disabled for interpreted languages.
         skip_for_interpreted: If True, the entire phase is skipped when the
-            target language has no build command (Python, Ruby, JS, etc.).
+            target language has no build command (Python, Ruby, JS, etc.),
+            regardless of whether a checkpoint is configured.
     """
 
     name: str
     file_tasks: list[FileTaskDef] = field(default_factory=list)
     checkpoint: CheckpointDef | None = None
-    skip_for_interpreted: bool = False  # Skip this entire phase for non-compiled langs
+    skip_for_interpreted: bool = False  # Skip this entire phase when no build command
 
 
 @dataclass
