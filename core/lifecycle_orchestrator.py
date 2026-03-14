@@ -4,8 +4,9 @@ Single responsibility: given a ``LifecycleEngine`` and a global ``TaskGraph``,
 advance every file through its Generate → Review → Fix → Build → Test lifecycle,
 then hand off to ``TaskDispatcher`` for the global DAG (security, deploy, docs).
 
-``AgentManager`` keeps public shim methods so that all existing callers remain
-unchanged.  This module owns the *implementation*.
+``AgentManager._execute_lifecycle_phase`` owns the canonical per-file execution
+logic; this orchestrator focuses exclusively on the state-machine event loop
+and tier coordination.
 """
 
 from __future__ import annotations
@@ -13,12 +14,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import warnings
 from typing import Any, TYPE_CHECKING
 
-from core.context_builder import ContextBuilder
-from core.event_bus import AgentEvent, BusEventType
-from core.models import Task, TaskType
-from core.observability import record_agent_end, record_agent_start
+from core.models import TaskType
 from core.state_machine import EventType, FilePhase
 
 if TYPE_CHECKING:
@@ -52,10 +51,16 @@ class LifecycleOrchestrator:
     ) -> dict[str, Any]:
         """Phase 1: drive per-file lifecycles; Phase 2: run the global DAG.
 
-        Phase 1 completes when all files have reached a terminal state.  Phase 2
-        then marks the sentinel task as completed (unblocking the global DAG) and
-        delegates graph execution to :meth:`~AgentManager.execute_graph`.
+        .. deprecated::
+            Prefer calling :class:`~core.pipeline_executor.PipelineExecutor`
+            directly.  This method is kept for backward compatibility only.
         """
+        warnings.warn(
+            "LifecycleOrchestrator.execute_with_lifecycle is deprecated. "
+            "Use PipelineExecutor.execute() directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         start_time = time.monotonic()
         semaphore = asyncio.Semaphore(self._am.settings.max_concurrent_agents)
         phase_timeout: float = float(self._am.settings.phase_timeout_seconds)
@@ -171,9 +176,16 @@ class LifecycleOrchestrator:
     ) -> dict[str, Any]:
         """Tier-scheduled execution with repo-level build checkpoints.
 
-        Delegates entirely to :class:`~core.pipeline_executor.PipelineExecutor`
-        which owns the tier-blocking and checkpoint-retry logic.
+        .. deprecated::
+            Prefer calling :class:`~core.pipeline_executor.PipelineExecutor`
+            directly.  This method is kept for backward compatibility only.
         """
+        warnings.warn(
+            "LifecycleOrchestrator.execute_with_checkpoints is deprecated. "
+            "Use PipelineExecutor.execute() directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         from core.pipeline_executor import PipelineExecutor
 
         executor = PipelineExecutor(
@@ -197,197 +209,14 @@ class LifecycleOrchestrator:
         file_path: str,
         phase: FilePhase,
     ) -> None:
-        """Execute one lifecycle phase for *file_path* and drive the FSM forward.
+        """Execute one lifecycle phase — delegates to AgentManager.
 
-        Maps the current ``FilePhase`` to the appropriate ``TaskType``, runs the
-        agent, then fires the correct ``EventType`` based on the result so the
-        state machine can transition to the next phase.
+        All implementation lives in :meth:`AgentManager._execute_lifecycle_phase`;
+        this shim exists so ``execute_with_lifecycle`` routes through a single
+        stable entry point without the caller needing to reference AgentManager
+        directly.
         """
-        lc = engine.get_lifecycle(file_path)
-
-        # PENDING is a virtual phase — fire DEPS_MET to advance to GENERATING.
-        if phase == FilePhase.PENDING:
-            engine.process_event(file_path, EventType.DEPS_MET)
-            phase = lc.phase  # now GENERATING
-
-        gen_task_type = TaskType(lc.generation_task_type)
-        gen_verb = "Modify" if gen_task_type == TaskType.MODIFY_FILE else "Generate"
-
-        phase_config: dict[FilePhase, dict[str, Any]] = {
-            FilePhase.GENERATING: {
-                "task_type": gen_task_type,
-                "success_event": EventType.CODE_GENERATED,
-                "failure_event": EventType.RETRIES_EXHAUSTED,
-                "description": f"{gen_verb} {file_path}",
-            },
-            FilePhase.REVIEWING: {
-                "task_type": TaskType.REVIEW_FILE,
-                "success_event": EventType.REVIEW_PASSED,
-                "failure_event": EventType.REVIEW_FAILED,
-                "description": f"Review {file_path}",
-            },
-            FilePhase.FIXING: {
-                "task_type": TaskType.FIX_CODE,
-                # Even on fix-agent failure fire FIX_APPLIED to re-enter the
-                # review cycle rather than hard-failing the file.
-                "success_event": EventType.FIX_APPLIED,
-                "failure_event": EventType.FIX_APPLIED,
-                "description": f"Fix {file_path} ({lc.fix_trigger} issues)",
-            },
-            FilePhase.BUILDING: {
-                "task_type": TaskType.VERIFY_BUILD,
-                "success_event": EventType.BUILD_PASSED,
-                "failure_event": EventType.BUILD_FAILED,
-                "description": f"Verify build for {file_path}",
-            },
-            FilePhase.TESTING: {
-                "task_type": TaskType.GENERATE_TEST,
-                "success_event": EventType.TEST_PASSED,
-                "failure_event": EventType.TEST_FAILED,
-                "description": f"Test {file_path}",
-            },
-        }
-
-        config = phase_config.get(phase)
-        if config is None:
-            logger.warning("No action for phase %s on %s", phase.value, file_path)
-            return
-
-        task_meta = self._build_lifecycle_metadata(lc)
-        task_meta.update(lc.change_metadata)
-        task = Task(
-            task_id=0,
-            task_type=config["task_type"],
-            file=file_path,
-            description=config["description"],
-            metadata=task_meta,
-        )
-
-        if self._am._live:
-            self._am._live.log(f"[cyan]Lifecycle:[/cyan] {config['description']}")
-
-        context_builder = ContextBuilder(
-            workspace_dir=self._am.repo.workspace,
-            blueprint=self._am.blueprint,
-            repo_index=self._am.repo.get_repo_index(),
-            dep_store=self._am._dep_store,
-            embedding_store=self._am._embedding_store,
-        )
-        # Run in thread — SentenceTransformer loads synchronously on first call.
-        context = await asyncio.to_thread(context_builder.build, task)
-
-        try:
-            agent = self._am._create_agent(config["task_type"])
-            record_agent_start()
-            try:
-                result = await agent.execute(context)
-            finally:
-                record_agent_end()
-
-            agent_name = agent.role.value
-            if agent_name not in self._am._metrics["agent_metrics"]:
-                self._am._metrics["agent_metrics"][agent_name] = []
-            self._am._metrics["agent_metrics"][agent_name].append(agent.get_metrics())
-
-            # Review is special: task success only means the agent ran without
-            # crashing; result.metrics["passed"] carries the actual verdict.
-            if config["task_type"] == TaskType.REVIEW_FILE:
-                review_passed = result.success and result.metrics.get("passed", False)
-                if review_passed:
-                    event_data = {"output": result.output}
-                    engine.process_event(file_path, EventType.REVIEW_PASSED, event_data)
-                    if self._am._event_bus:
-                        await self._am._event_bus.publish(AgentEvent(
-                            type=BusEventType.REVIEW_PASSED,
-                            task_type=config["task_type"].value,
-                            file_path=file_path,
-                            agent_name=agent_name,
-                        ))
-                else:
-                    event_data = {"findings": result.errors, "output": result.output}
-                    engine.process_event(file_path, EventType.REVIEW_FAILED, event_data)
-                    if self._am._event_bus:
-                        await self._am._event_bus.publish(AgentEvent(
-                            type=BusEventType.REVIEW_FAILED,
-                            task_type=config["task_type"].value,
-                            file_path=file_path,
-                            agent_name=agent_name,
-                            data={"findings": result.errors},
-                        ))
-                self._am._metrics["tasks_completed"] += 1
-
-            elif result.success:
-                self._am._metrics["tasks_completed"] += 1
-                event_data = self._extract_event_data(result, config["task_type"])
-                engine.process_event(file_path, config["success_event"], event_data)
-                logger.info("[%s] %s succeeded", file_path, phase.value)
-                if self._am._embedding_store and result.files_modified:
-                    for fp in result.files_modified:
-                        try:
-                            content = self._am.repo.read_file(fp)
-                            self._am._embedding_store.index_file(fp, content)
-                        except Exception:
-                            logger.debug("Embedding update skipped for %s", fp)
-                        if self._am._event_bus:
-                            await self._am._event_bus.publish(AgentEvent(
-                                type=BusEventType.FILE_WRITTEN,
-                                task_type=config["task_type"].value,
-                                file_path=fp,
-                                agent_name=agent_name,
-                            ))
-                if self._am._event_bus:
-                    bus_type = (
-                        BusEventType.TEST_PASSED
-                        if config["task_type"] == TaskType.GENERATE_TEST
-                        else BusEventType.TASK_COMPLETED
-                    )
-                    await self._am._event_bus.publish(AgentEvent(
-                        type=bus_type,
-                        task_type=config["task_type"].value,
-                        file_path=file_path,
-                        agent_name=agent_name,
-                    ))
-                if self._am._live:
-                    self._am._live.log(
-                        f"[green]Done:[/green] {config['description']}"
-                    )
-
-            else:
-                event_data = self._extract_event_data(result, config["task_type"])
-                engine.process_event(file_path, config["failure_event"], event_data)
-                logger.warning(
-                    "[%s] %s failed: %s", file_path, phase.value, result.errors
-                )
-                if self._am._event_bus:
-                    bus_type = (
-                        BusEventType.TEST_FAILED
-                        if config["task_type"] == TaskType.GENERATE_TEST
-                        else BusEventType.TASK_FAILED
-                    )
-                    await self._am._event_bus.publish(AgentEvent(
-                        type=bus_type,
-                        task_type=config["task_type"].value,
-                        file_path=file_path,
-                        agent_name=agent_name,
-                        data={"errors": result.errors},
-                    ))
-                if self._am._live:
-                    self._am._live.log(
-                        f"[yellow]Issue:[/yellow] {config['description']} — "
-                        f"transitioning via {config['failure_event'].value}"
-                    )
-
-        except Exception:
-            logger.exception("[%s] %s error", file_path, phase.value)
-            # Degrade gracefully: review/fix exceptions must not hard-fail a
-            # file — only generation-level failures result in FAILED state.
-            if phase == FilePhase.REVIEWING:
-                engine.process_event(file_path, EventType.REVIEW_PASSED)
-            elif phase == FilePhase.FIXING:
-                engine.process_event(file_path, EventType.FIX_APPLIED)
-            else:
-                engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
-                self._am._metrics["tasks_failed"] += 1
+        await self._am._execute_lifecycle_phase(engine, file_path, phase)
 
     # ── Static helpers ────────────────────────────────────────────────────────
 

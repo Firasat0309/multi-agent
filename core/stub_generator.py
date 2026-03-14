@@ -9,10 +9,12 @@ Stubs are deleted before the actual file is generated.
 
 Supported languages:
   - Java: empty class/interface with correct package declaration
+  - Kotlin: empty class/interface with correct package declaration
   - Go: package declaration + empty struct
   - TypeScript: empty exported interface/class
   - Rust: empty pub struct
   - C#: empty class in correct namespace
+  - Python: importable module with placeholder class/function exports
 
 Usage::
 
@@ -98,6 +100,8 @@ class StubGenerator:
         """Generate language-appropriate stub content."""
         if self._lang == "java":
             return self._java_stub(file_path, blueprints)
+        elif self._lang == "kotlin":
+            return self._kotlin_stub(file_path, blueprints)
         elif self._lang == "go":
             return self._go_stub(file_path)
         elif self._lang == "typescript":
@@ -106,6 +110,8 @@ class StubGenerator:
             return self._rust_stub(file_path, blueprints)
         elif self._lang == "csharp":
             return self._csharp_stub(file_path, blueprints)
+        elif self._lang == "python":
+            return self._python_stub(file_path, blueprints)
         return None
 
     @staticmethod
@@ -201,3 +207,74 @@ class StubGenerator:
             f"    public class {class_name} {{ }}\n"
             f"}}\n"
         )
+
+    @staticmethod
+    def _kotlin_stub(
+        file_path: str, blueprints: dict[str, object] | None
+    ) -> str:
+        """Generate a minimal Kotlin class/interface stub.
+
+        Mirrors the Java stub logic but uses Kotlin syntax.  Interfaces are
+        detected by the same naming convention (suffix ``Repository`` or
+        prefix ``I``).
+        """
+        parts = file_path.replace("\\", "/")
+        class_name = parts.split("/")[-1].replace(".kt", "")
+
+        # Determine package from path
+        package_path = parts
+        for prefix in ("src/main/kotlin/", "src/main/java/", "src/"):
+            if package_path.startswith(prefix):
+                package_path = package_path[len(prefix):]
+                break
+        package_parts = package_path.rsplit("/", 1)
+        package = package_parts[0].replace("/", ".") if len(package_parts) > 1 else ""
+
+        lines: list[str] = []
+        if package:
+            lines.append(f"package {package}")
+            lines.append("")
+
+        is_interface = class_name.endswith("Repository") or class_name.startswith("I")
+        if is_interface:
+            lines.append(f"interface {class_name}")
+        else:
+            lines.append(f"class {class_name}")
+        lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _python_stub(
+        file_path: str, blueprints: dict[str, object] | None
+    ) -> str:
+        """Generate a minimal Python module stub.
+
+        Creates an importable module with placeholder exports.  For files
+        that declare exports in the blueprint, each export is stubbed as
+        either a class (PascalCase) or a function (snake_case) so that
+        downstream ``import`` statements resolve successfully.
+        """
+        exports: list[str] = []
+        if blueprints and file_path in blueprints:
+            bp = blueprints[file_path]
+            if hasattr(bp, "exports"):
+                exports = bp.exports  # type: ignore[attr-defined]
+
+        lines: list[str] = ['"""Auto-generated stub for forward references."""', ""]
+
+        if not exports:
+            # Minimal stub — just enough to make the module importable
+            lines.append("")
+            return "\n".join(lines)
+
+        for export in exports[:10]:
+            # PascalCase → class stub; otherwise → function stub
+            if export and export[0].isupper() and "_" not in export:
+                lines.append(f"class {export}:")
+                lines.append("    pass")
+            else:
+                lines.append(f"def {export}(*args, **kwargs):")
+                lines.append("    raise NotImplementedError")
+            lines.append("")
+
+        return "\n".join(lines)

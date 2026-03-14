@@ -87,6 +87,48 @@ class TestStubGenerator:
         content = (tmp_path / "src/main/java/com/example/IPayment.java").read_text()
         assert "public interface IPayment {" in content
 
+    # ── Kotlin stubs ──
+
+    def test_kotlin_class_stub(self, tmp_path):
+        gen = self._make_generator("kotlin", tmp_path)
+        created = gen.generate_stubs(["src/main/kotlin/com/example/services/UserService.kt"])
+        assert len(created) == 1
+        content = (tmp_path / "src/main/kotlin/com/example/services/UserService.kt").read_text()
+        assert "package com.example.services" in content
+        assert "class UserService" in content
+
+    def test_kotlin_interface_stub(self, tmp_path):
+        gen = self._make_generator("kotlin", tmp_path)
+        gen.generate_stubs(["src/main/kotlin/com/example/UserRepository.kt"])
+        content = (tmp_path / "src/main/kotlin/com/example/UserRepository.kt").read_text()
+        assert "interface UserRepository" in content
+
+    # ── Python stubs ──
+
+    def test_python_stub_minimal(self, tmp_path):
+        gen = self._make_generator("python", tmp_path)
+        created = gen.generate_stubs(["src/services/user_service.py"])
+        assert len(created) == 1
+        content = (tmp_path / "src/services/user_service.py").read_text()
+        assert "Auto-generated stub" in content
+
+    def test_python_stub_with_exports(self, tmp_path):
+        from core.models import FileBlueprint
+        bp = FileBlueprint(
+            path="src/models/user.py",
+            purpose="User model",
+            exports=["UserModel", "validate_email"],
+        )
+        gen = self._make_generator("python", tmp_path)
+        created = gen.generate_stubs(
+            ["src/models/user.py"],
+            blueprints={"src/models/user.py": bp},
+        )
+        assert len(created) == 1
+        content = (tmp_path / "src/models/user.py").read_text()
+        assert "class UserModel:" in content
+        assert "def validate_email" in content
+
 
 class TestScopeCommand:
     """Tests for BuildCheckpoint._scope_command (module-scoped builds)."""

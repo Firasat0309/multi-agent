@@ -695,3 +695,150 @@ class TestConcurrentExecution:
         semaphore = asyncio.Semaphore(am.settings.max_concurrent_agents)
         assert semaphore._value == 3
 
+
+# ── Agent name registry tests ─────────────────────────────────────────────
+
+
+class TestAgentNameRegistry:
+    """Verify _get_agent_name_for_task_type derives names from TASK_AGENT_MAP."""
+
+    def test_known_task_types_return_class_name(self) -> None:
+        from core.agent_manager import AgentManager, TASK_AGENT_MAP
+        from core.models import TaskType
+
+        am = MagicMock(spec=AgentManager)
+        am._get_agent_name_for_task_type = AgentManager._get_agent_name_for_task_type.__get__(am)
+
+        for task_type, agent_cls in TASK_AGENT_MAP.items():
+            name = am._get_agent_name_for_task_type(task_type)
+            assert name == agent_cls.__name__, (
+                f"Expected {agent_cls.__name__} for {task_type}, got {name}"
+            )
+
+    def test_unknown_task_type_returns_fallback(self) -> None:
+        from core.agent_manager import AgentManager
+
+        am = MagicMock(spec=AgentManager)
+        am._get_agent_name_for_task_type = AgentManager._get_agent_name_for_task_type.__get__(am)
+        # Use a fake task type that isn't registered
+        name = am._get_agent_name_for_task_type("nonexistent_task")
+        assert name == "UnknownAgent"
+
+
+# ── Metrics bounded growth tests ───────────────────────────────────────────
+
+
+class TestMetricsBoundedGrowth:
+    """Verify that agent_metrics lists are capped at 100 entries."""
+
+    def test_update_metrics_caps_at_100(self) -> None:
+        from core.agent_manager import AgentManager
+
+        am = MagicMock(spec=AgentManager)
+        am._metrics = {"tasks_completed": 0, "tasks_failed": 0, "agent_metrics": {}}
+        am._update_metrics = AgentManager._update_metrics.__get__(am)
+
+        # Create a mock agent
+        agent = MagicMock()
+        agent.role.value = "coder"
+        agent.get_metrics.return_value = {"llm_calls": 1}
+
+        result = MagicMock()
+        result.success = True
+
+        # Append 105 entries
+        for _ in range(105):
+            am._update_metrics(agent, result)
+
+        assert len(am._metrics["agent_metrics"]["coder"]) == 100, (
+            "Metrics list should be capped at 100 entries"
+        )
+
+
+# ── Lifecycle delegation tests ─────────────────────────────────────────────
+
+
+class TestLifecycleDelegation:
+    """Verify LifecycleOrchestrator delegates to AgentManager."""
+
+    @pytest.mark.anyio
+    async def test_orchestrator_delegates_phase_to_agent_manager(self) -> None:
+        """LifecycleOrchestrator._execute_lifecycle_phase must delegate to
+        AgentManager._execute_lifecycle_phase."""
+        from core.lifecycle_orchestrator import LifecycleOrchestrator
+
+        am = MagicMock()
+        am._execute_lifecycle_phase = AsyncMock()
+
+        orch = LifecycleOrchestrator(am)
+        engine = MagicMock()
+        await orch._execute_lifecycle_phase(engine, "Model.java", FilePhase.GENERATING)
+
+        am._execute_lifecycle_phase.assert_called_once_with(
+            engine, "Model.java", FilePhase.GENERATING,
+        )
+
+
+# ── Exception handling tests ──────────────────────────────────────────────
+
+
+class TestExecutionExceptionHandling:
+    """Verify _handle_execution_exception degrades gracefully per phase."""
+
+    @pytest.mark.anyio
+    async def test_review_exception_auto_passes(self) -> None:
+        """An exception during REVIEWING should auto-pass the review."""
+        from core.agent_manager import AgentManager
+
+        engine = MagicMock()
+        am = MagicMock(spec=AgentManager)
+        am._metrics = {"tasks_completed": 0, "tasks_failed": 0, "agent_metrics": {}}
+        am._handle_execution_exception = AgentManager._handle_execution_exception.__get__(am)
+
+        await am._handle_execution_exception(
+            engine, "Model.java", FilePhase.REVIEWING, RuntimeError("parse error"),
+        )
+
+        engine.process_event.assert_called_once_with(
+            "Model.java", EventType.REVIEW_PASSED,
+        )
+        assert am._metrics["tasks_failed"] == 0
+
+    @pytest.mark.anyio
+    async def test_fixing_exception_fires_fix_applied(self) -> None:
+        """An exception during FIXING should fire FIX_APPLIED to re-enter review."""
+        from core.agent_manager import AgentManager
+
+        engine = MagicMock()
+        am = MagicMock(spec=AgentManager)
+        am._metrics = {"tasks_completed": 0, "tasks_failed": 0, "agent_metrics": {}}
+        am._handle_execution_exception = AgentManager._handle_execution_exception.__get__(am)
+
+        await am._handle_execution_exception(
+            engine, "Model.java", FilePhase.FIXING, RuntimeError("fix error"),
+        )
+
+        engine.process_event.assert_called_once_with(
+            "Model.java", EventType.FIX_APPLIED,
+        )
+        assert am._metrics["tasks_failed"] == 0
+
+    @pytest.mark.anyio
+    async def test_generating_exception_marks_failed(self) -> None:
+        """An exception during GENERATING should mark RETRIES_EXHAUSTED + increment failed."""
+        from core.agent_manager import AgentManager
+
+        engine = MagicMock()
+        am = MagicMock(spec=AgentManager)
+        am._metrics = {"tasks_completed": 0, "tasks_failed": 0, "agent_metrics": {}}
+        am._handle_execution_exception = AgentManager._handle_execution_exception.__get__(am)
+
+        await am._handle_execution_exception(
+            engine, "Model.java", FilePhase.GENERATING, RuntimeError("llm timeout"),
+        )
+
+        engine.process_event.assert_called_once_with(
+            "Model.java", EventType.RETRIES_EXHAUSTED,
+        )
+        assert am._metrics["tasks_failed"] == 1
+
