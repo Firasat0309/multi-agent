@@ -91,6 +91,54 @@ class DesignParserAgent(BaseAgent):
             "Use your tools to explore the design if necessary, then output the UIDesignSpec JSON object."
         )
 
+    async def parse_design(
+        self,
+        requirements: ProductRequirements,
+        figma_url: str = "",
+    ) -> UIDesignSpec:
+        """Convenience facade called by FrontendPipeline.
+
+        Builds an AgentContext, runs the agentic loop via execute(), then
+        returns the parsed UIDesignSpec from task metadata.
+
+        Raises on failure so the caller can handle the exception and fall
+        back to an empty spec (matching the try/except in pipeline_frontend).
+        """
+        from core.models import (
+            RepositoryBlueprint,
+            Task,
+            TaskType,
+            AgentContext as _AgentContext,
+        )
+
+        # DesignParser doesn't use blueprint file metadata — provide a minimal stub.
+        stub_blueprint = RepositoryBlueprint(
+            name="design-parser-stub",
+            description="",
+            architecture_style="",
+        )
+        context = _AgentContext(
+            task=Task(
+                task_id=0,
+                task_type=TaskType.PARSE_DESIGN,
+                file="",
+                description="Parse design spec",
+                metadata={"requirements": requirements, "figma_url": figma_url},
+            ),
+            blueprint=stub_blueprint,
+        )
+        result = await self.execute(context)
+        if not result.success:
+            raise RuntimeError(
+                f"DesignParserAgent failed: {'; '.join(result.errors)}"
+            )
+        spec: UIDesignSpec | None = context.task.metadata.get("design_spec")
+        if spec is None:
+            raise RuntimeError(
+                "DesignParserAgent returned success but no design_spec in metadata"
+            )
+        return spec
+
     async def execute(self, context: AgentContext) -> TaskResult:
         figma_url: str = context.task.metadata.get("figma_url", "")
         try:

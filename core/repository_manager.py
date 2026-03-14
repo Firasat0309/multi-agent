@@ -57,6 +57,9 @@ class RepositoryManager:
         # as docker-compose.yml, .gitignore, package.json from parallel
         # backend and frontend pipelines.
         self._root_write_lock: asyncio.Lock | None = None
+        # Populated by write_file() after each write; read by base_agent._tool_write_file
+        # to relay broken-import feedback back to the LLM.
+        self._last_broken_imports: list[str] = []
 
     @property
     def src_dir(self) -> Path:
@@ -184,6 +187,7 @@ class RepositoryManager:
         broken = self._import_validator.validate(
             rel_path, content, known_files, self._lang_profile
         )
+        self._last_broken_imports = broken  # exposed to _tool_write_file in base_agent
         if broken:
             logger.warning(
                 "Broken imports detected in %s: %s", rel_path, broken

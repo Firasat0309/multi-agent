@@ -158,6 +158,9 @@ class FrontendPipeline:
         repo_manager.initialize(frontend_blueprint)
         metrics["components_planned"] = len(component_plan.components)
 
+        # ── Write package.json and .env.local ─────────────────────────────────
+        self._write_config_files(workspace, component_plan, requirements)
+
         # ── Phase 3: Component DAG ────────────────────────────────────────────
         self._phase("FE: Component DAG", "running")
         logger.info("[FE Phase 3] Building component dependency graph...")
@@ -180,9 +183,28 @@ class FrontendPipeline:
 
         # ── Phase 4: Component Generation (tier-by-tier) ──────────────────────
         self._phase("FE: Component Generation", "running")
+
+        # Detect ghost dependencies — components referenced in depends_on but
+        # not present in the plan — and synthesize minimal stubs so they are
+        # generated rather than left as empty nodes in the dependency graph.
+        planned_names = {c.name for c in ordered_components}
+        ghost_components = self._find_ghost_dependencies(ordered_components, planned_names)
+        if ghost_components:
+            logger.info(
+                "[FE Phase 4] Adding %d unplanned dependency stubs: %s",
+                len(ghost_components),
+                [c.name for c in ghost_components],
+            )
+            # Ghosts go in tier 0 (no dependencies of their own)
+            for gc in ghost_components:
+                tier_map[gc.name] = 0
+            ordered_components = list(ghost_components) + list(ordered_components)
+            # Rebuild the blueprint to include ghost paths
+            frontend_blueprint = self._make_frontend_blueprint(requirements, component_plan)
+        max_tier = max(tier_map.values()) + 1 if tier_map else 1
+
         logger.info("[FE Phase 4] Generating %d components...", len(ordered_components))
         generator = ComponentGeneratorAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
-        max_tier = max(tier_map.values()) + 1 if tier_map else 1
         gen_errors: list[str] = []
 
         for tier_idx in range(max_tier):
@@ -281,6 +303,12 @@ class FrontendPipeline:
                     },
                 ),
                 blueprint=frontend_blueprint,
+                file_blueprint=FileBlueprint(
+                    path="src/lib/api.ts",
+                    purpose="Base Axios/Fetch API client with auth interceptors",
+                    language="typescript",
+                    layer="lib",
+                ),
             )
             api_result = await integrator.execute(api_ctx)
             if not api_result.success:
@@ -306,6 +334,12 @@ class FrontendPipeline:
                     metadata={"component_plan": component_plan},
                 ),
                 blueprint=frontend_blueprint,
+                file_blueprint=FileBlueprint(
+                    path="src/store/index.ts",
+                    purpose="State management barrel / root store",
+                    language="typescript",
+                    layer="store",
+                ),
             )
             state_result = await state_agent.execute(state_ctx)
             if not state_result.success:
@@ -327,22 +361,22 @@ class FrontendPipeline:
             index_workspace(repo_manager, fe_settings)
         except Exception:
             logger.warning("Frontend workspace indexing failed", exc_info=True)
-
-            success = not any(
-                e for e in errors
-                if "Component planning failed" in e
-            )
-            return PipelineResult(
-                success=success,
-                workspace_path=workspace,
-                blueprint=frontend_blueprint,
-                metrics=metrics,
-                errors=errors,
-                elapsed_seconds=time.monotonic() - start_time,
-            )
         finally:
             if mcp_client:
                 await mcp_client.close()
+
+        success = not any(
+            e for e in errors
+            if "Component planning failed" in e
+        )
+        return PipelineResult(
+            success=success,
+            workspace_path=workspace,
+            blueprint=frontend_blueprint,
+            metrics=metrics,
+            errors=errors,
+            elapsed_seconds=time.monotonic() - start_time,
+        )
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -444,3 +478,154 @@ class FrontendPipeline:
         logger.error("Phase %s failed: %s", name, reason)
         if self._live:
             self._live.fail_phase(name, reason)
+
+    # ── Config file generation ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _write_config_files(
+        workspace: Path,
+        plan: ComponentPlan,
+        requirements: "ProductRequirements",
+    ) -> None:
+        """Write package.json and .env.local to the workspace.
+
+        package.json is sourced from the LLM-generated ``plan.package_json``.
+        If the LLM returned an empty dict, a sensible framework-specific
+        default is used so the workspace is always bootable.
+
+        .env.local contains placeholder environment variables that the
+        developer needs to fill in before running the app.
+        """
+        import json as _json
+
+        # ── package.json ─────────────────────────────────────────────────────
+        pkg = dict(plan.package_json) if plan.package_json else {}
+        if not pkg.get("name"):
+            pkg["name"] = requirements.title.lower().replace(" ", "-")
+        if not pkg.get("version"):
+            pkg["version"] = "0.1.0"
+        if not pkg.get("private"):
+            pkg["private"] = True
+
+        # Ensure minimal framework scripts are present
+        fw = plan.framework.lower()
+        if "next" in fw:
+            pkg.setdefault("scripts", {
+                "dev": "next dev",
+                "build": "next build",
+                "start": "next start",
+                "lint": "next lint",
+                "type-check": "tsc --noEmit",
+            })
+            deps = pkg.setdefault("dependencies", {})
+            deps.setdefault("next", "^14.0.0")
+            deps.setdefault("react", "^18.0.0")
+            deps.setdefault("react-dom", "^18.0.0")
+            dev_deps = pkg.setdefault("devDependencies", {})
+            dev_deps.setdefault("@types/node", "^20.0.0")
+            dev_deps.setdefault("@types/react", "^18.0.0")
+            dev_deps.setdefault("typescript", "^5.0.0")
+            if requirements.tech_preferences.get("styling", "").lower() == "tailwind":
+                dev_deps.setdefault("tailwindcss", "^3.4.0")
+                dev_deps.setdefault("autoprefixer", "^10.0.0")
+                dev_deps.setdefault("postcss", "^8.0.0")
+        elif "vue" in fw:
+            pkg.setdefault("scripts", {"dev": "vite", "build": "vite build"})
+            pkg.setdefault("dependencies", {"vue": "^3.4.0"})
+        elif "angular" in fw:
+            pkg.setdefault("scripts", {"start": "ng serve", "build": "ng build"})
+            pkg.setdefault("dependencies", {"@angular/core": "^17.0.0"})
+        else:
+            pkg.setdefault("scripts", {"start": "react-scripts start"})
+            pkg.setdefault("dependencies", {"react": "^18.0.0", "react-dom": "^18.0.0"})
+
+        # State management dependency
+        state = plan.state_solution.lower()
+        if "zustand" in state:
+            pkg.setdefault("dependencies", {})["zustand"] = pkg.get(
+                "dependencies", {}
+            ).get("zustand", "^4.5.0")
+        elif "redux" in state:
+            pkg.setdefault("dependencies", {}).setdefault("@reduxjs/toolkit", "^2.0.0")
+            pkg.setdefault("dependencies", {}).setdefault("react-redux", "^9.0.0")
+
+        pkg_path = workspace / "package.json"
+        pkg_path.write_text(_json.dumps(pkg, indent=2), encoding="utf-8")
+        logger.info("Wrote package.json (%d deps)", len(pkg.get("dependencies", {})))
+
+        # ── .env.local ────────────────────────────────────────────────────────
+        api_base = plan.api_base_url or "/api/v1"
+        env_content = (
+            "# Auto-generated by codegen frontend pipeline\n"
+            "# Fill in the values before running the application.\n\n"
+            f"NEXT_PUBLIC_API_BASE_URL={api_base}\n"
+            "NEXT_PUBLIC_APP_NAME=" + requirements.title + "\n"
+            "# NEXT_PUBLIC_AUTH_URL=https://your-auth-service.example.com\n"
+            "# DATABASE_URL=postgresql://user:password@localhost:5432/dbname\n"
+            "# JWT_SECRET=change-me-in-production\n"
+        )
+        env_path = workspace / ".env.local"
+        env_path.write_text(env_content, encoding="utf-8")
+        logger.info("Wrote .env.local")
+
+    # ── Ghost dependency detection ─────────────────────────────────────────────
+
+    @staticmethod
+    def _find_ghost_dependencies(
+        planned_components: "list",
+        planned_names: "set[str]",
+    ) -> "list":
+        """Return UIComponent stubs for every component name referenced in
+        ``depends_on`` that is not present in ``planned_names``.
+
+        Ghost components appear in the dependency graph but were never added
+        to the ComponentPlan (e.g. UserDropdown, Alert, ProgressBar).
+        Without stubs, they become dead nodes and the importing file ends up
+        with a broken import at runtime.
+
+        File-path and type are inferred from naming conventions:
+          - Dropdown / Modal / Menu / Popover → components/ui/
+          - Alert / Badge / Tag / Chip / Toast → components/ui/
+          - Layout / Header / Footer / Sidebar / Nav → components/layout/
+          - Everything else → components/shared/
+        """
+        from core.models import UIComponent  # local import to avoid circular
+
+        _UI_KEYWORDS = {"dropdown", "modal", "menu", "popover", "alert",
+                        "badge", "tag", "chip", "toast", "button", "input",
+                        "card", "avatar", "icon", "spinner", "skeleton",
+                        "progressbar", "progress", "list", "table", "tabs"}
+        _LAYOUT_KEYWORDS = {"layout", "header", "footer", "sidebar", "nav",
+                             "navbar", "drawer", "panel"}
+
+        referenced: dict[str, str] = {}  # name -> implied_by (first referrer)
+        for comp in planned_components:
+            for dep in comp.depends_on:
+                if dep not in planned_names and dep not in referenced:
+                    referenced[dep] = comp.name
+
+        ghosts: list = []
+        for name, implied_by in referenced.items():
+            lower = name.lower()
+            if any(kw in lower for kw in _LAYOUT_KEYWORDS):
+                layer = "layout"
+                folder = "components/layout"
+            elif any(kw in lower for kw in _UI_KEYWORDS):
+                layer = "ui"
+                folder = "components/ui"
+            else:
+                layer = "shared"
+                folder = "components/shared"
+
+            ext = ".tsx"
+            file_path = f"src/{folder}/{name}{ext}"
+            ghosts.append(
+                UIComponent(
+                    name=name,
+                    file_path=file_path,
+                    component_type=layer,
+                    description=f"Auto-stub for missing dependency '{name}' (required by {implied_by})",
+                    layer=folder,
+                )
+            )
+        return ghosts

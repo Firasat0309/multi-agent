@@ -330,7 +330,19 @@ class BaseAgent(ABC):
             return "Error: 'path' is required"
         # Security: async_write_file is scoped to workspace root
         await self.repo.async_write_file(path, content)
-        return f"Written {len(content)} bytes to {path}"
+        msg = f"Written {len(content)} bytes to {path}"
+        # Relay broken-import warnings so the LLM can correct or accept them
+        broken = getattr(self.repo, "_last_broken_imports", [])
+        if broken:
+            msg += (
+                f"\n⚠ Unresolvable imports in {path}: {broken}."
+                " These paths do not match any file currently in the workspace."
+                " If the missing file will be generated later, you may leave the import as-is."
+                " Otherwise, fix the import path or inline the dependency."
+                " Do NOT rewrite this file just to fix the import — only rewrite if the"
+                " component logic itself is wrong."
+            )
+        return msg
 
     async def _tool_search_code(self, inp: dict) -> str:
         query = inp.get("query", "")
