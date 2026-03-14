@@ -76,10 +76,23 @@ class RunPipeline:
                 logger.error("Failed to initialize MCP client in run pipeline: %e", e)
                 mcp_client = None
 
+        # ── Phase 1: Architecture ─────────────────────────────────────────────
+        self._phase("Architecture Design", "running")
+        logger.info("[Phase 1] Designing architecture...")
+
+        repo_manager = RepositoryManager(self._settings.workspace_dir)
+        if self._root_write_lock is not None:
+            repo_manager._root_write_lock = self._root_write_lock
+        architect = ArchitectAgent(
+            llm_client=self._llm,
+            repo_manager=repo_manager,
+            mcp_client=mcp_client,
+        )
+
+        # Timeout the architecture LLM call so the pipeline never hangs
+        # indefinitely if the API endpoint stalls.
+        _arch_timeout = self._settings.phase_timeout_seconds
         try:
-            # Timeout the architecture LLM call so the pipeline never hangs
-            # indefinitely if the API endpoint stalls.
-            _arch_timeout = self._settings.phase_timeout_seconds
             blueprint = await asyncio.wait_for(
                 architect.design_architecture(user_prompt),
                 timeout=_arch_timeout,
@@ -109,32 +122,9 @@ class RunPipeline:
                 workspace_path=self._settings.workspace_dir,
                 errors=[f"Architecture design failed: {e}"],
                 elapsed_seconds=time.monotonic() - start_time,
-            # ── Phase 1: Architecture ─────────────────────────────────────────────
-            self._phase("Architecture Design", "running")
-            logger.info("[Phase 1] Designing architecture...")
-    
-            repo_manager = RepositoryManager(self._settings.workspace_dir)
-            if self._root_write_lock is not None:
-                repo_manager._root_write_lock = self._root_write_lock
-            architect = ArchitectAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
+            )
 
-            try:
-                blueprint = await architect.design_architecture(user_prompt)
-            except (LLMConfigError, Exception) as e:
-                is_config = isinstance(e, LLMConfigError)
-                if not is_config:
-                    logger.exception("Architecture design failed")
-                else:
-                    logger.error(str(e))
-                self._fail_phase("Architecture Design", str(e))
-                return PipelineResult(
-                    success=False,
-                    workspace_path=self._settings.workspace_dir,
-                    errors=[f"Architecture design failed: {e}"],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
-
-            lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
+        lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
             logger.info(
                 "Blueprint: %s | Language: %s | %d files",
                 blueprint.name, lang_profile.display_name, len(blueprint.file_blueprints),
@@ -269,8 +259,6 @@ class RunPipeline:
                     errors=[f"Task execution failed: {e}"],
                     elapsed_seconds=time.monotonic() - start_time,
                 )
-            finally:
-                await sandbox.teardown()
 
             self._complete_phase("Code Generation & Review")
 
@@ -289,10 +277,17 @@ class RunPipeline:
             # Code success: all files generated, reviewed, and built correctly.
             # Test failures (tests_degraded) are a quality signal, not a hard gate —
             # the generated code itself is valid even when generated tests don't all pass.
+            # Also check checkpoint results — if any build checkpoint failed, the
+            # code is not reliable even if lifecycle states look OK.
+            checkpoints_passed = all(
+                cr.get("passed", True)
+                for cr in exec_result.get("checkpoint_results", [])
+            )
             code_success = (
                 stats.get("failed", 0) == 0
                 and stats.get("blocked", 0) == 0
                 and stats.get("lifecycle_failed", 0) == 0
+                and checkpoints_passed
             )
             tests_passed = stats.get("lifecycle_tests_degraded", 0) == 0
             # Overall success requires code to generate correctly; test quality is
@@ -304,7 +299,10 @@ class RunPipeline:
             logger.info(
                 "Pipeline %s | code_success=%s tests_passed=%s | stats=%s | elapsed=%.1fs",
                 "SUCCEEDED" if success else "COMPLETED WITH ISSUES",
-                code_success, tests_passed, stats, elapsed,
+                code_success,
+                tests_passed,
+                stats,
+                elapsed,
             )
 
             token_cost = self._build_token_cost()
@@ -334,72 +332,12 @@ class RunPipeline:
             logger.error("Unhandled error in run pipeline: %e", flow_err)
             raise
         finally:
-            await sandbox.teardown()
-
-        self._complete_phase("Code Generation & Review")
-
-        # ── Phase 4: Finalise ─────────────────────────────────────────────────
-        self._phase("Finalize", "running")
-        logger.info("[Phase 4] Finalising repository...")
-
-        try:
-            index_workspace(repo_manager, self._settings)
-        except Exception as e:
-            logger.warning("Indexing failed (non-critical): %s", e)
-
-        elapsed = time.monotonic() - start_time
-        stats = exec_result.get("stats", {})
-
-        # Code success: all files generated, reviewed, and built correctly.
-        # Test failures (tests_degraded) are a quality signal, not a hard gate —
-        # the generated code itself is valid even when generated tests don't all pass.
-        # Also check checkpoint results — if any build checkpoint failed, the
-        # code is not reliable even if lifecycle states look OK.
-        checkpoints_passed = all(
-            cr.get("passed", True) for cr in exec_result.get("checkpoint_results", [])
-        )
-        code_success = (
-            stats.get("failed", 0) == 0
-            and stats.get("blocked", 0) == 0
-            and stats.get("lifecycle_failed", 0) == 0
-            and checkpoints_passed
-        )
-        tests_passed = stats.get("lifecycle_tests_degraded", 0) == 0
-        # Overall success requires code to generate correctly; test quality is
-        # reported separately so a run with working code is never masked as
-        # a total failure just because generated tests are imperfect.
-        success = code_success
-
-        self._complete_phase("Finalize")
-        logger.info(
-            "Pipeline %s | code_success=%s tests_passed=%s | stats=%s | elapsed=%.1fs",
-            "SUCCEEDED" if success else "COMPLETED WITH ISSUES",
-            code_success, tests_passed, stats, elapsed,
-        )
-
-        token_cost = self._build_token_cost()
-        RunReporter(self._settings.workspace_dir).write_run_report(
-            prompt=user_prompt,
-            blueprint=blueprint,
-            task_graph=global_graph,
-            stats=stats,
-            elapsed=elapsed,
-            success=success,
-            code_success=code_success,
-            tests_passed=tests_passed,
-            token_cost=token_cost,
-        )
-
-        return PipelineResult(
-            success=success,
-            workspace_path=self._settings.workspace_dir,
-            blueprint=blueprint,
-            task_stats=stats,
-            metrics=exec_result.get("metrics", {}),
-            errors=errors,
-            elapsed_seconds=elapsed,
-            token_cost=token_cost,
-        )
+            # Ensure sandbox and MCP client are cleaned up even on failure.
+            try:
+                if "sandbox" in locals():
+                    await sandbox.teardown()
+            except Exception:
+                logger.warning("Error during sandbox teardown", exc_info=True)
             if mcp_client:
                 await mcp_client.close()
 
