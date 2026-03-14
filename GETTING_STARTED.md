@@ -1,4 +1,4 @@
-﻿# Getting Started
+# Getting Started
 
 This guide walks you through installing, configuring, and running the
 multi-agent code generation platform — for all three operating modes:
