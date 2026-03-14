@@ -878,7 +878,7 @@ class PipelineExecutor:
             dep_store=self._am._dep_store,
             embedding_store=self._am._embedding_store,
         )
-        context = context_builder.build(task)
+        context = await asyncio.to_thread(context_builder.build, task)
 
         try:
             agent = self._am._create_agent(TaskType.FIX_CODE)
