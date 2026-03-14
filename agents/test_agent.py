@@ -513,7 +513,7 @@ class TestAgent(BaseAgent):
                 # Size guard: reject rewrites that inflate content (> 135% of original)
                 elif source_path and original_size > 0 and len(fixed_source) > original_size * 1.35:
                     logger.warning(
-                        f"Source fix rejected: new size ({len(fixed_source)}) exceeds 135%% "
+                        f"Source fix rejected: new size ({len(fixed_source)}) exceeds 135% "
                         f"of original ({original_size}). Keeping original to prevent "
                         f"content duplication."
                     )
