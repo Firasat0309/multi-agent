@@ -55,6 +55,57 @@ def _has_duplicate_definitions(content: str, language: str) -> bool:
     return len(names) != len(set(names))
 
 
+def _validate_rewrite(
+    new_content: str,
+    original_content: str,
+    profile: LanguageProfile,
+    file_path: str,
+    operation: str,
+) -> TaskResult | None:
+    """Validate a code rewrite and return TaskResult if validation fails, None if valid."""
+    original_size = len(original_content)
+    
+    # ── Guard: reject rewrites that inflate the file (likely LLM duplication) ──
+    if original_size > 0 and len(new_content) > original_size * _MAX_CONTENT_GROWTH:
+        logger.warning(
+            "%s rewrite rejected for %s: new size (%d) exceeds %.0f%% of original (%d). "
+            "Keeping original to prevent content duplication.",
+            operation, file_path, len(new_content), _MAX_CONTENT_GROWTH * 100, original_size,
+        )
+        return TaskResult(
+            success=False,
+            output=f"{operation} for {file_path} skipped — rewrite was too large (likely duplicated content)",
+            errors=[f"Content inflation detected: {len(new_content)} bytes vs {original_size} original"],
+            metrics={},
+        )
+
+    # ── Guard: detect duplicate class/function definitions ────────────────
+    if _has_duplicate_definitions(new_content, profile.name):
+        logger.warning(
+            "%s rewrite rejected for %s: duplicate definitions detected. "
+            "Keeping original to prevent content duplication.",
+            operation, file_path,
+        )
+        return TaskResult(
+            success=False,
+            output=f"{operation} for {file_path} skipped — duplicate definitions detected in LLM output",
+            errors=["Duplicate class/function definitions detected in LLM output"],
+            metrics={},
+        )
+
+    # ── Guard: skip write if content is identical ─────────────────────────
+    if new_content.rstrip() == original_content.rstrip():
+        logger.info("%s for %s produced identical content — skipping write", operation, file_path)
+        return TaskResult(
+            success=True,
+            output=f"No changes needed for {file_path} (content unchanged after {operation.lower()})",
+            files_modified=[],
+            metrics={},
+        )
+
+    return None  # Validation passed
+
+
 # File extensions that are configuration/resource files, not source code.
 # These need format-specific generation, not a language-code prompt.
 _CONFIG_FILE_FORMATS: dict[str, str] = {
@@ -474,44 +525,10 @@ class CoderAgent(BaseAgent):
         fixed_code = await self._call_llm(prompt, system_override=self._get_source_system_prompt(lang))
         fixed_code = self._clean_fences(fixed_code, profile.code_fence_name)
 
-        # ── Guard: reject rewrites that inflate the file (likely LLM duplication) ──
-        original_size = len(current_content)
-        if original_size > 0 and len(fixed_code) > original_size * _MAX_CONTENT_GROWTH:
-            logger.warning(
-                "Fix rewrite rejected for %s: new size (%d) exceeds %.0f%% of original (%d). "
-                "Keeping original to prevent content duplication.",
-                file_path, len(fixed_code), _MAX_CONTENT_GROWTH * 100, original_size,
-            )
-            return TaskResult(
-                success=True,
-                output=f"Fix for {file_path} skipped — rewrite was too large (likely duplicated content)",
-                files_modified=[],
-                metrics=self.get_metrics(),
-            )
-
-        # ── Guard: detect duplicate class/function definitions ────────────────
-        if _has_duplicate_definitions(fixed_code, profile.name):
-            logger.warning(
-                "Fix rewrite rejected for %s: duplicate definitions detected. "
-                "Keeping original to prevent content duplication.",
-                file_path,
-            )
-            return TaskResult(
-                success=True,
-                output=f"Fix for {file_path} skipped — duplicate definitions detected in LLM output",
-                files_modified=[],
-                metrics=self.get_metrics(),
-            )
-
-        # ── Guard: skip write if content is identical ─────────────────────────
-        if fixed_code.rstrip() == current_content.rstrip():
-            logger.info("Fix for %s produced identical content — skipping write", file_path)
-            return TaskResult(
-                success=True,
-                output=f"No changes needed for {file_path} (content unchanged after fix)",
-                files_modified=[],
-                metrics=self.get_metrics(),
-            )
+        # ── Validate the rewrite ─────────────────────────────────────────────
+        validation_result = _validate_rewrite(fixed_code, current_content, profile, file_path, "Fix")
+        if validation_result is not None:
+            return validation_result
 
         await self.repo.async_write_file(file_path, fixed_code)
 
@@ -697,34 +714,10 @@ class CoderAgent(BaseAgent):
         )
         modified_code = self._clean_fences(modified_code, profile.code_fence_name)
 
-        # ── Guard: reject rewrites that inflate the file (likely LLM duplication) ──
-        original_size = len(current_content)
-        if original_size > 0 and len(modified_code) > original_size * _MAX_CONTENT_GROWTH:
-            logger.warning(
-                "Modify rewrite rejected for %s: new size (%d) exceeds %.0f%% of original (%d). "
-                "Keeping original to prevent content duplication.",
-                file_path, len(modified_code), _MAX_CONTENT_GROWTH * 100, original_size,
-            )
-            return TaskResult(
-                success=False,
-                output=f"Modification of {file_path} skipped — rewrite was too large (likely duplicated content)",
-                errors=[f"Content inflation detected: {len(modified_code)} bytes vs {original_size} original"],
-                metrics=self.get_metrics(),
-            )
-
-        # ── Guard: detect duplicate class/function definitions ────────────────
-        if _has_duplicate_definitions(modified_code, profile.name):
-            logger.warning(
-                "Modify rewrite rejected for %s: duplicate definitions detected. "
-                "Keeping original to prevent content duplication.",
-                file_path,
-            )
-            return TaskResult(
-                success=False,
-                output=f"Modification of {file_path} skipped — duplicate definitions detected in LLM output",
-                errors=["Duplicate class/function definitions detected in LLM output"],
-                metrics=self.get_metrics(),
-            )
+        # ── Validate the rewrite ─────────────────────────────────────────────
+        validation_result = _validate_rewrite(modified_code, current_content, profile, file_path, "Modification")
+        if validation_result is not None:
+            return validation_result
 
         await self.repo.async_write_file(file_path, modified_code)
 

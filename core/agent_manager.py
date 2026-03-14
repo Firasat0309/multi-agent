@@ -251,6 +251,21 @@ class AgentManager:
             engine.process_event(file_path, EventType.REVIEW_PASSED)
             return
 
+        config = self._get_phase_config(phase, lc, file_path)
+        if config is None:
+            return
+
+        task = self._build_lifecycle_task(config, lc, file_path)
+
+        if self._live:
+            self._live.log(f"[cyan]Lifecycle:[/cyan] {config['description']}")
+
+        context = await self._build_agent_context(task)
+
+        await self._execute_agent_and_handle_result(engine, file_path, phase, config, task, context)
+
+    def _get_phase_config(self, phase: FilePhase, lc: Any, file_path: str) -> dict[str, Any] | None:
+        """Build the configuration for the given phase."""
         # Map phase → task type + event on success/failure.
         # For GENERATING: use the lifecycle's generation_task_type which is
         # MODIFY_FILE for the Enhance pipeline, GENERATE_FILE for Generate.
@@ -297,15 +312,16 @@ class AgentManager:
         config = phase_config.get(phase)
         if config is None:
             logger.warning("No action for phase %s on %s", phase.value, file_path)
-            return
+        return config
 
-        # Build a synthetic Task for the context builder.
+    def _build_lifecycle_task(self, config: dict[str, Any], lc: Any, file_path: str) -> Task:
+        """Build a synthetic Task for the context builder."""
         # Merge lifecycle change_metadata (change_type, target_function etc.)
         # so PatchAgent/CoderAgent receives the full context.
         task_meta = self._build_lifecycle_metadata(lc)
         task_meta.update(lc.change_metadata)
 
-        task = Task(
+        return Task(
             task_id=0,
             task_type=config["task_type"],
             file=file_path,
@@ -313,10 +329,8 @@ class AgentManager:
             metadata=task_meta,
         )
 
-        if self._live:
-            self._live.log(f"[cyan]Lifecycle:[/cyan] {config['description']}")
-
-        # Build context and execute
+    async def _build_agent_context(self, task: Task) -> AgentContext:
+        """Build the agent execution context."""
         context_builder = ContextBuilder(
             workspace_dir=self.repo.workspace,
             blueprint=self.blueprint,
@@ -327,8 +341,18 @@ class AgentManager:
         # Run context build in a thread — embedding_store.search() loads the
         # SentenceTransformer model synchronously on first call, which makes
         # HuggingFace network requests that would otherwise block the event loop.
-        context = await asyncio.to_thread(context_builder.build, task)
+        return await asyncio.to_thread(context_builder.build, task)
 
+    async def _execute_agent_and_handle_result(
+        self,
+        engine: LifecycleEngine,
+        file_path: str,
+        phase: FilePhase,
+        config: dict[str, Any],
+        task: Task,
+        context: AgentContext,
+    ) -> None:
+        """Execute the agent and handle the result."""
         try:
             agent = self._create_agent(config["task_type"])
             record_agent_start()
@@ -337,118 +361,142 @@ class AgentManager:
             finally:
                 record_agent_end()
 
-            # Track metrics
-            agent_name = agent.role.value
-            if agent_name not in self._metrics["agent_metrics"]:
-                self._metrics["agent_metrics"][agent_name] = []
-            self._metrics["agent_metrics"][agent_name].append(agent.get_metrics())
+            self._update_metrics(agent, result)
 
-            # Determine success/failure for lifecycle events.
-            # Review is special: ReviewerAgent always returns success=True (task
-            # completed), but uses result.metrics["passed"] to indicate the
-            # actual review verdict.
-            if config["task_type"] == TaskType.REVIEW_FILE:
-                # Treat a task-level failure (e.g. JSON parse error) as a
-                # review failure rather than silently passing the file through.
-                # Also change the default to False so an empty metrics dict
-                # (result of a ValidationError) doesn't produce a false pass.
-                review_passed = result.success and result.metrics.get("passed", False)
-                if review_passed:
-                    event_data = {"output": result.output}
-                    engine.process_event(file_path, EventType.REVIEW_PASSED, event_data)
-                    if self._event_bus:
-                        await self._event_bus.publish(AgentEvent(
-                            type=BusEventType.REVIEW_PASSED,
-                            task_type=config["task_type"].value,
-                            file_path=file_path,
-                            agent_name=agent_name,
-                        ))
-                else:
-                    event_data = {"findings": result.errors, "output": result.output}
-                    engine.process_event(file_path, EventType.REVIEW_FAILED, event_data)
-                    if self._event_bus:
-                        await self._event_bus.publish(AgentEvent(
-                            type=BusEventType.REVIEW_FAILED,
-                            task_type=config["task_type"].value,
-                            file_path=file_path,
-                            agent_name=agent_name,
-                            data={"findings": result.errors},
-                        ))
-                self._metrics["tasks_completed"] += 1
-            elif result.success:
-                self._metrics["tasks_completed"] += 1
-                event_data = self._extract_event_data(result, config["task_type"])
-                engine.process_event(file_path, config["success_event"], event_data)
-                logger.info("[%s] %s succeeded", file_path, phase.value)
-                # Incremental embedding update for lifecycle path
-                if self._embedding_store and result.files_modified:
-                    for fp in result.files_modified:
-                        try:
-                            content = self.repo.read_file(fp)
-                            self._embedding_store.index_file(fp, content)
-                        except Exception:
-                            logger.debug("Embedding update skipped for %s", fp)
-                        if self._event_bus:
-                            await self._event_bus.publish(AgentEvent(
-                                type=BusEventType.FILE_WRITTEN,
-                                task_type=config["task_type"].value,
-                                file_path=fp,
-                                agent_name=agent_name,
-                            ))
-                if self._event_bus:
-                    bus_type = (
-                        BusEventType.TEST_PASSED
-                        if config["task_type"] == TaskType.GENERATE_TEST
-                        else BusEventType.TASK_COMPLETED
-                    )
-                    await self._event_bus.publish(AgentEvent(
-                        type=bus_type,
-                        task_type=config["task_type"].value,
-                        file_path=file_path,
-                        agent_name=agent_name,
-                    ))
-                if self._live:
-                    self._live.log(f"[green]Done:[/green] {config['description']}")
-            else:
-                event_data = self._extract_event_data(result, config["task_type"])
-                engine.process_event(file_path, config["failure_event"], event_data)
-                logger.warning("[%s] %s failed: %s", file_path, phase.value, result.errors)
-                if self._event_bus:
-                    bus_type = (
-                        BusEventType.TEST_FAILED
-                        if config["task_type"] == TaskType.GENERATE_TEST
-                        else BusEventType.TASK_FAILED
-                    )
-                    await self._event_bus.publish(AgentEvent(
-                        type=bus_type,
-                        task_type=config["task_type"].value,
-                        file_path=file_path,
-                        agent_name=agent_name,
-                        data={"errors": result.errors},
-                    ))
-                if self._live:
-                    self._live.log(
-                        f"[yellow]Issue:[/yellow] {config['description']} — "
-                        f"transitioning via {config['failure_event'].value}"
-                    )
+            await self._handle_execution_result(engine, file_path, phase, config, task, result)
 
         except Exception as e:
-            logger.exception("[%s] %s error", file_path, phase.value)
-            # For review phase, treat crash as REVIEW_FAILED so the file still
-            # goes through build verification rather than silently passing.
-            if phase == FilePhase.REVIEWING:
-                engine.process_event(
-                    file_path, EventType.REVIEW_FAILED,
-                    {"findings": [f"Review crashed: {e}"], "output": ""},
-                )
-            elif phase == FilePhase.FIXING:
-                # Fix crashed — fire RETRIES_EXHAUSTED so the file stops
-                # cycling and is marked FAILED instead of looping forever.
-                engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
-                self._metrics["tasks_failed"] += 1
+            await self._handle_execution_exception(engine, file_path, phase, e)
+
+    def _update_metrics(self, agent: BaseAgent, result: TaskResult) -> None:
+        """Update internal metrics with bounded lists."""
+        agent_name = agent.role.value
+        if agent_name not in self._metrics["agent_metrics"]:
+            self._metrics["agent_metrics"][agent_name] = []
+        
+        # Keep only last 100 metrics entries per agent to prevent unbounded growth
+        metrics_list = self._metrics["agent_metrics"][agent_name]
+        metrics_list.append(agent.get_metrics())
+        if len(metrics_list) > 100:
+            metrics_list.pop(0)
+
+    async def _handle_execution_result(
+        self,
+        engine: LifecycleEngine,
+        file_path: str,
+        phase: FilePhase,
+        config: dict[str, Any],
+        task: Task,
+        result: TaskResult,
+    ) -> None:
+        """Handle the result of agent execution."""
+        # Get agent name from the task type (simplified mapping)
+        agent_name = self._get_agent_name_for_task_type(config["task_type"])
+
+        # Determine success/failure for lifecycle events.
+        # Review is special: ReviewerAgent always returns success=True (task
+        # completed), but uses result.metrics["passed"] to indicate the
+        # actual review verdict.
+        if config["task_type"] == TaskType.REVIEW_FILE:
+            # Treat a task-level failure (e.g. JSON parse error) as a
+            # review failure rather than silently passing the file through.
+            # Also change the default to False so an empty metrics dict
+            # (result of a ValidationError) doesn't produce a false pass.
+            review_passed = result.success and result.metrics.get("passed", False)
+            if review_passed:
+                event_data = {"output": result.output}
+                engine.process_event(file_path, EventType.REVIEW_PASSED, event_data)
+                if self._event_bus:
+                    await self._event_bus.publish(AgentEvent(
+                        type=BusEventType.REVIEW_PASSED,
+                        task_type=config["task_type"].value,
+                        file_path=file_path,
+                        agent_name=agent_name,
+                    ))
             else:
-                engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
-                self._metrics["tasks_failed"] += 1
+                event_data = {"findings": result.errors, "output": result.output}
+                engine.process_event(file_path, EventType.REVIEW_FAILED, event_data)
+                if self._event_bus:
+                    await self._event_bus.publish(AgentEvent(
+                        type=BusEventType.REVIEW_FAILED,
+                        task_type=config["task_type"].value,
+                        file_path=file_path,
+                        agent_name=agent_name,
+                        data={"findings": result.errors},
+                    ))
+            self._metrics["tasks_completed"] += 1
+        elif result.success:
+            self._metrics["tasks_completed"] += 1
+            event_data = self._extract_event_data(result, config["task_type"])
+            engine.process_event(file_path, config["success_event"], event_data)
+            logger.info("[%s] %s succeeded", file_path, phase.value)
+            # Incremental embedding update for lifecycle path
+            if self._embedding_store and result.files_modified:
+                for fp in result.files_modified:
+                    try:
+                        content = self.repo.read_file(fp)
+                        self._embedding_store.index_file(fp, content)
+                    except Exception:
+                        logger.debug("Embedding update skipped for %s", fp)
+                    if self._event_bus:
+                        await self._event_bus.publish(AgentEvent(
+                            type=BusEventType.FILE_WRITTEN,
+                            task_type=config["task_type"].value,
+                            file_path=fp,
+                            agent_name=agent_name,
+                        ))
+            if self._event_bus:
+                bus_type = (
+                    BusEventType.TEST_PASSED
+                    if config["task_type"] == TaskType.GENERATE_TEST
+                    else BusEventType.TASK_COMPLETED
+                )
+                await self._event_bus.publish(AgentEvent(
+                    type=bus_type,
+                    task_type=config["task_type"].value,
+                    file_path=file_path,
+                    agent_name=agent_name,
+                ))
+            if self._live:
+                self._live.log(f"[green]Done:[/green] {config['description']}")
+        else:
+            event_data = self._extract_event_data(result, config["task_type"])
+            engine.process_event(file_path, config["failure_event"], event_data)
+            logger.warning("[%s] %s failed: %s", file_path, phase.value, result.errors)
+            if self._event_bus:
+                bus_type = (
+                    BusEventType.TEST_FAILED
+                    if config["task_type"] == TaskType.GENERATE_TEST
+                    else BusEventType.TASK_FAILED
+                )
+                await self._event_bus.publish(AgentEvent(
+                    type=bus_type,
+                    task_type=config["task_type"].value,
+                    file_path=file_path,
+                    agent_name=agent_name,
+                    data={"errors": result.errors},
+                ))
+            if self._live:
+                self._live.log(
+                    f"[yellow]Issue:[/yellow] {config['description']} — "
+                    f"transitioning via {config['failure_event'].value}"
+                )
+
+    def _get_agent_name_for_task_type(self, task_type: TaskType) -> str:
+        """Get the agent name for a given task type."""
+        # Simple mapping - in practice, this could be more sophisticated
+        mapping = {
+            TaskType.GENERATE_FILE: "CoderAgent",
+            TaskType.REVIEW_FILE: "ReviewerAgent",
+            TaskType.FIX_CODE: "CoderAgent",
+            TaskType.MODIFY_FILE: "PatchAgent",
+            TaskType.GENERATE_TEST: "TestAgent",
+            TaskType.SECURITY_SCAN: "SecurityAgent",
+            TaskType.VERIFY_BUILD: "BuildVerifierAgent",
+            TaskType.GENERATE_DEPLOY: "DeployAgent",
+            TaskType.GENERATE_DOCS: "WriterAgent",
+        }
+        return mapping.get(task_type, "UnknownAgent")
 
     async def execute_with_checkpoints(
         self,
