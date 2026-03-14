@@ -73,7 +73,6 @@ class PlanApprover:
         Panel: type,
     ) -> None:
         """Render plan with Rich tables and panels."""
-        from rich.text import Text
 
         console.print(f"\n[bold cyan]Change Plan:[/bold cyan] {plan.summary}\n")
 

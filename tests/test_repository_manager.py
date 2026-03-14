@@ -1,7 +1,6 @@
 """Tests for repository manager."""
 
 import pytest
-from pathlib import Path
 
 from core.models import FileBlueprint, RepositoryBlueprint
 from core.repository_manager import RepositoryManager
@@ -88,3 +87,23 @@ class TestRepositoryManager:
         repo_manager.write_file("models/user.py", "class User: pass\n")
         repo_manager.save_repo_index()
         assert (workspace / "repo_index.json").exists()
+
+    def test_path_traversal_blocked(self, repo_manager, blueprint):
+        """write_file must raise ValueError for paths that escape the workspace."""
+        repo_manager.initialize(blueprint)
+        import pytest
+        with pytest.raises(ValueError, match="Path traversal blocked"):
+            repo_manager.write_file("../../etc/passwd", "malicious")
+
+    def test_path_traversal_blocked_absolute(self, repo_manager, blueprint):
+        """Absolute paths that escape the workspace are also rejected."""
+        import pytest
+        repo_manager.initialize(blueprint)
+        with pytest.raises((ValueError, Exception)):
+            repo_manager.write_file("/etc/passwd", "malicious")
+
+    def test_normal_write_not_blocked(self, repo_manager, blueprint):
+        """Legitimate nested writes must still succeed."""
+        repo_manager.initialize(blueprint)
+        repo_manager.write_file("models/deep/nested/file.py", "x = 1\n")
+        assert repo_manager.read_file("models/deep/nested/file.py") == "x = 1\n"

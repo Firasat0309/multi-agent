@@ -260,16 +260,35 @@ class CompilerErrorAttributor(BaseErrorAttributor):
         if file_path in known_files:
             return file_path
 
-        # Match by filename
-        basename = PurePosixPath(file_path).name
-        for known in known_files:
-            if known.endswith(f"/{basename}") or known == basename:
-                return known
+        # Suffix match (e.g., com/example/User.java → src/main/java/com/example/User.java)
+        # Collect ALL candidates; ambiguous results are discarded to avoid
+        # silently attributing errors to the wrong file.
+        suffix_matches = [k for k in known_files if k.endswith(file_path)]
+        if len(suffix_matches) == 1:
+            return suffix_matches[0]
+        if len(suffix_matches) > 1:
+            logger.debug(
+                "Ambiguous suffix attribution for %s — candidates: %s",
+                file_path, suffix_matches,
+            )
+            return None
 
-        # Match by suffix (e.g., com/example/User.java → src/main/java/com/example/User.java)
-        for known in known_files:
-            if known.endswith(file_path):
-                return known
+        # Basename match — only when there is exactly one file with that name.
+        # If two files share the same basename (e.g. src/models/User.java and
+        # src/dto/User.java) we cannot determine which one is at fault.
+        basename = PurePosixPath(file_path).name
+        basename_matches = [
+            k for k in known_files
+            if k.endswith(f"/{basename}") or k == basename
+        ]
+        if len(basename_matches) == 1:
+            return basename_matches[0]
+        if len(basename_matches) > 1:
+            logger.debug(
+                "Ambiguous basename attribution for %s — candidates: %s",
+                file_path, basename_matches,
+            )
+            return None
 
         return None
 

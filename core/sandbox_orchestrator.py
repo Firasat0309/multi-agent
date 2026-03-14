@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from config.settings import SandboxConfig, SandboxTier, SandboxType, Settings
+from config.settings import SandboxTier, SandboxType, Settings
 
 if TYPE_CHECKING:
     from core.language import LanguageProfile

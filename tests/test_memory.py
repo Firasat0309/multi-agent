@@ -1,8 +1,6 @@
 """Tests for memory systems."""
 
 import pytest
-import json
-from pathlib import Path
 
 from core.models import FileIndex
 from memory.repo_index import RepoIndexStore

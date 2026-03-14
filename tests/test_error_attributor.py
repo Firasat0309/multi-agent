@@ -1,6 +1,5 @@
 """Tests for the compiler error attribution system."""
 
-import pytest
 from core.error_attributor import (
     AttributedError,
     AttributionResult,

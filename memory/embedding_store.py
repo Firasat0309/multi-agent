@@ -53,6 +53,16 @@ class EmbeddingStore:
         self._client: Any = None
         self._collection: Any = None
 
+    @property
+    def is_ready(self) -> bool:
+        """Return True if the ChromaDB client has been initialised.
+
+        Callers that run on the asyncio event-loop thread should check this
+        before calling ``search()`` to avoid blocking the loop on the
+        threading lock inside ``_ensure_client()``.
+        """
+        return self._client is not None
+
     def _ensure_client(self) -> None:
         if self._client is not None:
             return

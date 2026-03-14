@@ -1,7 +1,6 @@
 """Tests for LLM error handling: missing API keys, invalid models, auth failures."""
 
-import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 

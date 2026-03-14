@@ -92,6 +92,27 @@ codegen generate "Build a user management REST API" --provider gemini --model ge
 
 ---
 
+## Generating a Fullstack App with Figma (UI Integration)
+
+The `fullstack` command generates both a backend API and a frontend UI. You can optionally provide a Figma design URL to generate the UI based on your designs.
+
+To use Figma, you must configure the Figma MCP server so the agent can read your design file:
+
+```bash
+# 1. Provide the command to start the Figma MCP server
+export MCP_SERVER_COMMAND="npx -y @modelcontextprotocol/server-figma"
+
+# 2. Provide your Figma Personal Access Token
+export FIGMA_TOKEN="figd_..." 
+
+# 3. Run the fullstack generator
+codegen fullstack "Build a SaaS dashboard" \
+  --figma-url "https://www.figma.com/file/YOUR_FILE_KEY/Dashboard" \
+  --workspace ./my-saas
+```
+
+---
+
 ## All CLI Options
 
 ```bash

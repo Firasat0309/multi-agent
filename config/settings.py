@@ -83,6 +83,7 @@ class Settings:
     review_levels: list[str] = field(
         default_factory=lambda: ["file", "module", "architecture"]
     )
+    figma_token: str = field(default_factory=lambda: os.environ.get("FIGMA_TOKEN", ""))
     allow_host_execution: bool = False  # Must be True to run without Docker
     require_plan_approval: bool = False  # If True, pause for human review after change planning
     # Number of build attempts per tier checkpoint (1 initial + retries).
@@ -91,6 +92,9 @@ class Settings:
     # Agent phases the user wants to skip entirely.  Recognised values:
     # "tester", "reviewer".  Phases listed here are bypassed in the executor.
     skip_agents: frozenset[str] = field(default_factory=frozenset)
+    
+    # Optional command to start a local embedded MCP server (e.g. ['npx', '-y', '@figma/mcp-server'])
+    mcp_server_command: list[str] = field(default_factory=list)
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -108,6 +112,7 @@ class Settings:
             ),
             max_concurrent_agents=int(os.environ.get("MAX_CONCURRENT_AGENTS", "4")),
             build_checkpoint_retries=int(os.environ.get("BUILD_CHECKPOINT_RETRIES", "3")),
+            mcp_server_command=os.environ.get("MCP_SERVER_COMMAND", "").split() if os.environ.get("MCP_SERVER_COMMAND") else [],
         )
 
 

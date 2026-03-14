@@ -2,10 +2,9 @@
 
 import asyncio
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
 from core.checkpoint import BuildCheckpoint, CheckpointResult, CheckpointCycleResult
-from core.error_attributor import AttributedError, AttributionResult, CompilerErrorAttributor
+from core.error_attributor import AttributedError, AttributionResult
 
 
 class TestCheckpointResult:

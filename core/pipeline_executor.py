@@ -27,6 +27,7 @@ This executor is used by both ``RunPipeline`` and ``EnhancePipeline``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from typing import Any, TYPE_CHECKING
@@ -34,8 +35,8 @@ from typing import Any, TYPE_CHECKING
 from core.checkpoint import BuildCheckpoint, CheckpointCycleResult, CheckpointResult
 from core.error_attributor import CompilerErrorAttributor
 from core.event_bus import AgentEvent, BusEventType
-from core.models import Task, TaskType, TaskResult
-from core.state_machine import EventType, FilePhase, FileLifecycle, LifecycleEngine
+from core.models import Task, TaskType
+from core.state_machine import EventType, FilePhase, LifecycleEngine
 from core.stub_generator import StubGenerator
 from core.tier_scheduler import Tier, TierScheduler
 
@@ -46,7 +47,6 @@ if TYPE_CHECKING:
     from core.language import LanguageProfile
     from core.pipeline_definition import CheckpointDef, PipelineDefinition
     from core.task_engine import TaskGraph
-    from tools.terminal_tools import TerminalTools
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,14 @@ class PipelineExecutor:
         # Files queued for re-verification at the next checkpoint because
         # an upstream dependency was modified after they reached a terminal
         # or post-review phase.
+        # NOTE: asyncio is single-threaded — no true concurrent mutation of
+        # this set occurs between handlers.  The TOCTOU window (phase check
+        # then set.add) is benign: the worst case is a harmless extra
+        # re-verification of a file whose phase changed after the check.
+        # We document this explicitly and atomically snapshot+clear in
+        # _drain_reverify_queue() to prevent duplicate processing.
         self._reverify_queue: set[str] = set()
+        self._reverify_lock = asyncio.Lock()
 
     def _wire_event_bus(self, engine: LifecycleEngine) -> None:
         """Register event bus subscribers for cross-file coordination.
@@ -101,18 +108,23 @@ class PipelineExecutor:
             try:
                 impact = dep_store.get_impact_analysis(event.file_path)
                 dependents = impact.get("direct_dependents", [])
+                to_queue: list[str] = []
                 for dep_path in dependents:
                     if engine.has_file(dep_path):
                         lc = engine.get_lifecycle(dep_path)
                         # Only queue files that have already moved past review —
                         # files still in early phases will naturally pick up changes.
                         if lc.phase in (FilePhase.BUILDING, FilePhase.TESTING,
-                                        FilePhase.PASSED):
-                            self._reverify_queue.add(dep_path)
-                            logger.debug(
-                                "Queued %s for re-verification (upstream %s changed)",
-                                dep_path, event.file_path,
-                            )
+                                        FilePhase.PASSED, FilePhase.DEGRADED):
+                            to_queue.append(dep_path)
+                if to_queue:
+                    async with self._reverify_lock:
+                        self._reverify_queue.update(to_queue)
+                    for dep_path in to_queue:
+                        logger.debug(
+                            "Queued %s for re-verification (upstream %s changed)",
+                            dep_path, event.file_path,
+                        )
             except Exception:
                 logger.debug(
                     "Could not compute dependents for %s", event.file_path,
@@ -129,7 +141,7 @@ class PipelineExecutor:
                     tier, attempt, len(affected), affected,
                 )
 
-        self._event_bus.subscribe(BusEventType.FILE_WRITTEN, on_file_changed)
+        self._event_bus.subscribe_critical(BusEventType.FILE_WRITTEN, on_file_changed)
         self._event_bus.subscribe(BusEventType.TASK_FAILED, on_build_failed)
 
     async def execute(
@@ -223,8 +235,12 @@ class PipelineExecutor:
         _GEN_TYPES = {TaskType.GENERATE_FILE, TaskType.MODIFY_FILE}
 
         # ── Phase loop ──────────────────────────────────────────────────────
+        # Tracks the set of files whose build errors could never be resolved.
+        # Downstream files that transitively depend ONLY on these broken files
+        # are failed; files with no dependency on them proceed normally.
         tier_hard_blocked = False
         skip_agents = self._settings.skip_agents
+        _permanently_failed_files: set[str] = set()
 
         for phase in phases:
             if tier_hard_blocked:
@@ -301,30 +317,90 @@ class PipelineExecutor:
                             new_stubs = stub_gen.generate_stubs(later_files, bp_map)
                             active_stubs.extend(new_stubs)
 
+                        # Snapshot the files in BUILDING before the checkpoint
+                        # so we can identify exactly which files had unresolvable
+                        # build errors after the checkpoint returns (those files
+                        # may already be FAILED by the time we check).
+                        pre_checkpoint_building = {
+                            f for f in tier.files
+                            if engine.get_lifecycle(f).phase == FilePhase.BUILDING
+                        }
+
                         cycle_result = await self._run_checkpoint(
                             engine, ck_def, tier,
                         )
                         checkpoint_results.append(cycle_result)
                         total_checkpoint_fixes += len(cycle_result.files_fixed)
 
-                        # ── Hard gate: failed checkpoint blocks downstream tiers ─
+                        # ── Partial gate: only fail downstream files that
+                        # transitively depend on an unresolved BUILDING file.
                         if not cycle_result.passed:
-                            logger.error(
-                                "Tier %d checkpoint failed permanently — "
-                                "blocking %d downstream tier(s) from starting",
-                                tier.index, len(tiers) - tier_idx - 1,
-                            )
+                            # Use the pre-checkpoint snapshot — those were the
+                            # files with unresolved build errors (they may already
+                            # be FAILED by the time we reach this point).
+                            still_broken = list(pre_checkpoint_building)
+                            _permanently_failed_files.update(still_broken)
+
+                            # Fail the broken files themselves.
+                            for path in still_broken:
+                                engine.process_event(path, EventType.RETRIES_EXHAUSTED)
+
+                            # For downstream tiers only fail files whose deps
+                            # are ALL failed/broken; files with at least one
+                            # clean dep can still be generated.
+                            blocked_downstream: list[str] = []
                             for blocked_tier in tiers[tier_idx + 1:]:
                                 for path in blocked_tier.files:
                                     lc = engine.get_lifecycle(path)
-                                    if not lc.is_terminal:
+                                    if lc.is_terminal:
+                                        continue
+                                    file_deps = [
+                                        d for d in engine._deps.get(path, [])
+                                        if d in engine._lifecycles
+                                    ]
+                                    # If every non-terminal dep is in the failed set,
+                                    # this file cannot possibly compile — fail it.
+                                    all_deps_broken = file_deps and all(
+                                        d in _permanently_failed_files for d in file_deps
+                                    )
+                                    if all_deps_broken:
                                         engine.process_event(
                                             path, EventType.RETRIES_EXHAUSTED,
                                         )
+                                        blocked_downstream.append(path)
+
+                            if blocked_downstream:
+                                logger.error(
+                                    "Tier %d checkpoint failed — %d file(s) with "
+                                    "unresolvable build errors: %s. "
+                                    "%d downstream file(s) blocked: %s. "
+                                    "Remaining downstream files will proceed.",
+                                    tier.index, len(still_broken), still_broken,
+                                    len(blocked_downstream), blocked_downstream,
+                                )
+                            else:
+                                logger.warning(
+                                    "Tier %d checkpoint failed — %d file(s) with "
+                                    "unresolvable build errors: %s. "
+                                    "No downstream files have exclusive deps on "
+                                    "these files; downstream tiers will proceed.",
+                                    tier.index, len(still_broken), still_broken,
+                                )
+
+                            # Only set tier_hard_blocked if every file in every
+                            # downstream tier was just blocked (total failure).
+                            remaining_downstream = [
+                                f
+                                for bt in tiers[tier_idx + 1:]
+                                for f in bt.files
+                                if not engine.get_lifecycle(f).is_terminal
+                            ]
+                            if not remaining_downstream:
+                                tier_hard_blocked = True
+
                             if active_stubs:
                                 stub_gen.cleanup_stubs(active_stubs)
                                 active_stubs = []
-                            tier_hard_blocked = True
                             break
 
                         # Clean up stubs after a passed checkpoint.
@@ -361,19 +437,44 @@ class PipelineExecutor:
 
         logger.info(
             "Pipeline execution complete in %.1fs. "
-            "Files: %d passed, %d failed. Checkpoint fixes: %d. "
+            "Files: %d passed, %d degraded, %d failed. Checkpoint fixes: %d. "
             "Global tasks: %s",
             elapsed,
             lifecycle_summary["passed"],
+            lifecycle_summary.get("degraded", 0),
             lifecycle_summary["failed"],
             total_checkpoint_fixes,
             global_stats,
         )
 
+        if lifecycle_summary.get("degraded", 0):
+            logger.warning(
+                "%d file(s) completed with quality warnings (DEGRADED): %s",
+                lifecycle_summary["degraded"],
+                lifecycle_summary.get("degraded_files", []),
+            )
+
+        # Drain and report any critical event bus handler failures so callers
+        # know whether re-verification or coordination work was silently lost.
+        bus_failures: list[dict[str, str]] = []
+        if self._event_bus and self._event_bus.has_failures():
+            for failure in self._event_bus.clear_failures():
+                bus_failures.append({
+                    "handler": failure.handler_name,
+                    "event": failure.event_type,
+                    "error": failure.error,
+                })
+            logger.error(
+                "%d critical event bus handler failure(s) recorded — "
+                "re-verification or coordination may be incomplete: %s",
+                len(bus_failures), bus_failures,
+            )
+
         return {
             "stats": {
                 **global_stats,
                 "lifecycle_passed": lifecycle_summary["passed"],
+                "lifecycle_degraded": lifecycle_summary.get("degraded", 0),
                 "lifecycle_failed": lifecycle_summary["failed"],
                 "lifecycle_total_fixes": lifecycle_summary["total_fix_cycles"],
                 "lifecycle_tests_degraded": lifecycle_summary["tests_degraded"],
@@ -382,6 +483,7 @@ class PipelineExecutor:
             "metrics": self._am._metrics,
             "elapsed_seconds": elapsed,
             "lifecycle_summary": lifecycle_summary,
+            "bus_handler_failures": bus_failures,
             "checkpoint_results": [
                 {
                     "passed": cr.passed,
@@ -393,6 +495,19 @@ class PipelineExecutor:
         }
 
     # ── Tier lifecycle execution ─────────────────────────────────────────
+
+    async def _drain_reverify_queue(self, tier_files: set[str]) -> set[str]:
+        """Atomically drain and return the subset of reverify-queue entries
+        that belong to *tier_files*.
+
+        The lock makes the read-then-clear atomic so the ``on_file_changed``
+        event handler cannot interleave an insertion between the snapshot
+        and the removal, preventing duplicate processing of the same file.
+        """
+        async with self._reverify_lock:
+            drained = self._reverify_queue & tier_files
+            self._reverify_queue -= drained
+        return drained
 
     async def _run_tier_lifecycles(
         self,
@@ -414,6 +529,15 @@ class PipelineExecutor:
         # Only process files in this tier
         tier_files = set(tier.files)
 
+        # Staleness detection: if no task completes within this window and
+        # non-terminal files remain stuck PENDING (waiting on deps that are
+        # themselves stuck in REVIEWING/FIXING and will never reach TESTING),
+        # we diagnose and force-fail the stuck files rather than hanging forever.
+        # Use 2× phase_timeout as the stale threshold — ample time for any
+        # in-flight task to resolve before we declare a deadlock.
+        _stale_timeout = phase_timeout * 2
+        _last_progress = time.monotonic()
+
         async def run_file_phase(path: str, phase: FilePhase) -> None:
             async with semaphore:
                 try:
@@ -428,8 +552,19 @@ class PipelineExecutor:
                     )
                     try:
                         engine.process_event(path, EventType.RETRIES_EXHAUSTED)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Failed to transition to RETRIES_EXHAUSTED: %s "
+                            "— forcing FAILED directly",
+                            path, exc,
+                        )
+                        try:
+                            engine.get_lifecycle(path).phase = FilePhase.FAILED
+                        except Exception:
+                            logger.error(
+                                "[%s] Could not force FAILED state — file phase is UNKNOWN",
+                                path,
+                            )
                     self._am._metrics["tasks_failed"] += 1
                 finally:
                     in_flight.discard(path)
@@ -448,6 +583,7 @@ class PipelineExecutor:
 
             for path, phase in actionable:
                 in_flight.add(path)
+                _last_progress = time.monotonic()
                 t = asyncio.create_task(
                     run_file_phase(path, phase), name=f"tier{tier.index}:{path}",
                 )
@@ -455,9 +591,73 @@ class PipelineExecutor:
                 t.add_done_callback(running_tasks.discard)
 
             if not running_tasks:
+                # No tasks running and nothing actionable — check whether any
+                # tier files are stuck PENDING (dependency deadlock).
+                stuck = [
+                    path for path in tier_files
+                    if not engine.get_lifecycle(path).is_terminal
+                    and engine.get_lifecycle(path).phase == FilePhase.PENDING
+                    and path not in in_flight
+                ]
+                if stuck:
+                    logger.error(
+                        "[Tier %d] Dependency deadlock: %d file(s) are PENDING "
+                        "with no actionable work and no in-flight tasks. "
+                        "Dependency chain may be waiting on files stuck in "
+                        "REVIEWING/FIXING. Failing stuck files: %s",
+                        tier.index, len(stuck), stuck,
+                    )
+                    for path in stuck:
+                        try:
+                            engine.process_event(path, EventType.RETRIES_EXHAUSTED)
+                        except Exception:
+                            engine.get_lifecycle(path).phase = FilePhase.FAILED
                 break
 
-            await asyncio.wait(running_tasks, return_when=asyncio.FIRST_COMPLETED)
+            # Wait for any task to complete, bounded by the stale timeout.
+            # If the timeout fires with no new actionable files, the tier may
+            # be deadlocked (e.g. a dep stuck in REVIEWING that will never
+            # reach TESTING in checkpoint mode).
+            wait_timeout = max(1.0, _stale_timeout - (time.monotonic() - _last_progress))
+            try:
+                done, _ = await asyncio.wait(
+                    running_tasks,
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=wait_timeout,
+                )
+                if done:
+                    _last_progress = time.monotonic()
+            except Exception:
+                pass  # asyncio.wait itself should not raise; be defensive
+
+            # Staleness check: if no progress was made and non-terminal files
+            # remain in this tier (PENDING or early phases), diagnose explicitly.
+            elapsed_since_progress = time.monotonic() - _last_progress
+            if elapsed_since_progress >= _stale_timeout:
+                non_terminal = [
+                    path for path in tier_files
+                    if not engine.get_lifecycle(path).is_terminal
+                    and path not in in_flight
+                ]
+                if non_terminal:
+                    for path in non_terminal:
+                        lc = engine.get_lifecycle(path)
+                        dep_phases = {
+                            d: engine.get_lifecycle(d).phase.value
+                            for d in engine._deps.get(path, [])
+                            if engine.has_file(d)
+                        }
+                        logger.error(
+                            "[Tier %d] Staleness timeout (%.0fs no progress): "
+                            "%s is stuck in %s. Dependency phases: %s",
+                            tier.index, elapsed_since_progress,
+                            path, lc.phase.value, dep_phases,
+                        )
+                        try:
+                            engine.process_event(path, EventType.RETRIES_EXHAUSTED)
+                        except Exception:
+                            lc.phase = FilePhase.FAILED
+                    break
 
         # Cancel any stragglers
         for t in list(running_tasks):
@@ -501,16 +701,21 @@ class PipelineExecutor:
         # A file that fails repeatedly shouldn't consume unlimited retries.
         fix_attempt_counts: dict[str, int] = {}
         max_fixes_per_file = 2  # cap per-file fix dispatches
+        # Track the error fingerprint seen on the previous fix attempt for each
+        # file.  If the same errors recur unchanged after a fix, the fix made
+        # no progress and further attempts would be futile.
+        file_error_hashes: dict[str, str] = {}
 
-        # Drain any files queued for re-verification by event bus handlers.
-        # These are dependents of files that were fixed in earlier tiers.
-        reverify = self._reverify_queue & set(tier.files)
+        # Atomically drain any files queued for re-verification by event bus
+        # handlers.  Using the lock ensures the handler cannot add new entries
+        # to the set while we are reading it, preventing the TOCTOU window
+        # where a file could be queued after the snapshot but before the clear.
+        reverify = await self._drain_reverify_queue(set(tier.files))
         if reverify:
             logger.info(
                 "[Checkpoint] Including %d re-verify files from event bus: %s",
                 len(reverify), sorted(reverify),
             )
-            self._reverify_queue -= reverify
 
         for attempt in range(1, checkpoint_def.max_retries + 1):
             result = await checkpoint.run_once(attempt=attempt)
@@ -573,6 +778,21 @@ class PipelineExecutor:
                     continue
 
                 fix_context = checkpoint.get_fix_context_for_file(file_path, result)
+
+                # Skip if this file's errors haven't changed since the last fix
+                # attempt — the previous fix made no progress, so another
+                # identical fix would almost certainly fail too.
+                errors_text = str(fix_context.get("build_errors", ""))
+                error_hash = hashlib.md5(errors_text.encode()).hexdigest()[:8]
+                if file_error_hashes.get(file_path) == error_hash:
+                    logger.warning(
+                        "[Checkpoint] Skipping %s — errors unchanged after fix "
+                        "(no progress, hash=%s)",
+                        file_path, error_hash,
+                    )
+                    continue
+                file_error_hashes[file_path] = error_hash
+
                 fix_context["fix_attempt"] = prior_fixes + 1
                 fix_context["max_fix_attempts"] = max_fixes_per_file
 
@@ -674,8 +894,12 @@ class PipelineExecutor:
                         try:
                             content = self._am.repo.read_file(fp)
                             self._am._embedding_store.index_file(fp, content)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.warning(
+                                "[Checkpoint] Embedding update failed for %s: %s "
+                                "— semantic index may be stale",
+                                fp, exc,
+                            )
             else:
                 self._am._metrics["tasks_failed"] += 1
                 logger.warning(
@@ -709,8 +933,19 @@ class PipelineExecutor:
                     )
                     try:
                         engine.process_event(path, EventType.RETRIES_EXHAUSTED)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] Failed to transition to RETRIES_EXHAUSTED: %s "
+                            "— forcing FAILED directly",
+                            path, exc,
+                        )
+                        try:
+                            engine.get_lifecycle(path).phase = FilePhase.FAILED
+                        except Exception:
+                            logger.error(
+                                "[%s] Could not force FAILED state — file phase is UNKNOWN",
+                                path,
+                            )
                 finally:
                     in_flight.discard(path)
 
@@ -733,6 +968,12 @@ class PipelineExecutor:
                         path,
                     )
                     engine.process_event(path, EventType.RETRIES_EXHAUSTED)
+                    # Auto-transition to TESTING
+                    engine.process_event(path, EventType.BUILD_PASSED)
+                    new_phase = lc.phase
+                    if new_phase in (FilePhase.TESTING, FilePhase.PASSED, FilePhase.DEGRADED):
+                        if new_phase == FilePhase.TESTING:
+                            actionable.append((path, new_phase))
 
             for path, phase in actionable:
                 if path in in_flight:

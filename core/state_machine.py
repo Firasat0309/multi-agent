@@ -41,6 +41,7 @@ class FilePhase(Enum):
     TESTING = "testing"           # TestAgent generating/running tests
     PASSED = "passed"             # terminal: file completed successfully
     FAILED = "failed"             # terminal: exhausted retries
+    DEGRADED = "degraded"         # terminal: completed with quality warnings (fix limits hit)
 
 
 class EventType(Enum):
@@ -116,6 +117,7 @@ class FileLifecycle:
         max_review_fixes: int = 2,
         max_test_fixes: int = 3,
         max_build_fixes: int = 3,
+        max_build_fixes: int = 2,
         generation_task_type: str = "generate_file",
         change_metadata: dict[str, Any] | None = None,
     ) -> None:
@@ -155,7 +157,7 @@ class FileLifecycle:
 
     @property
     def is_terminal(self) -> bool:
-        return self.phase in (FilePhase.PASSED, FilePhase.FAILED)
+        return self.phase in (FilePhase.PASSED, FilePhase.FAILED, FilePhase.DEGRADED)
 
     @property
     def test_fix_target(self) -> str:
@@ -245,6 +247,12 @@ class FileLifecycle:
                 self.fix_trigger = ""
                 logger.warning(
                     "%s: test fix limit (%d) reached — marking as failed",
+                # Tests never fully passed — mark DEGRADED so the pipeline
+                # reports a quality warning rather than a false clean success.
+                new_phase = FilePhase.DEGRADED
+                self.fix_trigger = ""
+                logger.warning(
+                    "%s: test fix limit (%d) reached — marking DEGRADED (tests not passing)",
                     self.file_path, self.max_test_fixes,
                 )
 
@@ -259,6 +267,12 @@ class FileLifecycle:
                 self.fix_trigger = ""
                 logger.warning(
                     "%s: build fix limit (%d) reached — marking as failed",
+                # Build never fully resolved — mark DEGRADED so the pipeline
+                # reports a quality warning rather than a false clean success.
+                new_phase = FilePhase.DEGRADED
+                self.fix_trigger = ""
+                logger.warning(
+                    "%s: build fix limit (%d) reached — marking DEGRADED (build not clean)",
                     self.file_path, self.max_build_fixes,
                 )
 
@@ -317,6 +331,7 @@ class LifecycleEngine:
         max_review_fixes: int = 2,
         max_test_fixes: int = 3,
         max_build_fixes: int = 3,
+        max_build_fixes: int = 2,
         compiled: bool = False,
         checkpoint_mode: bool = False,
         file_overrides: dict[str, dict[str, Any]] | None = None,
@@ -325,6 +340,7 @@ class LifecycleEngine:
         self._deps = file_deps
         self._skip_testing: set[str] = set()
         self._compiled = compiled
+        self._max_build_fixes = max_build_fixes
         # When True, BUILDING is handled by repo-level checkpoints in
         # PipelineExecutor, not per-file.  The REVIEW_PASSED transition
         # still goes to BUILDING, but it's immediately auto-passed unless
@@ -437,7 +453,7 @@ class LifecycleEngine:
                     deps_met = all(
                         dep not in self._lifecycles
                         or self._lifecycles[dep].phase in (
-                            FilePhase.TESTING, FilePhase.PASSED,
+                            FilePhase.TESTING, FilePhase.PASSED, FilePhase.DEGRADED,
                         )
                         for dep in deps
                     )
@@ -480,22 +496,23 @@ class LifecycleEngine:
         """Summary suitable for pipeline reporting."""
         passed = [p for p, lc in self._lifecycles.items() if lc.phase == FilePhase.PASSED]
         failed = [p for p, lc in self._lifecycles.items() if lc.phase == FilePhase.FAILED]
+        degraded = [p for p, lc in self._lifecycles.items() if lc.phase == FilePhase.DEGRADED]
         total_fixes = sum(lc.total_fix_count for lc in self._lifecycles.values())
-        # Files whose code generated/compiled fine but whose tests never fully
-        # passed (test-fix limit exhausted).  These reach PASSED phase but with
-        # test_fix_count > 0, indicating the code is valid but tests are
-        # incomplete or need attention.
+        # Legacy field: files that hit test-fix limits (now DEGRADED phase;
+        # kept for backward compatibility with existing dashboard consumers).
         tests_degraded = [
             p for p, lc in self._lifecycles.items()
-            if lc.phase == FilePhase.PASSED and lc.test_fix_count > 0
+            if lc.phase == FilePhase.DEGRADED and lc.test_fix_count > 0
         ]
         return {
             "total_files": len(self._lifecycles),
             "passed": len(passed),
             "failed": len(failed),
+            "degraded": len(degraded),
             "tests_degraded": len(tests_degraded),
             "total_fix_cycles": total_fixes,
             "passed_files": passed,
             "failed_files": failed,
+            "degraded_files": degraded,
             "tests_degraded_files": tests_degraded,
         }

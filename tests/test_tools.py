@@ -1,7 +1,6 @@
 """Tests for developer tools."""
 
 import pytest
-from pathlib import Path
 
 from tools.file_tools import FileTools
 from tools.code_search import CodeSearch

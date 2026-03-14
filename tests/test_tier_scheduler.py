@@ -1,6 +1,5 @@
 """Tests for the dependency tier scheduler."""
 
-import pytest
 from core.tier_scheduler import Tier, TierScheduler
 
 

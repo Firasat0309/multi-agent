@@ -5,9 +5,7 @@ from __future__ import annotations
 import logging
 
 from agents.base_agent import BaseAgent
-from core.llm_client import LLMClient
 from core.models import AgentContext, AgentRole, RepositoryBlueprint, TaskResult
-from core.repository_manager import RepositoryManager
 from core.state_machine import LifecycleEngine
 from core.task_engine import TaskGraph, LifecyclePlanBuilder
 

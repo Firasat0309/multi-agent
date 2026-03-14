@@ -8,7 +8,8 @@
       "Bash(grep:*)",
       "Bash(pip list:*)",
       "Bash(read f:*)",
-      "Bash(find /c/Users/SDSI/Documents/AI-BK/multi-agent-claude -name \".env*\" -o -name \"*.env\" 2>/dev/null | head -20)"
+      "Bash(find /c/Users/SDSI/Documents/AI-BK/multi-agent-claude -name \".env*\" -o -name \"*.env\" 2>/dev/null | head -20)",
+      "Bash(wc -l tests/*.py | tail -1)"
     ]
   }
 }

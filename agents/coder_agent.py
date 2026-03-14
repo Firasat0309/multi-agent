@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import difflib
 import logging
 import re as _re
 from pathlib import Path
@@ -11,7 +10,7 @@ from typing import Any
 from agents.base_agent import BaseAgent
 from core.agent_tools import CODER_TOOLS, ToolDefinition
 from core.language import get_language_profile, LanguageProfile
-from core.models import AgentContext, AgentRole, ChangeAction, ChangeActionType, TaskResult, TaskType
+from core.models import AgentContext, AgentRole, TaskResult, TaskType
 
 # Files with more lines than this threshold are modified via unified diff instead
 # of a full-file rewrite.  Diffs are ~5–20× cheaper in tokens for large files.
@@ -416,7 +415,7 @@ class CoderAgent(BaseAgent):
         if fix_trigger == "build" and build_errors:
             raw = build_errors
             issues_text = (
-                f"Compilation/build errors to fix:\n"
+                "Compilation/build errors to fix:\n"
                 + (raw[-_MAX_ERROR_CHARS:] if len(raw) > _MAX_ERROR_CHARS
                    else raw)
             )

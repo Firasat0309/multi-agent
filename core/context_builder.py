@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -150,7 +150,10 @@ class ContextBuilder:
                     ))
 
         # ── Priority 3: semantic search hits ─────────────────────────────────
-        if self._embedding_store is not None:
+        # Guard: skip if the model warmup thread hasn't finished yet.  Calling
+        # search() before _ensure_client() completes would block the event-loop
+        # thread on a threading.Lock acquired by the background warmup thread.
+        if self._embedding_store is not None and self._embedding_store.is_ready:
             try:
                 hits = self._embedding_store.search(
                     task.description,
@@ -370,7 +373,9 @@ class ContextBuilder:
         Respects the overall context budget and never overwrites files already
         included via blueprint dependencies.
         """
-        if self._embedding_store is None:
+        # Guard: same readiness check as in _collect_ranked — avoid blocking
+        # the event-loop thread if the background warmup hasn't completed yet.
+        if self._embedding_store is None or not self._embedding_store.is_ready:
             return
 
         total_chars = sum(len(v) for v in related.values())

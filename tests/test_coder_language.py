@@ -1,7 +1,6 @@
 """Tests for language detection and config-file routing in coder/architect agents."""
 
-import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import MagicMock
 
 from agents.architect_agent import ArchitectAgent
 from agents.coder_agent import CoderAgent, _config_format

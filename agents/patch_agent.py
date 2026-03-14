@@ -14,7 +14,7 @@ import logging
 
 from agents.base_agent import BaseAgent
 from core.language import get_language_profile
-from core.models import AgentContext, AgentRole, TaskResult, TaskType
+from core.models import AgentContext, AgentRole, TaskResult
 from tools.file_tools import FileTools
 
 logger = logging.getLogger(__name__)

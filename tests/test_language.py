@@ -1,10 +1,8 @@
 """Tests for language profile system."""
 
-import pytest
 
 from core.language import (
     PYTHON, JAVA, GO, TYPESCRIPT, RUST, CSHARP,
-    LanguageProfile,
     get_language_profile,
     detect_language_from_blueprint,
 )
@@ -40,7 +38,7 @@ class TestLanguageProfiles:
         assert "go test" in GO.test_command
 
     def test_typescript_profile(self):
-        assert TYPESCRIPT.file_extensions == [".ts"]
+        assert TYPESCRIPT.file_extensions == [".ts", ".tsx"]
         assert "jest" in TYPESCRIPT.test_command
         assert "node" in TYPESCRIPT.docker_image
 
@@ -96,6 +94,8 @@ class TestLanguageProfileMethods:
         assert not PYTHON.matches_extension("models/User.java")
         assert JAVA.matches_extension("models/User.java")
         assert GO.matches_extension("handlers/user.go")
+        assert TYPESCRIPT.matches_extension("components/Button.ts")
+        assert TYPESCRIPT.matches_extension("components/Button.tsx")
 
     def test_to_module_path(self):
         assert PYTHON.to_module_path("models/user.py") == "models.user"

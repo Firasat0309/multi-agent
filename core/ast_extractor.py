@@ -164,6 +164,8 @@ class FileSignature:
 
             lines.append("")
 
+        if not lines:
+            return None
         return "\n".join(lines).strip() + "\n"
 
     def _to_java_stub(self) -> str:

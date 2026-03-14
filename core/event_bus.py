@@ -14,6 +14,11 @@ Usage::
 
     bus.subscribe(BusEventType.FILE_WRITTEN, on_file_written)
     await bus.publish(AgentEvent(type=BusEventType.FILE_WRITTEN, file_path="src/foo.py"))
+
+Critical handlers (coordination, re-verification):
+    Use ``subscribe_critical`` instead of ``subscribe``.  Failures in critical
+    handlers are recorded in ``handler_failures`` so the pipeline executor can
+    detect and surface them rather than silently missing re-verification work.
 """
 
 from __future__ import annotations
@@ -66,17 +71,33 @@ class AgentEvent:
     data: dict = field(default_factory=dict)
 
 
+@dataclass
+class HandlerFailure:
+    """Record of a critical handler failure for pipeline-level reporting."""
+    handler_name: str
+    event_type: str
+    error: str
+
+
 class EventBus:
     """Async pub-sub hub shared across all agents in a pipeline run.
 
     *subscribe* — register a coroutine handler for one event type.
+    *subscribe_critical* — same as subscribe, but failures are recorded in
+        ``handler_failures`` for pipeline-level inspection rather than
+        just being logged.
     *subscribe_all* — register a handler for every event type.
     *publish* — fire an event; all matching handlers are awaited concurrently.
     """
 
     def __init__(self) -> None:
         self._handlers: dict[BusEventType, list[Handler]] = defaultdict(list)
+        self._critical_handlers: dict[BusEventType, list[Handler]] = defaultdict(list)
         self._catch_all: list[Handler] = []
+        # Accumulates failures from critical handlers so the executor can
+        # surface them in pipeline results rather than silently discarding
+        # re-verification or coordination work.
+        self.handler_failures: list[HandlerFailure] = []
 
     # ── Subscription ─────────────────────────────────────────────────────────
 
@@ -84,22 +105,45 @@ class EventBus:
         """Register *handler* to be called whenever *event_type* is published."""
         self._handlers[event_type].append(handler)
 
+    def subscribe_critical(self, event_type: BusEventType, handler: Handler) -> None:
+        """Register a *critical* handler that is called whenever *event_type* is
+        published.
+
+        Unlike ``subscribe``, failures in critical handlers are recorded in
+        ``handler_failures`` so the pipeline executor can detect missed
+        coordination work (e.g. a dependent not queued for re-verification).
+        """
+        self._critical_handlers[event_type].append(handler)
+
     def subscribe_all(self, handler: Handler) -> None:
         """Register *handler* to be called for every published event."""
         self._catch_all.append(handler)
+
+    def has_failures(self) -> bool:
+        """Return True if any critical handler has recorded a failure."""
+        return bool(self.handler_failures)
+
+    def clear_failures(self) -> list[HandlerFailure]:
+        """Return and reset the accumulated critical handler failures."""
+        failures, self.handler_failures = self.handler_failures, []
+        return failures
 
     # ── Publishing ───────────────────────────────────────────────────────────
 
     async def publish(self, event: AgentEvent) -> None:
         """Publish *event* to all matching subscribers.
 
-        Handlers for the specific event type and catch-all handlers are run
-        concurrently.  Any exception raised by a handler is logged but does
-        not propagate — a broken subscriber never affects other subscribers or
-        the publisher.
+        Standard handlers and catch-all handlers are run concurrently.
+        Any exception raised by a standard handler is logged but does not
+        propagate.
+
+        Critical handlers are also run concurrently.  Their exceptions are
+        logged AND recorded in ``handler_failures`` for pipeline inspection.
         """
-        handlers = self._handlers[event.type] + self._catch_all
-        if not handlers:
+        standard_handlers = self._handlers[event.type] + self._catch_all
+        critical_handlers = self._critical_handlers[event.type]
+
+        if not standard_handlers and not critical_handlers:
             return
 
         async def _safe(h: Handler) -> None:
@@ -112,4 +156,23 @@ class EventBus:
                     event.type.value,
                 )
 
-        await asyncio.gather(*[_safe(h) for h in handlers])
+        async def _safe_critical(h: Handler) -> None:
+            try:
+                await h(event)
+            except Exception as exc:
+                handler_name = getattr(h, "__qualname__", repr(h))
+                logger.error(
+                    "Critical EventBus handler %s raised for event %s: %s — "
+                    "coordination work may have been lost",
+                    handler_name, event.type.value, exc,
+                )
+                self.handler_failures.append(HandlerFailure(
+                    handler_name=handler_name,
+                    event_type=event.type.value,
+                    error=str(exc),
+                ))
+
+        tasks = [_safe(h) for h in standard_handlers] + [
+            _safe_critical(h) for h in critical_handlers
+        ]
+        await asyncio.gather(*tasks)

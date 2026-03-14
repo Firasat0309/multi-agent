@@ -52,6 +52,14 @@ class RepositoryManager:
         self._lang_profile: LanguageProfile = PYTHON
         self._import_validator = ImportValidator()
         self._embedding_store = embedding_store
+        # Optional cross-pipeline lock for root-level shared files.
+        # Set by FullstackPipeline to prevent concurrent writes to files such
+        # as docker-compose.yml, .gitignore, package.json from parallel
+        # backend and frontend pipelines.
+        self._root_write_lock: asyncio.Lock | None = None
+        # Populated by write_file() after each write; read by base_agent._tool_write_file
+        # to relay broken-import feedback back to the LLM.
+        self._last_broken_imports: list[str] = []
 
     @property
     def src_dir(self) -> Path:
@@ -125,12 +133,17 @@ class RepositoryManager:
             return self.workspace / Path(rel_path).name  # preserve original case
 
         if root == self.workspace:
-            return self.workspace / rel_path
-        root_prefix = str(root.relative_to(self.workspace)).replace("\\", "/")
-        if rel_path.startswith(root_prefix + "/") or rel_path == root_prefix:
-            # Path already includes the root prefix — write relative to workspace
-            return self.workspace / rel_path
-        return root / rel_path
+            resolved = (self.workspace / rel_path).resolve()
+        else:
+            root_prefix = str(root.relative_to(self.workspace)).replace("\\", "/")
+            if rel_path.startswith(root_prefix + "/") or rel_path == root_prefix:
+                resolved = (self.workspace / rel_path).resolve()
+            else:
+                resolved = (root / rel_path).resolve()
+        workspace_resolved = self.workspace.resolve()
+        if not (resolved == workspace_resolved or resolved.is_relative_to(workspace_resolved)):
+            raise ValueError(f"Path traversal blocked: {rel_path!r}")
+        return resolved
 
     @staticmethod
     def _write_atomic(file_path: Path, content: str) -> None:
@@ -174,6 +187,7 @@ class RepositoryManager:
         broken = self._import_validator.validate(
             rel_path, content, known_files, self._lang_profile
         )
+        self._last_broken_imports = broken  # exposed to _tool_write_file in base_agent
         if broken:
             logger.warning(
                 "Broken imports detected in %s: %s", rel_path, broken
@@ -196,7 +210,15 @@ class RepositoryManager:
         Delegates the actual I/O (write_text, mkdir, md5 hashing, __init__.py
         creation) to a thread so the event loop stays responsive while agents
         are generating files concurrently.
+
+        Root-level files (docker-compose.yml, package.json, .gitignore, etc.)
+        are serialised through ``_root_write_lock`` when it is set, preventing
+        concurrent writes from parallel pipelines (e.g. fullstack BE + FE).
         """
+        is_root_level = Path(rel_path).name.lower() in _ROOT_LEVEL_FILES
+        if self._root_write_lock is not None and is_root_level:
+            async with self._root_write_lock:
+                return await asyncio.to_thread(self.write_file, rel_path, content)
         return await asyncio.to_thread(self.write_file, rel_path, content)
 
     def write_test_file(self, rel_path: str, content: str) -> Path:

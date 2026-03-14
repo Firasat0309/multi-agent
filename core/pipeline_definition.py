@@ -192,3 +192,34 @@ ENHANCE_PIPELINE = PipelineDefinition(
         TaskType.REVIEW_MODULE,
     ],
 )
+
+
+# ── Frontend pipeline definition ──────────────────────────────────────────────
+
+FRONTEND_PIPELINE = PipelineDefinition(
+    name="frontend",
+    phases=[
+        Phase(
+            name="component_generation",
+            file_tasks=[
+                # Each component file is generated individually.
+                # The FrontendPipeline uses ComponentDAGAgent to order tiers;
+                # this definition captures the per-file task contract.
+                FileTaskDef(
+                    task_type=TaskType.GENERATE_COMPONENT,
+                    review=False,
+                    max_review_fixes=0,
+                ),
+            ],
+            # Frontend components are interpreted TypeScript — no compile checkpoint
+            checkpoint=None,
+            skip_for_interpreted=False,
+        ),
+    ],
+    global_tasks=[
+        TaskType.INTEGRATE_API,
+        TaskType.MANAGE_STATE,
+        TaskType.GENERATE_DOCS,
+    ],
+)
+

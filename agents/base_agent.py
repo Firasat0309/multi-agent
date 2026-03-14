@@ -15,9 +15,10 @@ _READ_CHUNK_LINES = 150
 
 from core.agent_tools import ToolDefinition
 from core.language import get_language_profile
-from core.llm_client import LLMClient, LLMResponse, ToolCall
-from core.models import AgentContext, AgentRole, Task, TaskResult
+from core.llm_client import LLMClient, ToolCall
+from core.models import AgentContext, AgentRole, TaskResult
 from core.repository_manager import RepositoryManager
+from core.mcp_client import MCPClient
 from tools.code_search import CodeSearch
 from tools.file_tools import FileTools, PatchError
 
@@ -33,9 +34,12 @@ class BaseAgent(ABC):
         self,
         llm_client: LLMClient,
         repo_manager: RepositoryManager,
+        mcp_client: MCPClient | None = None,
     ) -> None:
         self.llm = llm_client
         self.repo = repo_manager
+        self._mcp_client = mcp_client
+        self._mcp_tools: list[ToolDefinition] = []
         self._metrics: dict[str, Any] = {"llm_calls": 0, "tokens_used": 0}
         # Tool helpers are created once per agent instance and reused across all
         # tool dispatch calls — avoiding per-call re-instantiation overhead.
@@ -62,8 +66,10 @@ class BaseAgent(ABC):
 
     @property
     def tools(self) -> list[ToolDefinition]:
-        """Tools available to this agent.  Override in subclasses to add tools."""
-        return []
+        """Tools available to this agent. Override in subclasses to add tools.
+        If an MCP client is attached, its dynamically fetched tools are appended."""
+        base_tools = []
+        return base_tools + self._mcp_tools
 
     def _build_prompt(self, context: AgentContext) -> str:
         """Build the initial user message for the agentic loop.
@@ -73,12 +79,19 @@ class BaseAgent(ABC):
         return self._format_context(context)
 
     async def execute_agentic(self, context: AgentContext) -> TaskResult:
-        """Tool-use loop: agent may request reads, searches, and writes.
+        """Tool-use loop: agent may request reads, searches, writes, and MCP extensions.
 
         The loop continues until the LLM returns ``stop_reason == "end_turn"``
         or ``max_iterations`` is reached.  Each tool call is dispatched via
         ``_dispatch_tool()`` and the result is fed back in the next turn.
         """
+        # If an MCP client is present, fetch the tools before execution starts
+        if self._mcp_client and not self._mcp_tools:
+            try:
+                self._mcp_tools = await self._mcp_client.list_tools()
+            except Exception as e:
+                logger.warning(f"Agent failed to fetch MCP tools before execution: {e}")
+
         if not self.tools:
             # No tools registered — fall back to single-shot call
             content = await self._call_llm(self._build_prompt(context))
@@ -253,9 +266,18 @@ class BaseAgent(ABC):
             "list_files":      self._tool_list_files,
             "apply_patch":     self._tool_apply_patch,
         }
+        
         handler = handlers.get(tc.name)
         if handler is None:
+            # Not a local native handler. Check if it's an MCP tool.
+            if self._mcp_client and any(t.name == tc.name for t in self._mcp_tools):
+                try:
+                    return await self._mcp_client.execute_tool(tc.name, tc.input)
+                except Exception as exc:
+                    logger.warning("MCP Tool %s execution raised: %s", tc.name, exc)
+                    return f"Error executing MCP tool: {exc}"
             return f"Error: unknown tool '{tc.name}'"
+            
         try:
             return await handler(tc.input)
         except Exception as exc:
@@ -308,7 +330,19 @@ class BaseAgent(ABC):
             return "Error: 'path' is required"
         # Security: async_write_file is scoped to workspace root
         await self.repo.async_write_file(path, content)
-        return f"Written {len(content)} bytes to {path}"
+        msg = f"Written {len(content)} bytes to {path}"
+        # Relay broken-import warnings so the LLM can correct or accept them
+        broken = getattr(self.repo, "_last_broken_imports", [])
+        if broken:
+            msg += (
+                f"\n⚠ Unresolvable imports in {path}: {broken}."
+                " These paths do not match any file currently in the workspace."
+                " If the missing file will be generated later, you may leave the import as-is."
+                " Otherwise, fix the import path or inline the dependency."
+                " Do NOT rewrite this file just to fix the import — only rewrite if the"
+                " component logic itself is wrong."
+            )
+        return msg
 
     async def _tool_search_code(self, inp: dict) -> str:
         query = inp.get("query", "")
@@ -347,7 +381,7 @@ class BaseAgent(ABC):
                 except ValueError:
                     return "Error: access denied (path escapes workspace)"
             target = (workspace / directory).resolve()
-            if not str(target).startswith(str(workspace)):
+            if not (target == workspace or target.is_relative_to(workspace)):
                 return "Error: access denied (path escapes workspace)"
             base = target
         if not base.exists():
