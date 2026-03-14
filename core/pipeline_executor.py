@@ -239,6 +239,7 @@ class PipelineExecutor:
         # Downstream files that transitively depend ONLY on these broken files
         # are failed; files with no dependency on them proceed normally.
         tier_hard_blocked = False
+        skip_agents = self._settings.skip_agents
         _permanently_failed_files: set[str] = set()
 
         for phase in phases:
@@ -256,6 +257,23 @@ class PipelineExecutor:
                 continue
 
             first_tt = phase.file_tasks[0].task_type if phase.file_tasks else None
+
+            # --skip-tester: skip testing phases entirely.
+            if "tester" in skip_agents and first_tt == TaskType.GENERATE_TEST:
+                logger.info(
+                    "=== Phase '%s' skipped (--skip-tester) ===", phase.name,
+                )
+                # Move testable files straight to PASSED so they don't end
+                # up stuck in TESTING/BUILDING. Respect the state machine by
+                # transitioning BUILDING → TESTING → PASSED.
+                for path in list(engine._lifecycles.keys()):
+                    lc = engine.get_lifecycle(path)
+                    if lc.phase == FilePhase.BUILDING:
+                        engine.process_event(path, EventType.BUILD_PASSED)
+                        engine.process_event(path, EventType.TEST_PASSED)
+                    elif lc.phase == FilePhase.TESTING:
+                        engine.process_event(path, EventType.TEST_PASSED)
+                continue
             # Checkpoints are only meaningful for compiled languages.
             ck_def = phase.checkpoint if self._compiled else None
 
@@ -939,16 +957,17 @@ class PipelineExecutor:
                 and phase in (FilePhase.TESTING, FilePhase.FIXING)
             ]
 
-            # Also check for files still in BUILDING that should transition
+            # Files stuck in BUILDING at this point should be marked FAILED,
+            # not auto-passed — they never went through build verification.
             for path in list(engine._lifecycles.keys()):
                 lc = engine.get_lifecycle(path)
                 if lc.phase == FilePhase.BUILDING and path not in in_flight:
-                    # Auto-transition to TESTING
-                    engine.process_event(path, EventType.BUILD_PASSED)
-                    new_phase = lc.phase
-                    if new_phase in (FilePhase.TESTING, FilePhase.PASSED, FilePhase.DEGRADED):
-                        if new_phase == FilePhase.TESTING:
-                            actionable.append((path, new_phase))
+                    logger.warning(
+                        "[%s] still in BUILDING at test phase — marking as failed "
+                        "(missed build checkpoint)",
+                        path,
+                    )
+                    engine.process_event(path, EventType.RETRIES_EXHAUSTED)
 
             for path, phase in actionable:
                 if path in in_flight:

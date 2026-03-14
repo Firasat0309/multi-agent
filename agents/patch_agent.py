@@ -119,7 +119,8 @@ class PatchAgent(BaseAgent):
             f"Change type: {change_type}\n"
             f"{target_hint}"
             f"Change description: {change_desc}\n\n"
-            f"Current file content (line numbers shown for reference):\n"
+            f"Current file content (line numbers shown for reference ONLY — "
+            f"do NOT include line numbers in your diff output):\n"
         )
 
         # Add line numbers to help the LLM emit correct @@ headers
@@ -129,8 +130,22 @@ class PatchAgent(BaseAgent):
         )
         prompt += f"```\n{numbered_lines}\n```\n\n"
         prompt += (
-            "Generate the unified diff patch.  "
-            "Output ONLY the raw diff — no markdown fences, no explanation."
+            "Generate a unified diff patch.\n\n"
+            "FORMAT REQUIREMENTS:\n"
+            f"--- a/{file_path}\n"
+            f"+++ b/{file_path}\n"
+            "@@ -<start>,<count> +<start>,<count> @@\n"
+            " context line (3 lines before change)\n"
+            "-removed line\n"
+            "+added line\n"
+            " context line (3 lines after change)\n\n"
+            "RULES:\n"
+            "- Output ONLY the raw diff — no markdown fences, no explanation\n"
+            "- Line numbers in @@ headers reference the ORIGINAL file lines "
+            "(not the numbered display above)\n"
+            "- Include exactly 3 context lines before and after each hunk\n"
+            "- The count in @@ header = context lines + changed lines in that hunk\n"
+            "- Change ONLY what the description asks for — nothing else"
         )
 
         return await self._call_llm(prompt)

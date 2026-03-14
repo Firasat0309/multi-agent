@@ -25,30 +25,57 @@ class ReviewerAgent(BaseAgent):
     @property
     def system_prompt(self) -> str:
         return (
-            "You are a senior code reviewer agent. You perform thorough code reviews.\n\n"
-            "You must respond with a JSON object:\n"
+            "You are a senior code reviewer agent. You perform structured, deterministic "
+            "code reviews.\n\n"
+
+            "You MUST respond with a JSON object (no markdown fences, no prose outside JSON):\n"
             "{\n"
-            '  "passed": true/false,\n'
-            '  "summary": "overall assessment",\n'
+            '  "passed": true or false,\n'
+            '  "summary": "One-sentence overall assessment",\n'
             '  "findings": [\n'
             "    {\n"
-            '      "severity": "critical|warning|info",\n'
-            '      "file": "path/to/file.py",\n'
-            '      "line": 42,\n'
-            '      "message": "description of issue",\n'
-            '      "suggestion": "how to fix"\n'
+            '      "severity": "critical" | "warning" | "info",\n'
+            '      "file": "path/to/file",\n'
+            '      "line": <line-number-or-null>,\n'
+            '      "message": "What is wrong",\n'
+            '      "suggestion": "How to fix it"\n'
             "    }\n"
             "  ]\n"
             "}\n\n"
-            "Review criteria:\n"
-            "- Code correctness and logic errors\n"
-            "- Type safety and proper error handling\n"
-            "- Adherence to the architecture blueprint\n"
-            "- Proper imports and dependency usage\n"
-            "- Security vulnerabilities (injection, XSS, etc.)\n"
-            "- Performance issues\n"
-            "- Code style and readability\n"
-            "- Critical = must fix, Warning = should fix, Info = suggestion"
+
+            "SEVERITY DEFINITIONS (follow strictly):\n"
+            "- critical: Code will not compile, will crash at runtime, has a security "
+            "vulnerability (injection, XSS, SSRF), or violates the architecture blueprint "
+            "(wrong imports, missing exports, layer violation). ONLY use critical for "
+            "issues that MUST be fixed for the code to work correctly.\n"
+            "- warning: Code works but has a significant quality issue — missing error "
+            "handling for likely failure cases, resource leaks, race conditions, missing "
+            "input validation on public APIs.\n"
+            "- info: Style suggestions, minor improvements, optional optimizations. "
+            "These do NOT affect correctness.\n\n"
+
+            "PASS/FAIL RULE:\n"
+            "- Set \"passed\": false if there is AT LEAST ONE critical finding\n"
+            "- Set \"passed\": true if there are ZERO critical findings "
+            "(warnings and info are acceptable)\n\n"
+
+            "REVIEW CHECKLIST:\n"
+            "1. Does the file compile/parse without syntax errors?\n"
+            "2. Are all imports valid and do they match the dependency graph?\n"
+            "3. Are all exports from the blueprint actually defined?\n"
+            "4. Are there any runtime errors (null dereference, type mismatch, "
+            "missing return statements)?\n"
+            "5. Is error handling present for I/O operations and external calls?\n"
+            "6. Are there security issues (injection, hardcoded secrets, path traversal)?\n"
+            "7. Does the code follow the architectural layer constraints?\n\n"
+
+            "IMPORTANT:\n"
+            "- Do NOT flag style preferences as critical or warning\n"
+            "- Do NOT hallucinate issues — only report problems you can identify in the "
+            "actual code shown to you\n"
+            "- If the code is correct and follows the blueprint, return passed: true "
+            "with an empty findings array\n"
+            "- Be specific: reference exact line numbers and exact variable/method names"
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
@@ -92,10 +119,53 @@ class ReviewerAgent(BaseAgent):
     async def _review_file(self, context: AgentContext) -> ReviewResult:
         """Review a single file."""
         formatted = self._format_context(context)
+        
+        # Explicitly append the target file content with line numbers for the reviewer
+        target_file_content = await self.repo.async_read_file(context.task.file)
+        if target_file_content:
+            numbered_lines = []
+            for i, line in enumerate(target_file_content.splitlines(), start=1):
+                numbered_lines.append(f"{i:4d} | {line}")
+            numbered_content = "\n".join(numbered_lines)
+            
+            # Extract language name for code fence
+            lang_name = ""
+            if context.file_blueprint and context.file_blueprint.language:
+                from core.language import get_language_profile
+                lang_name = get_language_profile(context.file_blueprint.language).code_fence_name
+            else:
+                lang_name = "code"
+
+            formatted += (
+                f"\n\n## TARGET FILE ({context.task.file})\n"
+                f"```{lang_name}\n"
+                f"{numbered_content}\n"
+                f"```"
+            )
+
+        fb = context.file_blueprint
+
+        blueprint_checklist = ""
+        if fb:
+            exports_check = ", ".join(fb.exports) if fb.exports else "none specified"
+            deps_check = ", ".join(fb.depends_on) if fb.depends_on else "none"
+            blueprint_checklist = (
+                f"\n\nBLUEPRINT REQUIREMENTS TO VERIFY:\n"
+                f"- File MUST export: {exports_check}\n"
+                f"- File depends on: {deps_check}\n"
+                f"- File purpose: {fb.purpose}\n"
+                f"- File layer: {fb.layer}\n"
+                f"- Mark as critical if any listed export is missing or if imports "
+                f"reference files not in depends_on"
+            )
+
         prompt = (
             f"{formatted}\n\n"
             f"Review the file: {context.task.file}\n"
-            "Focus on correctness, security, and adherence to the blueprint."
+            f"{blueprint_checklist}\n\n"
+            "Check each item in the review checklist from your instructions. "
+            "For each issue found, provide the exact line number and a specific "
+            "fix suggestion."
         )
 
         data = await self._call_llm_json(prompt)
@@ -106,12 +176,15 @@ class ReviewerAgent(BaseAgent):
         formatted = self._format_context(context)
         prompt = (
             f"{formatted}\n\n"
-            "Perform a MODULE-LEVEL review checking:\n"
-            "- Consistency between controllers, services, and repositories\n"
-            "- Proper interface contracts between layers\n"
-            "- No missing or broken imports between files\n"
-            "- Consistent error handling patterns\n"
-            "- Proper dependency injection usage"
+            "Perform a MODULE-LEVEL review. Check the following across all files shown:\n"
+            "1. Do controllers call service methods that actually exist with correct signatures?\n"
+            "2. Do services call repository methods that actually exist with correct signatures?\n"
+            "3. Are return types consistent across layer boundaries?\n"
+            "4. Are all imports between files valid (no references to non-existent classes)?\n"
+            "5. Is error handling consistent (same pattern for similar error types)?\n"
+            "6. Is dependency injection used consistently across the module?\n\n"
+            "For each issue, specify the EXACT file and line where the mismatch occurs "
+            "and which other file it conflicts with."
         )
 
         data = await self._call_llm_json(prompt)
@@ -122,13 +195,16 @@ class ReviewerAgent(BaseAgent):
         formatted = self._format_context(context)
         prompt = (
             f"{formatted}\n\n"
-            "Perform an ARCHITECTURE-LEVEL review checking:\n"
-            "- No dependency cycles\n"
-            "- Proper layer separation (controllers don't access repositories directly)\n"
-            "- No layer violations\n"
-            "- Consistent patterns across the codebase\n"
-            "- Proper separation of concerns\n"
-            "- Scalability concerns"
+            "Perform an ARCHITECTURE-LEVEL review. Check specifically:\n"
+            "1. Layer violations: Does any controller directly import a repository "
+            "(skipping the service layer)?\n"
+            "2. Dependency cycles: Does file A import file B which imports file A?\n"
+            "3. Missing layers: Is there a controller without a corresponding service?\n"
+            "4. Cross-cutting concerns: Is authentication/authorization applied consistently?\n"
+            "5. Configuration: Are secrets hardcoded instead of externalized?\n\n"
+            "ONLY report issues you can specifically identify in the code shown. "
+            "Do NOT report vague concerns like 'consider scalability' without "
+            "pointing to a specific file and line."
         )
 
         data = await self._call_llm_json(prompt)

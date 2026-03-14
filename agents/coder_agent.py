@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re as _re
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,38 @@ _MAX_ERROR_CHARS = 3_000
 # Max chars of a single related file included in fix context.
 _MAX_RELATED_FILE_CHARS = 2_000
 
+# Maximum allowed content growth factor for fix/modify rewrites.
+# If new content exceeds original_size * this factor, the rewrite is rejected
+# as it likely contains duplicated code from LLM hallucination.
+_MAX_CONTENT_GROWTH = 1.35
+
 logger = logging.getLogger(__name__)
+
+
+def _has_duplicate_definitions(content: str, language: str) -> bool:
+    """Detect duplicate class/function/method definitions in source code.
+
+    Returns True if the same top-level definition name appears more than once,
+    which is a strong signal of LLM output duplication.
+    """
+    # Language-specific patterns for top-level definitions
+    patterns: dict[str, _re.Pattern[str]] = {
+        "python": _re.compile(r"^(?:class|def|async\s+def)\s+(\w+)", _re.MULTILINE),
+        "java": _re.compile(r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:class|interface|enum|record)\s+(\w+)", _re.MULTILINE),
+        "typescript": _re.compile(r"^(?:export\s+)?(?:class|interface|enum|function|const|type)\s+(\w+)", _re.MULTILINE),
+        "go": _re.compile(r"^(?:func|type)\s+(\w+)", _re.MULTILINE),
+        "csharp": _re.compile(r"^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:class|interface|enum|struct|record)\s+(\w+)", _re.MULTILINE),
+        "rust": _re.compile(r"^(?:pub\s+)?(?:fn|struct|enum|trait|type)\s+(\w+)", _re.MULTILINE),
+    }
+    pattern = patterns.get(language)
+    if not pattern:
+        return False
+    names = pattern.findall(content)
+    if language == "go":
+        # Go permits multiple init functions per file; they should not be treated as duplicates.
+        names = [name for name in names if name != "init"]
+    return len(names) != len(set(names))
+
 
 # File extensions that are configuration/resource files, not source code.
 # These need format-specific generation, not a language-code prompt.
@@ -121,29 +153,50 @@ class CoderAgent(BaseAgent):
         profile = get_language_profile(language)
         lang_rules = self._LANGUAGE_SYNTAX_RULES.get(profile.name, "")
         return (
-            f"You are an expert {profile.display_name} developer agent. "
-            f"You generate production-quality {profile.display_name} code.\n\n"
-            "Rules:\n"
-            f"- Generate ONLY the {profile.display_name} file content, no markdown fences or explanations\n"
-            "- Follow the file blueprint exactly (purpose, exports, dependencies)\n"
-            "- Import from the correct modules as specified in the dependency graph\n"
-            f"- Follow idiomatic {profile.display_name} conventions and best practices\n"
-            "- Use proper type annotations/generics\n"
-            "- Include proper error handling\n"
-            "- Use dependency injection patterns\n"
-            "- Do NOT add placeholder or TODO comments - write complete implementations\n"
+            f"You are an expert {profile.display_name} developer agent working inside "
+            f"an automated code generation pipeline.\n\n"
+
+            "YOUR TASK: Generate a single, complete, production-quality source file.\n\n"
+
+            "CRITICAL REQUIREMENTS:\n"
+            f"1. Output ONLY raw {profile.display_name} code — no markdown fences, no ```, "
+            "no explanations, no comments like '// rest of code here'\n"
+            "2. The file MUST be syntactically valid and compilable on its own\n"
+            "3. EVERY class, method, and function must be FULLY implemented — no stubs, "
+            "no TODOs, no placeholder comments, no '// implement later'\n"
+            "4. EVERY import/dependency must match exactly what the dependency files export "
+            "(check class names, method signatures, package paths)\n"
+            "5. Follow the file blueprint EXACTLY: implement all listed exports\n\n"
+
+            "DEPENDENCY RULES:\n"
+            "- Only import from files listed in 'depends_on' — never invent dependencies\n"
+            "- Match the exact class/function names from the dependency's 'exports' list\n"
+            "- Use the correct import path based on the dependency's file path\n"
+            "- When a dependency file is shown in 'Related Files', use its actual "
+            "method signatures (parameter types, return types)\n\n"
+
+            "CODE QUALITY RULES:\n"
+            "- Use dependency injection (constructor injection preferred)\n"
+            "- Include proper error handling: validate inputs, catch exceptions, "
+            "return meaningful error responses\n"
+            "- Use the framework's idiomatic patterns (annotations, decorators, etc.)\n"
+            f"- Follow idiomatic {profile.display_name} naming conventions\n"
+            "- Use proper type annotations/generics throughout\n"
             "- Do NOT import modules that aren't in the dependency graph"
             f"{lang_rules}"
         )
 
     def _get_config_system_prompt(self, fmt: str) -> str:
         return (
-            f"You are a configuration file generator. You produce correct {fmt} files.\n\n"
-            "Rules:\n"
-            f"- Generate ONLY valid {fmt} content — no code, no markdown fences, no explanations\n"
-            "- Use realistic values appropriate for the project and tech stack\n"
-            "- Include comments where the format supports them\n"
-            "- Do NOT wrap the output in any programming language"
+            f"You are a configuration file generator. You produce correct, complete {fmt} files.\n\n"
+            "CRITICAL REQUIREMENTS:\n"
+            f"1. Output ONLY valid {fmt} content — no code, no markdown fences, no explanations\n"
+            "2. The file MUST be syntactically valid and parseable\n"
+            "3. Use realistic, appropriate values for the project and tech stack\n"
+            "4. Include ALL required dependencies, plugins, and configurations\n"
+            "5. Do NOT truncate the file — output the COMPLETE content\n"
+            "6. Do NOT wrap the output in any programming language or markdown\n"
+            "7. Include comments where the format supports them to explain non-obvious settings"
         )
 
     @property
@@ -174,11 +227,19 @@ class CoderAgent(BaseAgent):
             f"Purpose: {fb.purpose}\n"
             f"Layer: {fb.layer}\n"
             f"Must export: {', '.join(fb.exports) if fb.exports else 'appropriate classes/functions'}\n\n"
-            f"Use the available tools to:\n"
-            f"1. Read any dependency files you need to understand their interfaces\n"
-            f"2. Search for usage patterns or symbol definitions if needed\n"
-            f"3. Write the complete, working {profile.display_name} code via write_file\n\n"
-            f"Output ONLY the code to write_file — no markdown fences, no explanations."
+            f"INSTRUCTIONS:\n"
+            f"1. First, read ALL dependency files listed in 'depends_on' to understand "
+            f"their exact interfaces, method signatures, and class names\n"
+            f"2. Search for symbol definitions if any dependency interface is unclear\n"
+            f"3. Write the COMPLETE, WORKING {profile.display_name} code via write_file\n\n"
+            f"COMPLETENESS CHECKLIST (verify before calling write_file):\n"
+            f"- Every export listed in the blueprint is defined\n"
+            f"- Every import matches a real class/function from a dependency file\n"
+            f"- Every method has a full implementation (no empty bodies, no TODOs)\n"
+            f"- All error cases are handled (try/catch, null checks, validation)\n"
+            f"- The file is syntactically valid {profile.display_name}\n\n"
+            f"Call write_file with path='{fb.path}' and the complete code. "
+            f"Do NOT output code as plain text — always use the write_file tool."
             f"{syntax_reminder}"
         )
 
@@ -396,17 +457,62 @@ class CoderAgent(BaseAgent):
         # ── Small files or diff fallback: full-file rewrite ──────────────────
         prompt = (
             f"{fix_context_header}\n\n"
-            f"The following file has issues that must be fixed:\n\n"
-            f"File: {file_path}\n\n"
+            f"FIX TASK for: {file_path}\n\n"
             f"Current content:\n```{profile.code_fence_name}\n{current_content}\n```\n\n"
             f"Issues to fix ({fix_trigger}):\n{issues_text}\n\n"
-            f"Output the COMPLETE corrected file with ALL issues resolved. "
-            f"Output only the code, nothing else."
+            "INSTRUCTIONS:\n"
+            "1. Fix ONLY the specific issues listed above\n"
+            "2. Do NOT remove, rename, or reorganize any existing methods or classes\n"
+            "3. Do NOT change method signatures unless the issue specifically requires it\n"
+            "4. Do NOT add new functionality beyond what is needed to fix the issues\n"
+            "5. Preserve all existing imports, fields, and logic that are not related to the fix\n"
+            "6. Output the COMPLETE corrected file — every line, from first import to last closing brace\n"
+            "7. Output ONLY the code — no markdown fences, no explanations"
             f"{syntax_note}"
         )
 
         fixed_code = await self._call_llm(prompt, system_override=self._get_source_system_prompt(lang))
         fixed_code = self._clean_fences(fixed_code, profile.code_fence_name)
+
+        # ── Guard: reject rewrites that inflate the file (likely LLM duplication) ──
+        original_size = len(current_content)
+        if original_size > 0 and len(fixed_code) > original_size * _MAX_CONTENT_GROWTH:
+            logger.warning(
+                "Fix rewrite rejected for %s: new size (%d) exceeds %.0f%% of original (%d). "
+                "Keeping original to prevent content duplication.",
+                file_path, len(fixed_code), _MAX_CONTENT_GROWTH * 100, original_size,
+            )
+            return TaskResult(
+                success=True,
+                output=f"Fix for {file_path} skipped — rewrite was too large (likely duplicated content)",
+                files_modified=[],
+                metrics=self.get_metrics(),
+            )
+
+        # ── Guard: detect duplicate class/function definitions ────────────────
+        if _has_duplicate_definitions(fixed_code, profile.name):
+            logger.warning(
+                "Fix rewrite rejected for %s: duplicate definitions detected. "
+                "Keeping original to prevent content duplication.",
+                file_path,
+            )
+            return TaskResult(
+                success=True,
+                output=f"Fix for {file_path} skipped — duplicate definitions detected in LLM output",
+                files_modified=[],
+                metrics=self.get_metrics(),
+            )
+
+        # ── Guard: skip write if content is identical ─────────────────────────
+        if fixed_code.rstrip() == current_content.rstrip():
+            logger.info("Fix for %s produced identical content — skipping write", file_path)
+            return TaskResult(
+                success=True,
+                output=f"No changes needed for {file_path} (content unchanged after fix)",
+                files_modified=[],
+                metrics=self.get_metrics(),
+            )
+
         await self.repo.async_write_file(file_path, fixed_code)
 
         return TaskResult(
@@ -503,20 +609,19 @@ class CoderAgent(BaseAgent):
         return (
             f"You are an expert {profile.display_name} developer agent specializing in "
             f"modifying existing code. You make targeted, surgical edits to existing files.\n\n"
-            "Rules:\n"
-            "- You will receive the CURRENT file content and a specific modification request\n"
-            "- Output the COMPLETE modified file — not just the patch\n"
-            "- Preserve ALL existing code that is not being changed\n"
-            "- Preserve existing imports, formatting, and style conventions\n"
-            "- Add new imports only if the modification requires them\n"
-            "- Place new functions/methods in the appropriate location:\n"
-            "  * New methods go inside their target class\n"
-            "  * New functions go after related existing functions\n"
-            "  * New imports go with existing import blocks\n"
-            f"- Follow the existing code's style and {profile.display_name} conventions\n"
-            "- Do NOT remove or rewrite code that isn't part of the requested change\n"
-            "- Do NOT add placeholder or TODO comments — write complete implementations\n"
-            "- Output only the code, no markdown fences or explanations"
+            "CRITICAL REQUIREMENTS:\n"
+            "1. Output the COMPLETE modified file — every line from start to end\n"
+            "2. Preserve ALL existing code that is NOT part of the requested change\n"
+            "3. Preserve existing imports, formatting, and style conventions exactly\n"
+            "4. Add new imports ONLY if the modification requires them\n"
+            "5. Do NOT remove, rename, or reorganize any existing code\n"
+            "6. Do NOT add placeholder or TODO comments — write complete implementations\n"
+            "7. Output ONLY the code — no markdown fences, no explanations\n\n"
+            "PLACEMENT RULES:\n"
+            "- New methods go inside their target class, after related existing methods\n"
+            "- New functions go after related existing functions\n"
+            "- New imports go with the existing import block at the top\n"
+            f"- Follow the existing code's style and {profile.display_name} conventions exactly"
         )
 
     async def modify_file(self, context: AgentContext) -> TaskResult:
@@ -591,6 +696,36 @@ class CoderAgent(BaseAgent):
             prompt, system_override=self._get_modify_system_prompt(lang),
         )
         modified_code = self._clean_fences(modified_code, profile.code_fence_name)
+
+        # ── Guard: reject rewrites that inflate the file (likely LLM duplication) ──
+        original_size = len(current_content)
+        if original_size > 0 and len(modified_code) > original_size * _MAX_CONTENT_GROWTH:
+            logger.warning(
+                "Modify rewrite rejected for %s: new size (%d) exceeds %.0f%% of original (%d). "
+                "Keeping original to prevent content duplication.",
+                file_path, len(modified_code), _MAX_CONTENT_GROWTH * 100, original_size,
+            )
+            return TaskResult(
+                success=False,
+                output=f"Modification of {file_path} skipped — rewrite was too large (likely duplicated content)",
+                errors=[f"Content inflation detected: {len(modified_code)} bytes vs {original_size} original"],
+                metrics=self.get_metrics(),
+            )
+
+        # ── Guard: detect duplicate class/function definitions ────────────────
+        if _has_duplicate_definitions(modified_code, profile.name):
+            logger.warning(
+                "Modify rewrite rejected for %s: duplicate definitions detected. "
+                "Keeping original to prevent content duplication.",
+                file_path,
+            )
+            return TaskResult(
+                success=False,
+                output=f"Modification of {file_path} skipped — duplicate definitions detected in LLM output",
+                errors=["Duplicate class/function definitions detected in LLM output"],
+                metrics=self.get_metrics(),
+            )
+
         await self.repo.async_write_file(file_path, modified_code)
 
         return TaskResult(

@@ -489,11 +489,15 @@ class BaseAgent(ABC):
                 continuation = continuation[:-3].rstrip()
 
             # Detect overlapping tail: the LLM sometimes repeats the last
-            # 1-3 lines for context.  Find the longest suffix of `content`
-            # that matches a prefix of `continuation` and skip it.
+            # few lines (or even larger sections) for context.  Find the
+            # longest suffix of `content` that matches a prefix of
+            # `continuation` and skip it.  We check up to the last 30 lines
+            # because LLMs can restart from the beginning of a class or
+            # function definition that was 10–20 lines back.
             overlap = 0
-            tail_lines = content.rsplit("\n", 5)[-5:]  # last 5 lines
-            for n in range(min(len(tail_lines), 5), 0, -1):
+            max_overlap_lines = 30
+            tail_lines = content.rsplit("\n", max_overlap_lines)[-max_overlap_lines:]
+            for n in range(min(len(tail_lines), max_overlap_lines), 0, -1):
                 tail = "\n".join(tail_lines[-n:])
                 if continuation.startswith(tail):
                     overlap = len(tail)
@@ -526,7 +530,12 @@ class BaseAgent(ABC):
         return result
 
     def _format_context(self, context: AgentContext) -> str:
-        """Format agent context into a prompt section."""
+        """Format agent context into a prompt section.
+
+        The primary file (matching the current task's file_blueprint) gets full
+        content to prevent truncation of critical method signatures. Dependency
+        files are truncated at 4000 chars to stay within token budget.
+        """
         parts: list[str] = []
 
         if context.architecture_summary:
@@ -545,9 +554,14 @@ class BaseAgent(ABC):
 
         if context.related_files:
             parts.append("## Related Files")
+            # Determine the primary file path to give it full content
+            primary_path = context.file_blueprint.path if context.file_blueprint else None
             for path, content in context.related_files.items():
-                # Truncate large files
-                truncated = content[:4000] if len(content) > 4000 else content
+                # Primary file gets full content; dependencies get truncated
+                if path == primary_path:
+                    truncated = content
+                else:
+                    truncated = content[:4000] if len(content) > 4000 else content
                 # Detect language from file extension for correct code fencing
                 lang_name = ""
                 if context.file_blueprint:

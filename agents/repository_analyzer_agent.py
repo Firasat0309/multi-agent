@@ -75,11 +75,18 @@ class RepositoryAnalyzerAgent(BaseAgent):
             "and produce structured summaries of their architecture, modules, "
             "and dependencies.\n\n"
             "When given a list of files with their contents, you must:\n"
-            "1. Identify the tech stack (language, framework, database, etc.)\n"
-            "2. Determine the architecture style (REST, GraphQL, microservices, etc.)\n"
-            "3. Summarize each module's purpose and responsibilities\n"
+            "1. Identify the tech stack (language, framework, database)\n"
+            "2. Determine the architecture style\n"
+            "3. Summarize the system's purpose and structure\n"
             "4. Identify entry points and main workflows\n\n"
-            "Respond with valid JSON only. No markdown fences or explanations."
+            "Respond with valid JSON only. No markdown fences or explanations.\n\n"
+            "VALUE CONSTRAINTS:\n"
+            "- language MUST be one of: python, java, go, typescript, rust, csharp (lowercase)\n"
+            "- framework must be a specific lowercase name (e.g., 'spring-boot', 'fastapi', "
+            "'gin', 'express', 'actix-web', 'asp.net')\n"
+            "- architecture_style MUST be one of: REST, GraphQL, gRPC, monolith, "
+            "microservices, event-driven\n"
+            "- If you cannot determine a value, use an empty string — do NOT guess"
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
@@ -307,7 +314,8 @@ class RepositoryAnalyzerAgent(BaseAgent):
                 sample_files[m.file] = content[:1500]
 
         prompt = (
-            f"Analyze this existing {lang_profile.display_name} repository.\n\n"
+            f"Analyze this existing {lang_profile.display_name} repository and produce "
+            f"a JSON summary.\n\n"
             f"Modules ({len(modules)} total):\n"
             f"{json.dumps(module_summary, indent=2)}\n\n"
             f"Entry points: {entry_points}\n\n"
@@ -317,12 +325,24 @@ class RepositoryAnalyzerAgent(BaseAgent):
             prompt += f"\n--- {path} ---\n{content}\n"
 
         prompt += (
-            "\n\nRespond with JSON:\n"
+            "\n\nRespond with ONLY this JSON (no fences, no prose):\n"
             "{\n"
-            '  "tech_stack": {"language": "...", "framework": "...", "db": "..."},\n'
-            '  "architecture_style": "REST|GraphQL|gRPC|monolith|microservices",\n'
-            '  "summary": "A 2-3 sentence description of what this system does"\n'
-            "}"
+            '  "tech_stack": {\n'
+            '    "language": "<lowercase: python|java|go|typescript|rust|csharp>",\n'
+            '    "framework": "<lowercase-framework-name or empty string>",\n'
+            '    "db": "<lowercase-db-name or empty string>"\n'
+            "  },\n"
+            '  "architecture_style": "<one of: REST|GraphQL|gRPC|monolith|microservices|event-driven>",\n'
+            '  "summary": "2-3 sentences describing what this system does and how it is structured"\n'
+            "}\n\n"
+            "RULES:\n"
+            "- language MUST be one of: python, java, go, typescript, rust, csharp\n"
+            "- framework must be the specific framework name (e.g., 'spring-boot', "
+            "'fastapi', 'gin', 'express')\n"
+            "- db must be the specific database name (e.g., 'postgresql', 'mysql', "
+            "'mongodb', 'redis', 'h2', 'sqlite')\n"
+            "- architecture_style must be EXACTLY one of the options listed\n"
+            "- If you cannot determine a value, use an empty string — do NOT guess"
         )
 
         try:

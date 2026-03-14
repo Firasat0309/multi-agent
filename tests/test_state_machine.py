@@ -97,7 +97,7 @@ class TestReviewFixCycle:
 
         assert lc.phase == FilePhase.BUILDING
 
-    def test_max_review_fixes_skips_to_testing(self):
+    def test_max_review_fixes_proceeds_to_building(self):
         lc = FileLifecycle("svc.java", max_review_fixes=2)
         lc.process_event(EventType.DEPS_MET)
         lc.process_event(EventType.CODE_GENERATED)
@@ -108,11 +108,35 @@ class TestReviewFixCycle:
         # Fix cycle 2
         lc.process_event(EventType.REVIEW_FAILED)
         lc.process_event(EventType.FIX_APPLIED)
-        # 3rd failure exceeds limit → skip to testing
+        # 3rd failure exceeds limit → proceed to build verification
         lc.process_event(EventType.REVIEW_FAILED)
 
-        assert lc.phase == FilePhase.TESTING
+        assert lc.phase == FilePhase.BUILDING
         assert lc.review_fix_count == 3
+
+
+# ── FileLifecycle: build fix cycle ──────────────────────────────────────
+
+class TestBuildFixCycle:
+    """BUILDING → FIXING → BUILDING cycle with max_build_fixes exhaustion."""
+
+    def test_max_build_fixes_marks_failed(self):
+        lc = FileLifecycle("svc.java", max_build_fixes=2)
+        lc.process_event(EventType.DEPS_MET)
+        lc.process_event(EventType.CODE_GENERATED)
+        lc.process_event(EventType.REVIEW_PASSED)
+
+        # Fix cycle 1
+        lc.process_event(EventType.BUILD_FAILED)
+        lc.process_event(EventType.FIX_APPLIED)
+        # Fix cycle 2
+        lc.process_event(EventType.BUILD_FAILED)
+        lc.process_event(EventType.FIX_APPLIED)
+        # 3rd failure exceeds limit → mark file as failed
+        lc.process_event(EventType.BUILD_FAILED)
+
+        assert lc.phase == FilePhase.FAILED
+        assert lc.build_fix_count == 3
 
 
 # ── FileLifecycle: test fix cycle ───────────────────────────────────────
@@ -163,6 +187,7 @@ class TestTestFixCycle:
         lc.process_event(EventType.FIX_APPLIED)
         assert lc.test_fix_target == "test"
 
+    def test_max_test_fixes_marks_failed(self):
     def test_max_test_fixes_marks_degraded(self):
         lc = FileLifecycle("svc.java", max_test_fixes=2)
         for evt in [EventType.DEPS_MET, EventType.CODE_GENERATED,
@@ -175,6 +200,10 @@ class TestTestFixCycle:
         lc.process_event(EventType.TEST_FAILED)
         lc.process_event(EventType.FIX_APPLIED)
 
+        # 3rd failure exceeds limit → mark as failed
+        lc.process_event(EventType.TEST_FAILED)
+
+        assert lc.phase == FilePhase.FAILED
         # 3rd failure exceeds limit → DEGRADED (was incorrectly PASSED)
         lc.process_event(EventType.TEST_FAILED)
 

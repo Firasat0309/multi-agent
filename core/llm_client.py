@@ -13,6 +13,13 @@ from core.circuit_breaker import CircuitBreaker, CircuitOpenError
 
 logger = logging.getLogger(__name__)
 
+# Per-request timeout in seconds.  Applies to each individual API call
+# (not the full retry loop).  Prevents the pipeline from hanging if a
+# provider endpoint stalls.  The value is generous enough for large
+# architecture responses (~16k tokens) while still failing in a
+# human-reasonable timeframe.
+_REQUEST_TIMEOUT = 180  # 3 minutes
+
 
 def _blk(block: Any, key: str) -> Any:
     """Read a field from a normalized content block (plain dict or SDK object).
@@ -196,10 +203,16 @@ class LLMClient:
         try:
             if self.config.provider == LLMProvider.ANTHROPIC:
                 import anthropic
-                self._client = anthropic.Anthropic(api_key=self.config.api_key)
+                self._client = anthropic.Anthropic(
+                    api_key=self.config.api_key,
+                    timeout=_REQUEST_TIMEOUT,
+                )
             elif self.config.provider == LLMProvider.OPENAI:
                 import openai
-                self._client = openai.OpenAI(api_key=self.config.openai_api_key)
+                self._client = openai.OpenAI(
+                    api_key=self.config.openai_api_key,
+                    timeout=_REQUEST_TIMEOUT,
+                )
             elif self.config.provider == LLMProvider.GEMINI:
                 import google.generativeai as genai
                 genai.configure(api_key=self.config.gemini_api_key)
@@ -250,11 +263,34 @@ class LLMClient:
 
         for attempt in range(_max_attempts):
             try:
-                response = await self._circuit.call(_generate_once)
+                logger.info(
+                    "LLM request (attempt %d/%d, provider=%s, model=%s) …",
+                    attempt + 1, _max_attempts,
+                    self.config.provider.value, self.config.model,
+                )
+                response = await asyncio.wait_for(
+                    self._circuit.call(_generate_once),
+                    timeout=_REQUEST_TIMEOUT + 30,  # generous over SDK timeout
+                )
                 # Accumulate lifetime token counts for cost reporting
                 self.total_input_tokens += response.usage.get("input_tokens", 0)
                 self.total_output_tokens += response.usage.get("output_tokens", 0)
                 return response
+            except asyncio.TimeoutError:
+                logger.error(
+                    "LLM request timed out after %ds (attempt %d/%d)",
+                    _REQUEST_TIMEOUT + 30, attempt + 1, _max_attempts,
+                )
+                if attempt < _max_attempts - 1:
+                    delay = _base_delay * (2 ** attempt)
+                    await asyncio.sleep(delay)
+                    continue
+                raise LLMClientError(
+                    f"LLM request timed out after {_REQUEST_TIMEOUT + 30}s "
+                    f"({_max_attempts} attempts). The {self.config.provider.value} API "
+                    f"may be overloaded — try again later or use --no-interactive for "
+                    f"more verbose logging."
+                )
             except CircuitOpenError as e:
                 raise LLMClientError(str(e)) from e
             except LLMClientError:
@@ -385,7 +421,10 @@ class LLMClient:
                     "max_output_tokens": max_tokens,
                 },
             )
-            return model.generate_content(user)
+            return model.generate_content(
+                user,
+                request_options={"timeout": _REQUEST_TIMEOUT},
+            )
 
         try:
             response = await asyncio.to_thread(_sync)
@@ -433,11 +472,26 @@ class LLMClient:
                     f"  • Your account has access to this model"
                 ) from e
             raise
+        # response.text raises ValueError if the content was blocked by safety
+        # filters or if no candidates were returned.  Handle gracefully.
+        try:
+            text = response.text
+        except ValueError as ve:
+            # Blocked response — treat as an LLM error so the caller can retry
+            # or surface the message instead of crashing with a traceback.
+            block_reason = ""
+            if hasattr(response, "prompt_feedback"):
+                block_reason = str(getattr(response.prompt_feedback, "block_reason", ""))
+            raise LLMClientError(
+                f"Gemini response blocked: {ve}. "
+                f"Block reason: {block_reason or 'unknown'}. "
+                f"Try rephrasing the prompt or using a different model."
+            ) from ve
         return LLMResponse(
-            content=response.text,
+            content=text,
             usage={
-                "input_tokens": response.usage_metadata.prompt_token_count,
-                "output_tokens": response.usage_metadata.candidates_token_count,
+                "input_tokens": getattr(response.usage_metadata, "prompt_token_count", 0) or 0,
+                "output_tokens": getattr(response.usage_metadata, "candidates_token_count", 0) or 0,
             },
             model=self.config.model,
             stop_reason=response.candidates[0].finish_reason.name if response.candidates else "",

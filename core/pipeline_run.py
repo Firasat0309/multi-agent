@@ -76,33 +76,55 @@ class RunPipeline:
                 logger.error("Failed to initialize MCP client in run pipeline: %e", e)
                 mcp_client = None
 
+        # ── Phase 1: Architecture ─────────────────────────────────────────────
+        self._phase("Architecture Design", "running")
+        logger.info("[Phase 1] Designing architecture...")
+
+        repo_manager = RepositoryManager(self._settings.workspace_dir)
+        if self._root_write_lock is not None:
+            repo_manager._root_write_lock = self._root_write_lock
+        architect = ArchitectAgent(
+            llm_client=self._llm,
+            repo_manager=repo_manager,
+            mcp_client=mcp_client,
+        )
+
+        # Timeout the architecture LLM call so the pipeline never hangs
+        # indefinitely if the API endpoint stalls.
+        _arch_timeout = self._settings.phase_timeout_seconds
         try:
-            # ── Phase 1: Architecture ─────────────────────────────────────────────
-            self._phase("Architecture Design", "running")
-            logger.info("[Phase 1] Designing architecture...")
-    
-            repo_manager = RepositoryManager(self._settings.workspace_dir)
-            if self._root_write_lock is not None:
-                repo_manager._root_write_lock = self._root_write_lock
-            architect = ArchitectAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
+            blueprint = await asyncio.wait_for(
+                architect.design_architecture(user_prompt),
+                timeout=_arch_timeout,
+            )
+        except asyncio.TimeoutError:
+            msg = (
+                f"Architecture design timed out after {_arch_timeout}s. "
+                "The LLM provider may be overloaded — try again later."
+            )
+            logger.error(msg)
+            self._fail_phase("Architecture Design", msg)
+            return PipelineResult(
+                success=False,
+                workspace_path=self._settings.workspace_dir,
+                errors=[msg],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+        except (LLMConfigError, Exception) as e:
+            is_config = isinstance(e, LLMConfigError)
+            if not is_config:
+                logger.exception("Architecture design failed")
+            else:
+                logger.error(str(e))
+            self._fail_phase("Architecture Design", str(e))
+            return PipelineResult(
+                success=False,
+                workspace_path=self._settings.workspace_dir,
+                errors=[f"Architecture design failed: {e}"],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
 
-            try:
-                blueprint = await architect.design_architecture(user_prompt)
-            except (LLMConfigError, Exception) as e:
-                is_config = isinstance(e, LLMConfigError)
-                if not is_config:
-                    logger.exception("Architecture design failed")
-                else:
-                    logger.error(str(e))
-                self._fail_phase("Architecture Design", str(e))
-                return PipelineResult(
-                    success=False,
-                    workspace_path=self._settings.workspace_dir,
-                    errors=[f"Architecture design failed: {e}"],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
-
-            lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
+        lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
             logger.info(
                 "Blueprint: %s | Language: %s | %d files",
                 blueprint.name, lang_profile.display_name, len(blueprint.file_blueprints),
@@ -237,8 +259,6 @@ class RunPipeline:
                     errors=[f"Task execution failed: {e}"],
                     elapsed_seconds=time.monotonic() - start_time,
                 )
-            finally:
-                await sandbox.teardown()
 
             self._complete_phase("Code Generation & Review")
 
@@ -257,10 +277,17 @@ class RunPipeline:
             # Code success: all files generated, reviewed, and built correctly.
             # Test failures (tests_degraded) are a quality signal, not a hard gate —
             # the generated code itself is valid even when generated tests don't all pass.
+            # Also check checkpoint results — if any build checkpoint failed, the
+            # code is not reliable even if lifecycle states look OK.
+            checkpoints_passed = all(
+                cr.get("passed", True)
+                for cr in exec_result.get("checkpoint_results", [])
+            )
             code_success = (
                 stats.get("failed", 0) == 0
                 and stats.get("blocked", 0) == 0
                 and stats.get("lifecycle_failed", 0) == 0
+                and checkpoints_passed
             )
             tests_passed = stats.get("lifecycle_tests_degraded", 0) == 0
             # Overall success requires code to generate correctly; test quality is
@@ -272,7 +299,10 @@ class RunPipeline:
             logger.info(
                 "Pipeline %s | code_success=%s tests_passed=%s | stats=%s | elapsed=%.1fs",
                 "SUCCEEDED" if success else "COMPLETED WITH ISSUES",
-                code_success, tests_passed, stats, elapsed,
+                code_success,
+                tests_passed,
+                stats,
+                elapsed,
             )
 
             token_cost = self._build_token_cost()
@@ -302,6 +332,12 @@ class RunPipeline:
             logger.error("Unhandled error in run pipeline: %e", flow_err)
             raise
         finally:
+            # Ensure sandbox and MCP client are cleaned up even on failure.
+            try:
+                if "sandbox" in locals():
+                    await sandbox.teardown()
+            except Exception:
+                logger.warning("Error during sandbox teardown", exc_info=True)
             if mcp_client:
                 await mcp_client.close()
 

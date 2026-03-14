@@ -105,7 +105,19 @@ class ChangePlannerAgent(BaseAgent):
             "- Include import changes if new dependencies are introduced\n"
             "- Be specific: name the exact function/class/method to add or modify\n"
             "- Only create_file when the change truly needs a new module\n"
-            "- Respond with valid JSON only. No markdown fences or explanations."
+            "- Respond with valid JSON only. No markdown fences or explanations.\n\n"
+
+            "ORDERING RULE:\n"
+            "- The 'changes' array MUST be in execution order: if change B depends on "
+            "change A, A must appear first in the array\n"
+            "- depends_on in each change lists the FILE PATHS that must be modified before "
+            "this change can be applied\n\n"
+
+            "COMPLETENESS RULE:\n"
+            "- If you add a new method to a service, you MUST also include a change for "
+            "the controller that calls it and the test that covers it\n"
+            "- If you add a new class, you MUST include import changes in files that need it\n"
+            "- Every change must reference an actual file that exists in the repository analysis"
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:

@@ -225,11 +225,12 @@ class FileLifecycle:
             self.review_output = data.get("output", "")
 
             if self.review_fix_count > self.max_review_fixes:
-                # Skip fix, proceed directly to testing
-                new_phase = FilePhase.TESTING
+                # Review fixes exhausted — still send the file through BUILD
+                # so the compiler can verify it.  Never skip BUILD.
+                new_phase = FilePhase.BUILDING
                 self.fix_trigger = ""
                 logger.warning(
-                    "%s: review fix limit (%d) reached — proceeding to testing",
+                    "%s: review fix limit (%d) reached — proceeding to build verification",
                     self.file_path, self.max_review_fixes,
                 )
 
@@ -239,6 +240,12 @@ class FileLifecycle:
             self.test_errors = data.get("errors", "")
 
             if self.test_fix_count > self.max_test_fixes:
+                # Test fixes exhausted — mark FAILED, not PASSED.
+                # Code with broken tests should not be reported as success.
+                new_phase = FilePhase.FAILED
+                self.fix_trigger = ""
+                logger.warning(
+                    "%s: test fix limit (%d) reached — marking as failed",
                 # Tests never fully passed — mark DEGRADED so the pipeline
                 # reports a quality warning rather than a false clean success.
                 new_phase = FilePhase.DEGRADED
@@ -254,6 +261,11 @@ class FileLifecycle:
             self.build_errors = data.get("errors", "")
 
             if self.build_fix_count > self.max_build_fixes:
+                # Build fixes exhausted — file does not compile, mark FAILED.
+                new_phase = FilePhase.FAILED
+                self.fix_trigger = ""
+                logger.warning(
+                    "%s: build fix limit (%d) reached — marking as failed",
                 # Build never fully resolved — mark DEGRADED so the pipeline
                 # reports a quality warning rather than a false clean success.
                 new_phase = FilePhase.DEGRADED
@@ -317,7 +329,7 @@ class LifecycleEngine:
         *,
         max_review_fixes: int = 2,
         max_test_fixes: int = 3,
-        max_build_fixes: int = 2,
+        max_build_fixes: int = 3,
         compiled: bool = False,
         checkpoint_mode: bool = False,
         file_overrides: dict[str, dict[str, Any]] | None = None,
