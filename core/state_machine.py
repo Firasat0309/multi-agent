@@ -331,7 +331,6 @@ class LifecycleEngine:
         max_review_fixes: int = 2,
         max_test_fixes: int = 3,
         max_build_fixes: int = 3,
-        max_build_fixes: int = 2,
         compiled: bool = False,
         checkpoint_mode: bool = False,
         file_overrides: dict[str, dict[str, Any]] | None = None,
