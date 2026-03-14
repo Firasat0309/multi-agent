@@ -51,5 +51,6 @@ def fix_all():
     with open('core/agent_manager.py', 'w', encoding='utf-8') as f:
         f.write(content)
 
-fix_all()
-print("Done.")
+if __name__ == "__main__":
+    fix_all()
+    print("Done.")

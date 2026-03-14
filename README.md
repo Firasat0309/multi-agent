@@ -1,4 +1,4 @@
-﻿# Multi-Agent Code Generator
+# Multi-Agent Code Generator
 
 Production-grade, autonomous code generation platform powered by a coordinated
 pipeline of specialised AI agents.

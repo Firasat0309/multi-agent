@@ -1,4 +1,4 @@
-﻿# Architecture — Multi-Agent Code Generation System
+# Architecture — Multi-Agent Code Generation System
 
 ## Table of Contents
 
