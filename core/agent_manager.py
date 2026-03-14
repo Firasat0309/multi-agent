@@ -509,7 +509,6 @@ class AgentManager:
             else:
                 engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
                 self._metrics["tasks_failed"] += 1
-        return await self._orchestrator._execute_lifecycle_phase(engine, file_path, phase)
 
     async def execute_with_checkpoints(
         self,
