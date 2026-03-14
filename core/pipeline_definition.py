@@ -45,8 +45,26 @@ class CheckpointDef:
     """Definition for a repo-level build checkpoint between phases.
 
     The checkpoint runs after all per-file tasks in the phase complete.
-    On failure, it attributes errors to files and dispatches fix tasks,
-    then re-runs the build.
+    On failure, it attributes errors to specific files using
+    ``CompilerErrorAttributor`` and dispatches targeted fix tasks, then
+    re-runs the build — up to ``max_retries`` times.
+
+    Checkpoint timing within the executor::
+
+        Tier N files: Generate → Review → Fix loops
+            ↓ (all complete)
+        Forward-reference stubs created for Tier N+1 files
+            ↓
+        BuildCheckpoint.run_once()  ←── this checkpoint
+            ↓ pass → clean stubs, advance to Tier N+1
+            ↓ fail → attribute errors → fix affected → retry
+
+    Attributes:
+        name: Identifier for logging and metrics (e.g. "build_verification").
+        max_retries: Maximum number of build→fix→rebuild cycles. Each cycle
+            only fixes files with newly attributed errors.
+        timeout: Seconds before the build command is killed. Should account
+            for dependency resolution on first build.
     """
 
     name: str = "build_verification"
@@ -58,11 +76,20 @@ class CheckpointDef:
 class FileTaskDef:
     """Definition for a per-file task within a phase.
 
-    ``review``: If True, the file goes through a Review → Fix cycle after
-    this task type completes.
+    Each ``FileTaskDef`` describes one kind of work to be done per file.
+    The lifecycle FSM (``FileLifecycle``) drives the actual state transitions;
+    these fields declare the *intent* of the phase.
 
-    ``max_review_fixes`` / ``max_test_fixes``: Cycle limits for the
-    review-fix and test-fix loops respectively.
+    Attributes:
+        task_type: The ``TaskType`` to dispatch for each file (e.g.
+            ``GENERATE_FILE``, ``MODIFY_FILE``, ``GENERATE_TEST``).
+        review: If True, the file enters a Review → Fix cycle after the
+            primary task completes.  Currently driven by the lifecycle FSM
+            rather than this flag — reserved for future phase customization.
+        max_review_fixes: Maximum review→fix iterations before the FSM
+            exhausts retries and skips to the next phase.
+        max_test_fixes: Maximum test→fix iterations before the FSM marks
+            the file as DEGRADED (quality warning, not hard failure).
     """
 
     task_type: TaskType
@@ -75,9 +102,30 @@ class FileTaskDef:
 class Phase:
     """A phase in the pipeline — contains per-file work + optional checkpoint.
 
-    Per-file tasks run in parallel (respecting dependency order).
-    The checkpoint runs after all per-file tasks in this phase complete
-    successfully.
+    Per-file tasks run in parallel (respecting dependency tiers).  For
+    generation phases (``GENERATE_FILE`` / ``MODIFY_FILE``), files are
+    processed tier-by-tier with an optional build checkpoint between tiers.
+    For test phases (``GENERATE_TEST``), all files run in a flat pass.
+
+    Execution order within a generation phase::
+
+        for tier in tiers:
+            1. Run per-file lifecycles (tasks in parallel, respecting deps)
+            2. If checkpoint defined and language is compiled:
+               a. Generate forward-reference stubs for later tiers
+               b. Run build checkpoint (with retry/fix loop)
+               c. Clean up stubs
+            3. If checkpoint fails after all retries:
+               - Fail files with unresolvable errors
+               - Block downstream files that depend exclusively on failed files
+
+    Attributes:
+        name: Human-readable phase identifier for logging.
+        file_tasks: Per-file task definitions dispatched during this phase.
+        checkpoint: Optional build checkpoint config.  Only runs for compiled
+            languages unless ``skip_for_interpreted`` is False.
+        skip_for_interpreted: If True, the entire phase is skipped when the
+            target language has no build command (Python, Ruby, JS, etc.).
     """
 
     name: str

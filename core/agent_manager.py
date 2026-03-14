@@ -19,6 +19,7 @@ continues to work without modification.
 from __future__ import annotations
 
 import logging
+import warnings
 from typing import Any, TYPE_CHECKING
 
 import asyncio
@@ -224,8 +225,16 @@ class AgentManager:
     ) -> dict[str, Any]:
         """Drive per-file lifecycle FSM then run the global DAG.
 
-        Delegates to :class:`~core.lifecycle_orchestrator.LifecycleOrchestrator`.
+        .. deprecated::
+            Prefer calling :class:`~core.pipeline_executor.PipelineExecutor`
+            directly.  This shim is kept for backward compatibility only.
         """
+        warnings.warn(
+            "AgentManager.execute_with_lifecycle is deprecated. "
+            "Use PipelineExecutor.execute() directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return await self._orchestrator.execute_with_lifecycle(engine, global_graph)
 
     async def _execute_lifecycle_phase(
@@ -482,21 +491,46 @@ class AgentManager:
                     f"transitioning via {config['failure_event'].value}"
                 )
 
+    async def _handle_execution_exception(
+        self,
+        engine: LifecycleEngine,
+        file_path: str,
+        phase: FilePhase,
+        exc: Exception,
+    ) -> None:
+        """Handle an uncaught exception from agent execution.
+
+        Graceful degradation: exceptions during review or fix phases must not
+        hard-fail a file.  Only generation-level failures result in
+        ``RETRIES_EXHAUSTED`` and a ``tasks_failed`` increment.
+
+        Behaviour by phase:
+
+        * ``REVIEWING`` — auto-pass review so the file can continue.
+        * ``FIXING``    — fire ``FIX_APPLIED`` to re-enter the review cycle.
+        * Any other     — fire ``RETRIES_EXHAUSTED`` and increment
+          ``tasks_failed``.
+        """
+        logger.exception("[%s] %s unhandled error: %s", file_path, phase.value, exc)
+        if phase == FilePhase.REVIEWING:
+            engine.process_event(file_path, EventType.REVIEW_PASSED)
+        elif phase == FilePhase.FIXING:
+            engine.process_event(file_path, EventType.FIX_APPLIED)
+        else:
+            engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
+            self._metrics["tasks_failed"] += 1
+
     def _get_agent_name_for_task_type(self, task_type: TaskType) -> str:
-        """Get the agent name for a given task type."""
-        # Simple mapping - in practice, this could be more sophisticated
-        mapping = {
-            TaskType.GENERATE_FILE: "CoderAgent",
-            TaskType.REVIEW_FILE: "ReviewerAgent",
-            TaskType.FIX_CODE: "CoderAgent",
-            TaskType.MODIFY_FILE: "PatchAgent",
-            TaskType.GENERATE_TEST: "TestAgent",
-            TaskType.SECURITY_SCAN: "SecurityAgent",
-            TaskType.VERIFY_BUILD: "BuildVerifierAgent",
-            TaskType.GENERATE_DEPLOY: "DeployAgent",
-            TaskType.GENERATE_DOCS: "WriterAgent",
-        }
-        return mapping.get(task_type, "UnknownAgent")
+        """Return the agent class name registered for *task_type*.
+
+        Derived directly from ``TASK_AGENT_MAP`` so there is a single source
+        of truth — adding a new agent to the registry automatically makes it
+        discoverable here.
+        """
+        agent_cls = TASK_AGENT_MAP.get(task_type)
+        if agent_cls is None:
+            return "UnknownAgent"
+        return agent_cls.__name__
 
     async def execute_with_checkpoints(
         self,
@@ -508,8 +542,16 @@ class AgentManager:
     ) -> dict[str, Any]:
         """Tier-scheduled execution with repo-level build checkpoints.
 
-        Delegates to :class:`~core.lifecycle_orchestrator.LifecycleOrchestrator`.
+        .. deprecated::
+            Prefer calling :class:`~core.pipeline_executor.PipelineExecutor`
+            directly.  This shim is kept for backward compatibility only.
         """
+        warnings.warn(
+            "AgentManager.execute_with_checkpoints is deprecated. "
+            "Use PipelineExecutor.execute() directly.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return await self._orchestrator.execute_with_checkpoints(
             engine,
             global_graph,
@@ -517,15 +559,23 @@ class AgentManager:
             pipeline_def=pipeline_def,
         )
 
-    # ── Static helpers — forwarding aliases for backward compatibility ────────
+    # ── Static helpers — shared with LifecycleOrchestrator ───────────────────
 
     @staticmethod
     def _build_lifecycle_metadata(lc: Any) -> dict[str, Any]:
-        """Forwarding alias — implementation lives in LifecycleOrchestrator."""
+        """Build task metadata from lifecycle state for downstream agents.
+
+        Delegates to :meth:`LifecycleOrchestrator._build_lifecycle_metadata`
+        so both callers share a single canonical implementation.
+        """
         return LifecycleOrchestrator._build_lifecycle_metadata(lc)
 
     @staticmethod
     def _extract_event_data(result: Any, task_type: Any) -> dict[str, Any]:
-        """Forwarding alias — implementation lives in LifecycleOrchestrator."""
+        """Extract event data from agent result for lifecycle FSM transitions.
+
+        Delegates to :meth:`LifecycleOrchestrator._extract_event_data`
+        so both callers share a single canonical implementation.
+        """
         return LifecycleOrchestrator._extract_event_data(result, task_type)
 

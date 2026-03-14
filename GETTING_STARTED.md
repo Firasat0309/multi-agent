@@ -1,8 +1,9 @@
-# Getting Started
+﻿# Getting Started
 
-Multi-agent code generation platform powered by Claude (and optionally OpenAI / Gemini).
-Generates or modifies full repositories from a plain-English prompt using a pipeline of
-specialised AI agents running inside isolated Docker sandboxes.
+This guide walks you through installing, configuring, and running the
+multi-agent code generation platform — for all three operating modes:
+`generate` (new backend project), `enhance` (modify an existing repo), and
+`fullstack` (backend + React/Next.js frontend).
 
 ---
 
@@ -11,515 +12,711 @@ specialised AI agents running inside isolated Docker sandboxes.
 1. [Prerequisites](#1-prerequisites)
 2. [Installation](#2-installation)
 3. [Configuration](#3-configuration)
-4. [Running with CLI](#4-running-with-cli)
-5. [Running the API Server](#5-running-the-api-server)
-6. [Running with Docker Compose (full stack)](#6-running-with-docker-compose-full-stack)
-7. [Verifying the Setup](#7-verifying-the-setup)
-8. [Troubleshooting](#8-troubleshooting)
+   - 3.1 [API Keys](#31-api-keys)
+   - 3.2 [Environment File (.env)](#32-environment-file-env)
+   - 3.3 [Full Environment Variable Reference](#33-full-environment-variable-reference)
+4. [Generate — New Backend Project](#4-generate--new-backend-project)
+5. [Enhance — Modify an Existing Repository](#5-enhance--modify-an-existing-repository)
+6. [Fullstack — Backend + Frontend](#6-fullstack--backend--frontend)
+   - 6.1 [Without Figma](#61-without-figma)
+   - 6.2 [With Figma Import](#62-with-figma-import)
+7. [HTTP API Server](#7-http-api-server)
+8. [Running with Docker Compose](#8-running-with-docker-compose)
+9. [Running the Test Suite](#9-running-the-test-suite)
+10. [Verifying a Generated Workspace](#10-verifying-a-generated-workspace)
+11. [Troubleshooting](#11-troubleshooting)
 
 ---
 
 ## 1. Prerequisites
 
-### 1.1 Python 3.11+
+| Requirement | Version | Notes |
+|-------------|---------|-------|
+| Python | ≥ 3.11 | `python --version` to check |
+| Docker | ≥ 24.0 | Required for sandbox isolation; skip with `--sandbox local` |
+| Git | any | For cloning the repo |
+| LLM API key | — | Anthropic (recommended), OpenAI, or Google Gemini |
+| Node.js + npm | ≥ 18 | **Fullstack only** — for TypeScript compilation check (`tsc`) |
+| Figma token | — | **Fullstack + Figma only** — optional |
 
-The project requires **Python 3.11 or newer**.
-
-```bash
-# Check your version
-python --version          # or python3 --version
-
-# Install on Ubuntu/Debian
-sudo apt install python3.11 python3.11-venv python3.11-dev
-
-# Install on macOS (Homebrew)
-brew install python@3.11
-
-# Install on Windows
-# Download from https://www.python.org/downloads/
-# Tick "Add to PATH" during setup
-```
-
-### 1.2 Docker
-
-Docker is required for the sandboxed code execution environment (build and test tiers).
-Without Docker, you can still run in `local` sandbox mode but code runs without isolation.
-
-```bash
-# Ubuntu/Debian
-sudo apt install docker.io
-sudo systemctl enable --now docker
-sudo usermod -aG docker $USER   # run Docker without sudo (re-login after)
-
-# macOS — install Docker Desktop from https://www.docker.com/products/docker-desktop/
-
-# Windows — install Docker Desktop from https://www.docker.com/products/docker-desktop/
-#   Enable WSL2 backend for best performance
-
-# Verify
-docker --version                # Docker version 25.x.x or newer
-docker run --rm hello-world     # should print "Hello from Docker!"
-```
-
-### 1.3 Git
-
-```bash
-git --version    # any modern version is fine
-```
-
-### 1.4 LLM API Key (at least one)
-
-| Provider | Environment Variable | Get Key |
-|----------|---------------------|---------|
-| Anthropic (Claude) — **recommended** | `ANTHROPIC_API_KEY` | https://console.anthropic.com |
-| OpenAI | `OPENAI_API_KEY` | https://platform.openai.com/api-keys |
-| Google Gemini | `GEMINI_API_KEY` | https://aistudio.google.com/app/apikey |
-
-### 1.5 ChromaDB (Vector Database)
-
-ChromaDB runs **in-process** — no separate server is needed. It is installed automatically
-as a Python package and persists its data to a local directory (default: `.chroma/`).
-
-> No extra installation steps are required for ChromaDB.
-
-### 1.6 Redis (optional — API server job queue only)
-
-Redis is only needed when running the **HTTP API server** for background job management.
-It is **not** needed for CLI usage.
-
-```bash
-# Ubuntu/Debian
-sudo apt install redis-server
-sudo systemctl enable --now redis-server
-
-# macOS
-brew install redis
-brew services start redis
-
-# Windows — use the official MSI or run via Docker:
-docker run -d -p 6379:6379 redis:7-alpine
-
-# Verify
-redis-cli ping    # should return PONG
-```
+> **Docker note:** The platform runs generated code (compilers, test suites)
+> inside isolated Docker containers. If you skip Docker with `--sandbox local`
+> the generated code runs directly on your machine — do not use this for
+> untrusted prompts.
 
 ---
 
 ## 2. Installation
 
-### 2.1 Clone the repository
-
 ```bash
-git clone <repository-url>
+# 1. Clone
+git clone <repo-url>
 cd multi-agent-claude
-```
 
-### 2.2 Create and activate a virtual environment
-
-```bash
-# Create
+# 2. Create a virtual environment
 python -m venv .venv
 
-# Activate — Linux / macOS
+# Windows
+.venv\Scripts\activate
+# macOS / Linux
 source .venv/bin/activate
 
-# Activate — Windows (PowerShell)
-.venv\Scripts\Activate.ps1
-
-# Activate — Windows (CMD)
-.venv\Scripts\activate.bat
-```
-
-### 2.3 Install the package and all dependencies
-
-```bash
-# Runtime dependencies + CLI entry-point
+# 3. Install runtime dependencies
 pip install -e .
 
-# Include dev dependencies (linter, type checker, tests)
+# 4. (Optional) Install dev tools — required for running the test suite
 pip install -e ".[dev]"
 ```
 
-This installs:
-
-| Package | Purpose |
-|---------|---------|
-| `anthropic` | Claude LLM client |
-| `openai` | OpenAI LLM client (optional) |
-| `google-generativeai` | Gemini LLM client (optional) |
-| `chromadb` | In-process vector database for semantic code search |
-| `sentence-transformers` | Embedding model (`all-MiniLM-L6-v2`) used by ChromaDB |
-| `docker` | Python SDK for Docker sandbox management |
-| `networkx` | Dependency graph traversal |
-| `fastapi` + `uvicorn` | HTTP API server |
-| `redis` | Background job queue (API mode) |
-| `rich` + `click` | CLI formatting and argument parsing |
-| `tree-sitter` | AST parsing for code stubs |
-| `bandit` | Security scanning agent |
-| `prometheus-client` | Metrics export |
-| `opentelemetry-*` | Distributed tracing |
-| `pydantic` | Settings and data validation |
-
-### 2.4 Pull the Docker sandbox image (recommended)
-
-The sandbox agents execute generated code inside Docker containers.
-Pulling the base image in advance avoids a delay on the first run:
+**Verify the CLI is installed:**
 
 ```bash
-docker pull python:3.11-slim
+codegen --help
+```
+
+Expected output:
+
+```
+Usage: codegen [OPTIONS] COMMAND [ARGS]...
+
+  Multi-Agent Backend Code Generator
+
+Options:
+  -v, --verbose  Enable debug logging
+  --help         Show this message and exit.
+
+Commands:
+  enhance    Modify an existing project based on a natural language prompt.
+  fullstack  Generate a complete fullstack project (backend + frontend)…
+  generate   Generate a backend project from a natural language prompt.
+  status     Show status of a workspace.
 ```
 
 ---
 
 ## 3. Configuration
 
-All settings are read from **environment variables**. Copy the block below into a `.env`
-file in the project root (or export them in your shell).
+### 3.1 API Keys
+
+Set **one** of these before running any command:
 
 ```bash
-# ── LLM Provider ──────────────────────────────────────────────────────────────
-# Choose one provider; set the matching API key.
-LLM_PROVIDER=anthropic                        # anthropic | openai | gemini
-LLM_MODEL=claude-sonnet-4-20250514            # model ID for the chosen provider
+# Anthropic Claude — recommended (highest code quality)
+export ANTHROPIC_API_KEY="sk-ant-api03-..."
 
-ANTHROPIC_API_KEY=sk-ant-...                  # required if LLM_PROVIDER=anthropic
-OPENAI_API_KEY=sk-...                         # required if LLM_PROVIDER=openai
-GEMINI_API_KEY=AI...                          # required if LLM_PROVIDER=gemini
+# OpenAI GPT
+export OPENAI_API_KEY="sk-proj-..."
 
-# ── Workspace ─────────────────────────────────────────────────────────────────
-WORKSPACE_DIR=workspace                       # output directory for generated code
-
-# ── Sandbox ───────────────────────────────────────────────────────────────────
-SANDBOX_TYPE=docker                           # docker | local
-SANDBOX_MEMORY_LIMIT=512m                     # memory cap per container
-SANDBOX_CPU_LIMIT=1.0                         # CPU cores per container
-SANDBOX_TIMEOUT=300                           # seconds before a task is killed
-
-# ── Agent concurrency ─────────────────────────────────────────────────────────
-MAX_CONCURRENT_AGENTS=4                       # 1–16
-
-# ── Vector DB (ChromaDB) ──────────────────────────────────────────────────────
-CHROMA_PERSIST_DIR=.chroma                    # directory for vector store data
-EMBEDDING_MODEL=all-MiniLM-L6-v2             # sentence-transformers model
-
-# ── Context limits ────────────────────────────────────────────────────────────
-MAX_CONTEXT_TOKENS=6000
-MAX_RELATED_FILES=10
-
-# ── Figma UI Generation (Optional) ────────────────────────────────────────────
-MCP_SERVER_COMMAND="npx -y @modelcontextprotocol/server-figma"
-FIGMA_TOKEN="figd_..."                              # Personal Access Token from Figma
-
-# ── Observability ─────────────────────────────────────────────────────────────
-PROMETHEUS_PORT=9090
-OTLP_ENDPOINT=http://localhost:4317           # OpenTelemetry collector endpoint
-# Set to false to disable tracing (useful in dev)
-# ENABLE_TRACING=false
+# Google Gemini
+export GEMINI_API_KEY="AIzaSy..."
 ```
 
-Load a `.env` file automatically (Linux / macOS / Git Bash):
+On Windows (PowerShell):
 
-```bash
-set -a && source .env && set +a
+```powershell
+$env:ANTHROPIC_API_KEY = "sk-ant-api03-..."
 ```
-
-Or use [python-dotenv](https://pypi.org/project/python-dotenv/) if you prefer automatic loading.
-
-### Model IDs reference
-
-| Provider | Recommended Model ID |
-|----------|---------------------|
-| Anthropic | `claude-sonnet-4-20250514` |
-| OpenAI | `gpt-4o` |
-| Gemini | `gemini-1.5-pro` |
 
 ---
 
-## 4. Running with CLI
+### 3.2 Environment File (.env)
 
-The `codegen` command is installed as a script entry-point when you run `pip install -e .`.
-
-### Generate a new project from scratch
+Create a `.env` file in the repo root — it is loaded automatically at startup:
 
 ```bash
-codegen generate "Build a user management REST API with JWT auth, PostgreSQL, and pytest tests"
+# .env
+ANTHROPIC_API_KEY=sk-ant-api03-...
+LLM_PROVIDER=anthropic
+LLM_MODEL=claude-sonnet-4-20250514
+WORKSPACE_DIR=workspace
+SANDBOX_TYPE=docker
+MAX_CONCURRENT_AGENTS=4
 ```
 
-With all options explicit:
+---
+
+### 3.3 Full Environment Variable Reference
 
 ```bash
-codegen generate "Build a user management REST API" \
-  --workspace ./my-project \
-  --provider anthropic \
-  --model claude-sonnet-4-20250514 \
-  --sandbox docker \
-  --max-agents 4
+# ── LLM ──────────────────────────────────────────────────────────────────────
+LLM_PROVIDER=anthropic              # anthropic | openai | gemini
+LLM_MODEL=claude-sonnet-4-20250514  # any model id supported by the provider
+ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-proj-...
+GEMINI_API_KEY=AIza...
+
+# ── Workspace ─────────────────────────────────────────────────────────────────
+WORKSPACE_DIR=workspace             # path to output directory (created if absent)
+
+# ── Sandbox ───────────────────────────────────────────────────────────────────
+SANDBOX_TYPE=docker                 # docker | local
+                                    # local = no isolation, runs on host
+                                    # docker = generated code runs in containers
+
+# ── Execution ─────────────────────────────────────────────────────────────────
+MAX_CONCURRENT_AGENTS=4             # 1–16 parallel agents per tier
+BUILD_CHECKPOINT_RETRIES=3          # compile-and-fix cycles per tier
+PHASE_TIMEOUT_SECONDS=600           # max wall-clock seconds per agent phase
+
+# ── Memory / vector store ─────────────────────────────────────────────────────
+CHROMA_PERSIST_DIR=.chroma          # ChromaDB on-disk persistence directory
+EMBEDDING_MODEL=all-MiniLM-L6-v2    # sentence-transformers model for semantic search
+
+# ── Observability ─────────────────────────────────────────────────────────────
+PROMETHEUS_PORT=9090
+OTLP_ENDPOINT=http://localhost:4317
+ENABLE_TRACING=true                 # OpenTelemetry trace export
+
+# ── Figma (fullstack mode only) ───────────────────────────────────────────────
+FIGMA_TOKEN=figd_...
+MCP_SERVER_COMMAND="npx -y @modelcontextprotocol/server-figma"
 ```
 
-Run without Docker (development / quick testing only — no isolation):
+---
+
+## 4. Generate — New Backend Project
+
+### Minimal example
 
 ```bash
-codegen generate "Hello world FastAPI app" \
+codegen generate "Build a user management REST API with PostgreSQL and JWT auth"
+```
+
+Output appears in `workspace/` (created automatically).
+
+### Specifying a language or framework
+
+```bash
+# Java / Spring Boot
+codegen generate "Build an inventory management API with MySQL" \
+  --provider anthropic
+
+# Go / Gin
+codegen generate "Build a URL shortener service with Redis" \
+  --model claude-sonnet-4-20250514
+
+# TypeScript / NestJS
+codegen generate "Build a notifications microservice with WebSocket support"
+
+# Python / FastAPI
+codegen generate "Build a blog API with PostgreSQL and Alembic migrations"
+```
+
+The language is inferred from the prompt. If you want to force a specific
+language, mention it explicitly: "using Go", "in Rust", "Spring Boot", etc.
+
+### Custom output directory
+
+```bash
+codegen generate "Build a payment service" --workspace ./my-payment-service
+```
+
+### Using OpenAI or Gemini
+
+```bash
+export OPENAI_API_KEY="sk-proj-..."
+codegen generate "Build a REST API" --provider openai --model gpt-4o
+
+export GEMINI_API_KEY="AIza..."
+codegen generate "Build a REST API" --provider gemini --model gemini-2.0-flash
+```
+
+### Skipping phases (for faster iteration)
+
+```bash
+# Skip reviewer only (faster, less safe)
+codegen generate "Build a TODO API" --skip-reviewer
+
+# Skip tests only
+codegen generate "Build a TODO API" --skip-tester
+
+# Skip both (minimal run — architecture + code only)
+codegen generate "Build a TODO API" --skip-reviewer --skip-tester
+```
+
+### Running without Docker
+
+```bash
+# Use this only for development — no sandbox isolation
+codegen generate "Build a TODO API" \
   --sandbox local \
   --allow-host-execution
 ```
 
-Non-interactive mode (no live dashboard — useful in CI):
+> All available flags are listed in [README.md — CLI Reference](README.md#cli-reference).
 
-```bash
-codegen generate "Build a REST API" --no-interactive
+### What gets generated
+
+After a successful run, `workspace/` contains:
+
+```
+workspace/
+  src/                  All source files (language-appropriate layout)
+  tests/                Unit + integration tests
+  Dockerfile            Multi-stage build
+  docker-compose.yml    App + DB
+  k8s/                  Kubernetes manifests
+  security_report.json  OWASP vulnerability scan results
+  docs/
+    README.md           Project documentation (accurate to the code)
+    API.md              Full API reference with request/response examples
+    CHANGELOG.md
+  run_report.json       Execution summary (timing, token cost, stats)
 ```
 
-### Enhance (modify) an existing project
+---
+
+## 5. Enhance — Modify an Existing Repository
+
+`enhance` analyses an existing codebase and applies targeted changes — it does
+NOT rewrite the project from scratch.
+
+### Basic usage
 
 ```bash
-codegen enhance "Add password reset via email and rate limiting" \
-  --workspace ./my-project
+codegen enhance "Add rate limiting to all API endpoints" \
+  --workspace ./my-existing-project
 ```
 
-Pause for human approval before executing the change plan:
+### With human approval of the change plan
+
+Before any file is modified, the agent will display the proposed changes and
+ask for confirmation:
 
 ```bash
-codegen enhance "Refactor database layer to use SQLAlchemy 2.0" \
+codegen enhance "Migrate from SQLAlchemy 1.x to 2.x style" \
   --workspace ./my-project \
   --require-plan-approval
 ```
 
-### Check workspace status
+Output:
 
-```bash
-codegen status                  # checks default workspace
-codegen status ./my-project     # checks a specific workspace
+```
+┌──────────────────────────────────────────────┐
+│  Proposed Changes                            │
+│                                              │
+│  Modify: src/database.py                     │
+│    Reason: Update Session usage to 2.x API  │
+│  Modify: src/repositories/user_repo.py       │
+│    Reason: Replace query() with select()     │
+│  New:    tests/test_db_migration.py          │
+│    Reason: Add migration smoke tests         │
+│                                              │
+│  Proceed? [y/N]                              │
+└──────────────────────────────────────────────┘
 ```
 
-### Global options
+### Example use cases
 
-| Flag | Description |
-|------|-------------|
-| `-v, --verbose` | Enable DEBUG-level logging |
-| `--workspace PATH` | Directory to write generated code (default: `workspace`) |
-| `--provider TEXT` | LLM provider: `anthropic` \| `openai` \| `gemini` |
-| `--model TEXT` | Model ID (must match provider) |
-| `--sandbox TEXT` | Sandbox type: `docker` \| `local` |
-| `--max-agents INT` | Parallel agent limit (1–16, default 4) |
-| `--no-interactive` | Disable live console dashboard |
-| `--allow-host-execution` | Skip Docker requirement (local mode) |
-| `--require-plan-approval` | Pause for approval before enhancement runs |
+```bash
+# Add a feature
+codegen enhance "Add email verification on registration" \
+  --workspace ./user-api
+
+# Fix a bug family
+codegen enhance "Fix all N+1 query issues in the repository layer" \
+  --workspace ./my-api
+
+# Security hardening
+codegen enhance "Add input validation and sanitisation to all endpoints" \
+  --workspace ./my-api
+
+# Refactor
+codegen enhance "Replace raw SQL with SQLAlchemy ORM" \
+  --workspace ./legacy-api
+```
+
+> All available flags are listed in [README.md — CLI Reference](README.md#cli-reference).
 
 ---
 
-## 5. Running the API Server
+## 6. Fullstack — Backend + Frontend
 
-The HTTP API allows you to submit jobs, poll their status, and stream logs.
-Redis must be running (see [Prerequisites](#16-redis-optional--api-server-job-queue-only)).
+`fullstack` generates a complete project: a backend API (same as `generate`)
+**and** a typed React/Next.js/Vue frontend — run in parallel.
+
+### 6.1 Without Figma
+
+```bash
+codegen fullstack "Build a SaaS analytics dashboard with user management, \
+  charts, and a subscription billing page"
+```
+
+The system will:
+1. Plan product requirements (decides it needs frontend + backend)
+2. Design the backend architecture
+3. Generate an OpenAPI contract (FE/BE handshake)
+4. Run the backend pipeline and frontend pipeline **simultaneously**
+
+Output layout:
+
+```
+workspace/
+  backend/
+    src/              Backend source files
+    tests/            Backend tests
+    Dockerfile
+    docker-compose.yml
+    security_report.json
+    docs/
+  frontend/
+    src/
+      components/     React/Vue components (Atomic Design)
+        atoms/
+        molecules/
+        organisms/
+        pages/
+      lib/
+        api.ts        Typed API client (auto-generated from contract)
+      services/       One service file per API tag
+      hooks/          SWR / React-Query hooks
+      store/          Zustand / Redux / Pinia stores
+    package.json      Exact dependencies for npm install
+    .env.local        NEXT_PUBLIC_API_URL etc.
+  run_report.json
+```
+
+### Framework selection
+
+The framework is inferred from the prompt. To be explicit:
+
+```bash
+codegen fullstack "Build a project manager with Next.js 14 App Router \
+  and FastAPI backend"
+
+codegen fullstack "Build a real-time chat app with Vue 3, Pinia, \
+  and NestJS backend"
+
+codegen fullstack "Build a dashboard with React, Zustand, and Spring Boot"
+```
+
+### 6.2 With Figma Import
+
+When a Figma URL is provided the `DesignParserAgent` queries the live Figma
+file via MCP to extract pages, component layout, typography tokens, and colour
+palette — driving the generated component names and styles directly from your
+design.
+
+**Step 1 — Get a Figma personal access token**
+
+In Figma: `Account Settings → Personal access tokens → Generate token`
+
+**Step 2 — Configure MCP**
+
+```bash
+# Install the Figma MCP server (once)
+npm install -g @modelcontextprotocol/server-figma
+
+# Set environment variables
+export FIGMA_TOKEN="figd_..."
+export MCP_SERVER_COMMAND="npx -y @modelcontextprotocol/server-figma"
+```
+
+Or add to `.env`:
+
+```bash
+FIGMA_TOKEN=figd_...
+MCP_SERVER_COMMAND=npx -y @modelcontextprotocol/server-figma
+```
+
+**Step 3 — Run with the Figma URL**
+
+```bash
+codegen fullstack "Build a task tracker based on this design" \
+  --figma-url "https://www.figma.com/file/YOUR_FILE_KEY/Your-Design-Name"
+```
+
+The `--figma-url` flag is also accepted without setting `MCP_SERVER_COMMAND` —
+but in that case the Figma data is not fetched and you get LLM-inferred
+components only.
+
+> All available flags are listed in [README.md — CLI Reference](README.md#cli-reference).
+
+---
+
+## 7. HTTP API Server
+
+Use the REST API to submit generation jobs from scripts, CI pipelines, or a
+custom frontend.
 
 ### Start the server
 
 ```bash
-uvicorn core.api:app --host 0.0.0.0 --port 8000
-```
-
-With auto-reload for development:
-
-```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
 uvicorn core.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-The server is now available at `http://localhost:8000`.
-Interactive docs (Swagger UI): `http://localhost:8000/docs`
+Swagger UI: http://localhost:8000/docs
 
-### API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/generate` | Start a new code generation job |
-| `POST` | `/enhance` | Start a repository enhancement job |
-| `GET` | `/jobs/{job_id}` | Poll job status |
-| `GET` | `/jobs/{job_id}/log` | Stream job logs (Server-Sent Events) |
-| `GET` | `/jobs/{job_id}/report` | Fetch the final run/modify report |
-| `DELETE` | `/jobs/{job_id}` | Cancel a running job |
-| `GET` | `/jobs` | List all jobs |
-| `GET` | `/health` | Health check |
-
-### Example: Generate a project via API
+### Submit a `generate` job
 
 ```bash
-# Submit job
-curl -X POST http://localhost:8000/generate \
+JOB=$(curl -s -X POST http://localhost:8000/generate \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Build a REST API for a todo app with SQLite",
-    "workspace": "workspace",
-    "model": "claude-sonnet-4-20250514",
-    "max_agents": 4
-  }'
-# Response: { "job_id": "abc-123", "status": "queued", ... }
+    "prompt": "Build a REST API with PostgreSQL",
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-20250514"
+  }' | python -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
 
-# Poll status
-curl http://localhost:8000/jobs/abc-123
-
-# Stream logs (Server-Sent Events — keep connection open)
-curl -N http://localhost:8000/jobs/abc-123/log
-
-# Fetch final report once status == "completed"
-curl http://localhost:8000/jobs/abc-123/report
+echo "Job ID: $JOB"
 ```
 
-### Example: Enhance a project via API
+### Submit a `fullstack` job
 
 ```bash
-curl -X POST http://localhost:8000/enhance \
+curl -s -X POST http://localhost:8000/fullstack \
   -H "Content-Type: application/json" \
   -d '{
-    "prompt": "Add Redis caching to all GET endpoints",
-    "workspace": "workspace",
-    "model": "claude-sonnet-4-20250514",
-    "require_plan_approval": false
+    "prompt": "Build a SaaS dashboard with React and FastAPI",
+    "figma_url": ""
   }'
 ```
+
+### Poll for status
+
+```bash
+curl http://localhost:8000/jobs/$JOB
+```
+
+```json
+{
+  "job_id": "abc123",
+  "status": "running",
+  "progress": 0.42,
+  "current_phase": "FE: Component Generation"
+}
+```
+
+### Stream logs (Server-Sent Events)
+
+```bash
+curl -N http://localhost:8000/jobs/$JOB/log
+```
+
+### Fetch the full report when complete
+
+```bash
+curl http://localhost:8000/jobs/$JOB/report
+```
+
+> Full endpoint table: [README.md — HTTP API Server](README.md#http-api-server).
 
 ---
 
-## 6. Running with Docker Compose (full stack)
+## 8. Running with Docker Compose
 
-Docker Compose spins up the app, Redis, Prometheus, and Grafana together.
+The included `deploy/docker-compose.yml` starts the API server, Redis
+(background job queue), Prometheus and Grafana.
 
 ```bash
-cd deploy/
+# Copy the compose file to root (or run from deploy/)
+cd deploy
 
-# Set your API key (required)
-export ANTHROPIC_API_KEY=sk-ant-...
+# Set your API key (required by the compose environment)
+export ANTHROPIC_API_KEY="sk-ant-..."
 
 # Start all services
 docker compose up -d
 
-# Watch logs
+# Tail the API server logs
 docker compose logs -f codegen
-
-# Stop everything
-docker compose down
 ```
 
-Services started:
+**Service URLs after startup:**
 
-| Service | URL | Description |
-|---------|-----|-------------|
-| **codegen** API | http://localhost:8000 | Main application (FastAPI) |
-| **Redis** | localhost:6379 | Job queue |
-| **Prometheus** | http://localhost:9090 | Metrics scraping |
-| **Grafana** | http://localhost:3000 | Dashboards (admin / admin) |
+| Service | URL |
+|---------|-----|
+| API server (Swagger UI) | http://localhost:8000/docs |
+| Prometheus | http://localhost:9090 |
+| Grafana | http://localhost:3000 (admin / admin) |
 
-> The `codegen` container mounts `/var/run/docker.sock` so it can spin up
-> child Docker sandboxes from inside the container (Docker-in-Docker).
+**Mount your own workspace:**
 
----
+```yaml
+# In docker-compose.yml, under the codegen service:
+volumes:
+  - ./my-output:/data/workspace
+```
 
-## 7. Verifying the Setup
+**Stopping:**
 
 ```bash
-# 1. Python version
-python --version                            # Python 3.11.x or newer
-
-# 2. CLI installed
-codegen --help
-
-# 3. Docker available
-docker ps
-
-# 4. API key works (Anthropic example)
-python -c "
-import anthropic, os
-c = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
-print(c.messages.create(model='claude-haiku-4-5-20251001', max_tokens=10,
-    messages=[{'role':'user','content':'ping'}]).content[0].text)
-"
-
-# 5. ChromaDB in-process
-python -c "import chromadb; print('chromadb OK', chromadb.__version__)"
-
-# 6. API server health (if running)
-curl http://localhost:8000/health
-
-# 7. Run the test suite
-pytest tests/ -v
+docker compose down          # stop containers
+docker compose down -v       # stop + delete all volumes
 ```
 
 ---
 
-## 8. Troubleshooting
-
-### `codegen: command not found`
-
-The virtual environment is not active or the package is not installed.
+## 9. Running the Test Suite
 
 ```bash
-source .venv/bin/activate     # activate venv
-pip install -e .              # reinstall
+# Full suite (409 tests)
+pytest tests/
+
+# Stop on first failure with short traceback
+pytest tests/ -x --tb=short
+
+# Specific module
+pytest tests/test_pipeline_executor.py -v
+
+# With coverage report
+pytest tests/ --cov=. --cov-report=term-missing
+
+# Skip slow integration tests (if tagged)
+pytest tests/ -m "not slow"
 ```
 
-### `docker: permission denied`
+All LLM calls are mocked — no API key is needed to run the test suite.
+No Docker daemon is needed — sandbox calls are mocked.
 
-Add your user to the `docker` group and re-login:
+---
+
+## 10. Verifying a Generated Workspace
+
+After `generate` or `fullstack` completes, use the `status` command:
 
 ```bash
-sudo usermod -aG docker $USER
-# Log out and log back in, then:
-docker ps
+codegen status workspace/
 ```
 
-### `LLMConfigError: ANTHROPIC_API_KEY not set`
+Output:
 
-Export the key before running:
+```
+         Workspace: workspace/
+┌──────────────────────────┬────────┐
+│ File                     │ Exists │
+├──────────────────────────┼────────┤
+│ architecture.md          │ Yes    │
+│ file_blueprints.json     │ Yes    │
+│ dependency_graph.json    │ Yes    │
+│ repo_index.json          │ Yes    │
+│ Source files             │ 18     │
+│ Test files               │ 14     │
+│ Deploy artifacts         │ 5      │
+└──────────────────────────┴────────┘
+```
+
+Also check `workspace/run_report.json` for the full execution summary:
+
+```json
+{
+  "success": true,
+  "code_success": true,
+  "tests_passed": 14,
+  "tasks_completed": 18,
+  "tasks_failed": 0,
+  "elapsed_seconds": 187.4,
+  "checkpoint_results": [...],
+  "blueprint": { ... }
+}
+```
+
+---
+
+## 11. Troubleshooting
+
+### `LLMConfigError: No API key found for provider 'anthropic'`
+
+You have not set the API key environment variable. Set it and re-run:
 
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-codegen generate "..."
+export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-### ChromaDB / embedding model slow on first run
+Or add it to `.env` in the repo root.
 
-The `all-MiniLM-L6-v2` model (~90 MB) is downloaded from HuggingFace on the first
-run and cached locally. Subsequent runs are instant. Ensure you have internet access
-on first launch.
+---
 
-### `SandboxUnavailableError: Docker not available`
+### `docker: command not found` / `Cannot connect to Docker daemon`
 
-Either Docker is not running or the socket is not accessible. Start Docker and verify:
+Docker is not installed or the daemon is not running.
+
+- Install Docker Desktop from https://www.docker.com/products/docker-desktop
+- Start Docker Desktop, then re-run
+- Or use `--sandbox local --allow-host-execution` to bypass Docker (no isolation)
+
+---
+
+### `tsc: command not found` (fullstack mode only)
+
+TypeScript compiler is not on `PATH`. The platform will skip the TS
+compilation check and continue. To enable it:
 
 ```bash
-sudo systemctl start docker
-docker ps
+npm install -g typescript
 ```
 
-Or bypass Docker with local sandbox (no isolation — development only):
+---
+
+### Build checkpoint keeps failing for Java / Go
+
+Increase the retry limit:
 
 ```bash
-codegen generate "..." --sandbox local --allow-host-execution
+BUILD_CHECKPOINT_RETRIES=5 codegen generate "..."
 ```
 
-### Redis connection refused (API server)
-
-Start Redis before launching the API server:
+Or increase the phase timeout for slow machines:
 
 ```bash
-sudo systemctl start redis-server    # Linux
-brew services start redis             # macOS
-# or via Docker:
-docker run -d -p 6379:6379 redis:7-alpine
+PHASE_TIMEOUT_SECONDS=900 codegen generate "..."
 ```
 
-### Slow first run (Docker image pull)
+---
 
-Pull the sandbox image in advance:
+### Figma import returns empty `UIDesignSpec`
+
+1. Verify `FIGMA_TOKEN` is set and has read access to the file
+2. Verify `MCP_SERVER_COMMAND` is set (`npx -y @modelcontextprotocol/server-figma`)
+3. Verify the Figma URL format: `https://www.figma.com/file/<FILE_KEY>/...`
+4. Check logs for `Failed to initialize MCP client` — this usually means the MCP npm package is not installed
+
+---
+
+### `ChromaDB` / embedding model slow on first run
+
+On the first run, `sentence-transformers` downloads `all-MiniLM-L6-v2`
+(~22 MB). Subsequent runs use the local cache. Set `HF_HOME` to control
+where the model is cached:
 
 ```bash
-docker pull python:3.11-slim
+export HF_HOME=/path/to/fast/disk/.cache/huggingface
 ```
 
-### Out of memory during generation
+---
 
-Reduce concurrency or increase the container memory limit:
+### Agent stuck / pipeline hangs
+
+If a phase exceeds `PHASE_TIMEOUT_SECONDS` the file is marked `FAILED` and
+the pipeline continues. If the whole run appears frozen:
+
+1. Check the live dashboard (Rich progress bars) — it shows which phase each file is in
+2. Use `--no-interactive` to get plain log output which is easier to inspect in CI
+3. Reduce `--max-agents` to 1 to serialise execution and see clearer logs:
 
 ```bash
-MAX_CONCURRENT_AGENTS=2 SANDBOX_MEMORY_LIMIT=1g codegen generate "..."
+codegen generate "..." --max-agents 1 --no-interactive -v
 ```
+
+---
+
+### Running in CI / GitHub Actions
+
+```yaml
+- name: Generate project
+  env:
+    ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  run: |
+    pip install -e .
+    codegen generate "Build a REST API with tests" \
+      --sandbox local \
+      --allow-host-execution \
+      --no-interactive \
+      --skip-tester
+```
+
+Use `--sandbox local` in CI unless your runner has Docker available.
+Use `--no-interactive` to disable the Rich live dashboard (not compatible with
+non-TTY environments).
+

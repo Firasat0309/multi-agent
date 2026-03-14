@@ -843,22 +843,31 @@ class PipelineExecutor:
             files_fixed=files_fixed,
         )
 
-    async def _dispatch_checkpoint_fix(
+    async def _dispatch_fix(
         self,
-        engine: LifecycleEngine,
         file_path: str,
         fix_context: dict[str, Any],
-    ) -> None:
-        """Dispatch a single fix task for a checkpoint build error."""
-        from core.context_builder import ContextBuilder
+        *,
+        label: str = "Checkpoint",
+    ) -> bool:
+        """Dispatch a single fix task — shared by build and test checkpoints.
 
-        lc = engine.get_lifecycle(file_path)
+        Builds context, creates a FIX_CODE agent, executes it, and updates
+        metrics + embeddings.  Returns True if the fix succeeded.
+
+        Args:
+            file_path: The workspace-relative path of the file to fix.
+            fix_context: Metadata dict passed as ``task.metadata`` to the agent.
+            label: Logging prefix for checkpoint identification.
+        """
+        from core.context_builder import ContextBuilder
+        from core.observability import record_agent_start, record_agent_end
 
         task = Task(
             task_id=0,
             task_type=TaskType.FIX_CODE,
             file=file_path,
-            description=f"Fix build errors in {file_path}",
+            description=f"Fix errors in {file_path}",
             metadata=fix_context,
         )
 
@@ -873,7 +882,6 @@ class PipelineExecutor:
 
         try:
             agent = self._am._create_agent(TaskType.FIX_CODE)
-            from core.observability import record_agent_start, record_agent_end
             record_agent_start()
             try:
                 result = await agent.execute(context)
@@ -883,12 +891,14 @@ class PipelineExecutor:
             agent_name = agent.role.value
             if agent_name not in self._am._metrics["agent_metrics"]:
                 self._am._metrics["agent_metrics"][agent_name] = []
-            self._am._metrics["agent_metrics"][agent_name].append(agent.get_metrics())
+            metrics_list = self._am._metrics["agent_metrics"][agent_name]
+            metrics_list.append(agent.get_metrics())
+            if len(metrics_list) > 100:
+                metrics_list.pop(0)
 
             if result.success:
                 self._am._metrics["tasks_completed"] += 1
-                logger.info("[Checkpoint] Fixed build errors in %s", file_path)
-                # Update embeddings
+                logger.info("[%s] Fixed errors in %s", label, file_path)
                 if self._am._embedding_store and result.files_modified:
                     for fp in result.files_modified:
                         try:
@@ -896,19 +906,35 @@ class PipelineExecutor:
                             self._am._embedding_store.index_file(fp, content)
                         except Exception as exc:
                             logger.warning(
-                                "[Checkpoint] Embedding update failed for %s: %s "
+                                "[%s] Embedding update failed for %s: %s "
                                 "— semantic index may be stale",
-                                fp, exc,
+                                label, fp, exc,
                             )
+                return True
             else:
                 self._am._metrics["tasks_failed"] += 1
                 logger.warning(
-                    "[Checkpoint] Fix attempt failed for %s: %s",
-                    file_path, result.errors,
+                    "[%s] Fix attempt failed for %s: %s",
+                    label, file_path, result.errors,
                 )
+                return False
         except Exception:
-            logger.exception("[Checkpoint] Error fixing %s", file_path)
+            logger.exception("[%s] Error fixing %s", label, file_path)
             self._am._metrics["tasks_failed"] += 1
+            return False
+
+    async def _dispatch_checkpoint_fix(
+        self,
+        engine: LifecycleEngine,
+        file_path: str,
+        fix_context: dict[str, Any],
+    ) -> None:
+        """Dispatch a single fix task for a checkpoint build error.
+
+        Thin wrapper around ``_dispatch_fix`` — preserved for backward
+        compatibility with callers that pass the ``engine`` argument.
+        """
+        await self._dispatch_fix(file_path, fix_context, label="Checkpoint")
 
     # ── Test phase ───────────────────────────────────────────────────────
 
@@ -1068,31 +1094,7 @@ class PipelineExecutor:
 
                     async def _fix_test_file(fp: str, ctx: dict[str, Any]) -> None:
                         async with sem:
-                            task = Task(
-                                task_id=0,
-                                task_type=TaskType.FIX_CODE,
-                                file=fp,
-                                description=f"Fix test failures in {fp}",
-                                metadata=ctx,
-                            )
-                            from core.context_builder import ContextBuilder
-                            context_builder = ContextBuilder(
-                                workspace_dir=self._am.repo.workspace,
-                                blueprint=self._am.blueprint,
-                                repo_index=self._am.repo.get_repo_index(),
-                                dep_store=self._am._dep_store,
-                                embedding_store=self._am._embedding_store,
-                            )
-                            context = context_builder.build(task)
-                            try:
-                                agent = self._am._create_agent(TaskType.FIX_CODE)
-                                fix_result = await agent.execute(context)
-                                if fix_result.success:
-                                    logger.info("[TestCheckpoint] Fixed %s", fp)
-                                else:
-                                    logger.warning("[TestCheckpoint] Fix failed: %s", fp)
-                            except Exception:
-                                logger.exception("[TestCheckpoint] Error fixing %s", fp)
+                            await self._dispatch_fix(fp, ctx, label="TestCheckpoint")
 
                     fix_tasks_list.append(
                         asyncio.create_task(_fix_test_file(file_path, fix_ctx))

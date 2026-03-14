@@ -240,12 +240,6 @@ class FileLifecycle:
             self.test_errors = data.get("errors", "")
 
             if self.test_fix_count > self.max_test_fixes:
-                # Test fixes exhausted — mark FAILED, not PASSED.
-                # Code with broken tests should not be reported as success.
-                new_phase = FilePhase.FAILED
-                self.fix_trigger = ""
-                logger.warning(
-                    "%s: test fix limit (%d) reached — marking as failed",
                 # Tests never fully passed — mark DEGRADED so the pipeline
                 # reports a quality warning rather than a false clean success.
                 new_phase = FilePhase.DEGRADED
@@ -261,11 +255,6 @@ class FileLifecycle:
             self.build_errors = data.get("errors", "")
 
             if self.build_fix_count > self.max_build_fixes:
-                # Build fixes exhausted — file does not compile, mark FAILED.
-                new_phase = FilePhase.FAILED
-                self.fix_trigger = ""
-                logger.warning(
-                    "%s: build fix limit (%d) reached — marking as failed",
                 # Build never fully resolved — mark DEGRADED so the pipeline
                 # reports a quality warning rather than a false clean success.
                 new_phase = FilePhase.DEGRADED

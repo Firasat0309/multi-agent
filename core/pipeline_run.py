@@ -125,6 +125,7 @@ class RunPipeline:
             )
 
         lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
+        try:
             logger.info(
                 "Blueprint: %s | Language: %s | %d files",
                 blueprint.name, lang_profile.display_name, len(blueprint.file_blueprints),
@@ -241,7 +242,16 @@ class RunPipeline:
                 lifecycle_engine.checkpoint_mode = True
 
             try:
-                exec_result = await agent_manager.execute_with_checkpoints(
+                from core.pipeline_executor import PipelineExecutor
+                
+                executor = PipelineExecutor(
+                    agent_manager=agent_manager,
+                    settings=self._settings,
+                    lang_profile=lang_profile,
+                    event_bus=event_bus,
+                )
+                
+                exec_result = await executor.execute(
                     lifecycle_engine,
                     global_graph,
                     tiers=tiers,

@@ -340,7 +340,16 @@ class EnhancePipeline:
         try:
             async with WorkspaceSnapshot(self._settings.workspace_dir) as snap:
                 try:
-                    exec_result = await agent_manager.execute_with_checkpoints(
+                    from core.pipeline_executor import PipelineExecutor
+                    
+                    executor = PipelineExecutor(
+                        agent_manager=agent_manager,
+                        settings=self._settings,
+                        lang_profile=lang_profile,
+                        event_bus=event_bus,
+                    )
+                    
+                    exec_result = await executor.execute(
                         lifecycle_engine,
                         global_graph,
                         tiers=tiers,
