@@ -116,7 +116,6 @@ class FileLifecycle:
         *,
         max_review_fixes: int = 2,
         max_test_fixes: int = 3,
-        max_build_fixes: int = 3,
         max_build_fixes: int = 2,
         generation_task_type: str = "generate_file",
         change_metadata: dict[str, Any] | None = None,
