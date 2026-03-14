@@ -226,9 +226,9 @@ class AgentManager:
         file_path: str,
         phase: Any,
     ) -> None:
-        """Execute one lifecycle phase — kept for backward compatibility with tests.
+        """Execute one lifecycle phase for a single file.
 
-        Delegates to :class:`~core.lifecycle_orchestrator.LifecycleOrchestrator`.
+        Kept as a dedicated hook for backward compatibility with tests.
         """
         lc = engine.get_lifecycle(file_path)
 
