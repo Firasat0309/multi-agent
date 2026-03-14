@@ -968,12 +968,6 @@ class PipelineExecutor:
                         path,
                     )
                     engine.process_event(path, EventType.RETRIES_EXHAUSTED)
-                    # Auto-transition to TESTING
-                    engine.process_event(path, EventType.BUILD_PASSED)
-                    new_phase = lc.phase
-                    if new_phase in (FilePhase.TESTING, FilePhase.PASSED, FilePhase.DEGRADED):
-                        if new_phase == FilePhase.TESTING:
-                            actionable.append((path, new_phase))
 
             for path, phase in actionable:
                 if path in in_flight:
