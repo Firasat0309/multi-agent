@@ -248,10 +248,14 @@ class PipelineExecutor:
                     "=== Phase '%s' skipped (--skip-tester) ===", phase.name,
                 )
                 # Move testable files straight to PASSED so they don't end
-                # up stuck in TESTING/BUILDING.
+                # up stuck in TESTING/BUILDING. Respect the state machine by
+                # transitioning BUILDING → TESTING → PASSED.
                 for path in list(engine._lifecycles.keys()):
                     lc = engine.get_lifecycle(path)
-                    if lc.phase in (FilePhase.BUILDING, FilePhase.TESTING):
+                    if lc.phase == FilePhase.BUILDING:
+                        engine.process_event(path, EventType.BUILD_PASSED)
+                        engine.process_event(path, EventType.TEST_PASSED)
+                    elif lc.phase == FilePhase.TESTING:
                         engine.process_event(path, EventType.TEST_PASSED)
                 continue
             # Checkpoints are only meaningful for compiled languages.
