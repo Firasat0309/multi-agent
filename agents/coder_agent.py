@@ -44,7 +44,7 @@ def _has_duplicate_definitions(content: str, language: str) -> bool:
         "typescript": _re.compile(r"^(?:export\s+)?(?:class|interface|enum|function|const|type)\s+(\w+)", _re.MULTILINE),
         "go": _re.compile(r"^(?:func|type)\s+(\w+)", _re.MULTILINE),
         "csharp": _re.compile(r"^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:class|interface|enum|struct|record)\s+(\w+)", _re.MULTILINE),
-        "rust": _re.compile(r"^(?:pub\s+)?(?:fn|struct|enum|trait|type|impl)\s+(\w+)", _re.MULTILINE),
+        "rust": _re.compile(r"^(?:pub\s+)?(?:fn|struct|enum|trait|type)\s+(\w+)", _re.MULTILINE),
     }
     pattern = patterns.get(language)
     if not pattern:
