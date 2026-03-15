@@ -261,8 +261,11 @@ FRONTEND_PIPELINE = PipelineDefinition(
                     max_review_fixes=0,
                 ),
             ],
-            # Frontend components are interpreted TypeScript — no compile checkpoint
-            checkpoint=None,
+            checkpoint=CheckpointDef(
+                name="tsx_compilation",
+                max_retries=2,
+                timeout=120,
+            ),
             skip_for_interpreted=False,
         ),
     ],

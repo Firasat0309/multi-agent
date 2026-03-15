@@ -5,21 +5,22 @@ from __future__ import annotations
 import asyncio
 import copy
 import dataclasses
+import json as _json
 import logging
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agents.design_parser_agent import DesignParserAgent
 from agents.component_planner_agent import ComponentPlannerAgent
 from agents.component_dag_agent import ComponentDAGAgent
-from agents.component_generator_agent import ComponentGeneratorAgent
-from agents.api_integration_agent import APIIntegrationAgent
-from agents.state_management_agent import StateManagementAgent
 from config.settings import Settings
+from core.agent_manager import AgentManager
+from core.event_bus import EventBus, AgentEvent, BusEventType
 from core.import_validator import ImportValidator
-from core.llm_client import LLMClient
-from core.tsx_compiler import TSXCompiler
+from core.language import detect_language_from_blueprint
+from core.llm_client import LLMClient, calculate_cost
 from core.models import (
     APIContract,
     ComponentPlan,
@@ -28,11 +29,16 @@ from core.models import (
     RepositoryBlueprint,
     Task,
     TaskType,
+    TokenCost,
     UIDesignSpec,
     AgentContext,
 )
+from core.pipeline_definition import FRONTEND_PIPELINE
 from core.repository_manager import RepositoryManager
+from core.sandbox_orchestrator import SandboxOrchestrator, SandboxUnavailableError
+from core.tsx_compiler import TSXCompiler
 from core.workspace_indexer import index_workspace
+from memory.dependency_graph import DependencyGraphStore
 from memory.embedding_store import EmbeddingStore
 from core.mcp_client import MCPClient
 
@@ -51,11 +57,9 @@ class FrontendPipeline:
       2. Component Planning  — decompose design into a ComponentPlan
       3. DAG Building        — topological sort of component dependencies
       4. Component Generation— generate source code per component (tiers)
+      4.5 TSX Compilation    — type-check with fix-retry loop
       5. API Integration     — typed API client + SWR/React-Query hooks
       6. State Management    — Zustand/Redux/Pinia store layer
-
-    The pipeline is intentionally self-contained: it does NOT depend on
-    the backend RunPipeline and can be run standalone or in parallel.
     """
 
     def __init__(
@@ -112,6 +116,9 @@ class FrontendPipeline:
                 logger.error("Failed to initialize MCP client in frontend pipeline: %e", e)
                 mcp_client = None
 
+        # ── Sandbox setup ─────────────────────────────────────────────────────
+        sandbox: SandboxOrchestrator | None = None
+
         try:
             # ── Phase 1: Design Parsing ───────────────────────────────────────────
             self._phase("FE: Design Parsing", "running")
@@ -161,224 +168,458 @@ class FrontendPipeline:
         # ── Write package.json and .env.local ─────────────────────────────────
         self._write_config_files(workspace, component_plan, requirements)
 
-        # ── Phase 3: Component DAG ────────────────────────────────────────────
-        self._phase("FE: Component DAG", "running")
-        logger.info("[FE Phase 3] Building component dependency graph...")
-        ordered_components = component_plan.components  # default linear order
-        tier_map: dict[str, int] = {}
+        # ── Sandbox + AgentManager setup ──────────────────────────────────────
+        lang_profile = detect_language_from_blueprint(frontend_blueprint.tech_stack)
+
+        sandbox = SandboxOrchestrator(self._settings)
         try:
-            dag_agent = ComponentDAGAgent(llm_client=self._llm, repo_manager=repo_manager)
-            ordered_components, tier_map = dag_agent.build_dag(component_plan)
-            logger.info(
-                "DAG: %d components across %d tiers",
-                len(ordered_components),
-                max(tier_map.values()) + 1 if tier_map else 1,
-            )
-            self._complete_phase("FE: Component DAG")
-        except Exception as exc:
-            logger.exception("Component DAG construction failed")
-            errors.append(f"Component DAG failed: {exc}")
-            self._fail_phase("FE: Component DAG", str(exc))
-            # Non-fatal: fall back to planner order
-
-        # ── Phase 4: Component Generation (tier-by-tier) ──────────────────────
-        self._phase("FE: Component Generation", "running")
-
-        # Detect ghost dependencies — components referenced in depends_on but
-        # not present in the plan — and synthesize minimal stubs so they are
-        # generated rather than left as empty nodes in the dependency graph.
-        planned_names = {c.name for c in ordered_components}
-        ghost_components = self._find_ghost_dependencies(ordered_components, planned_names)
-        if ghost_components:
-            logger.info(
-                "[FE Phase 4] Adding %d unplanned dependency stubs: %s",
-                len(ghost_components),
-                [c.name for c in ghost_components],
-            )
-            # Ghosts go in tier 0 (no dependencies of their own)
-            for gc in ghost_components:
-                tier_map[gc.name] = 0
-            ordered_components = list(ghost_components) + list(ordered_components)
-            # Rebuild the blueprint to include ghost paths
-            frontend_blueprint = self._make_frontend_blueprint(requirements, component_plan)
-        max_tier = max(tier_map.values()) + 1 if tier_map else 1
-
-        logger.info("[FE Phase 4] Generating %d components...", len(ordered_components))
-        generator = ComponentGeneratorAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
-        gen_errors: list[str] = []
-
-        for tier_idx in range(max_tier):
-            tier_components = [
-                c for c in ordered_components
-                if tier_map.get(c.name, 0) == tier_idx
-            ] if tier_map else (
-                ordered_components if tier_idx == 0 else []
+            sb = await sandbox.setup(lang_profile)
+        except SandboxUnavailableError as e:
+            self._fail_phase("FE: Sandbox Setup", str(e))
+            return PipelineResult(
+                success=False,
+                workspace_path=workspace,
+                blueprint=frontend_blueprint,
+                errors=[str(e)],
+                elapsed_seconds=time.monotonic() - start_time,
             )
 
-            # Run all components within the same tier concurrently
-            tasks_coros = [
-                generator.execute(
-                    AgentContext(
-                        task=Task(
-                            task_id=i,
-                            task_type=TaskType.GENERATE_COMPONENT,
-                            file=comp.file_path,
-                            description=f"Generate {comp.name} component",
-                            metadata={
-                                "component": comp,
-                                "component_plan": component_plan,
-                                "api_contract": api_contract,
-                            },
-                        ),
-                        blueprint=frontend_blueprint,
+        event_bus = EventBus()
+        dep_store = DependencyGraphStore(workspace)
+
+        agent_manager = AgentManager(
+            settings=self._settings,
+            llm_client=self._llm,
+            repo_manager=repo_manager,
+            blueprint=frontend_blueprint,
+            live_console=self._live,
+            sandbox_manager=sb.manager,
+            build_sandbox_id=sb.build_id,
+            test_sandbox_id=sb.test_id,
+            dep_store=dep_store,
+            embedding_store=_fe_embedding_store,
+            event_bus=event_bus,
+            mcp_client=mcp_client,
+        )
+
+        try:
+            # ── Phase 3: Component DAG ────────────────────────────────────────────
+            self._phase("FE: Component DAG", "running")
+            logger.info("[FE Phase 3] Building component dependency graph...")
+            ordered_components = component_plan.components  # default linear order
+            tier_map: dict[str, int] = {}
+            try:
+                dag_agent = ComponentDAGAgent(llm_client=self._llm, repo_manager=repo_manager)
+                ordered_components, tier_map = dag_agent.build_dag(component_plan)
+                logger.info(
+                    "DAG: %d components across %d tiers",
+                    len(ordered_components),
+                    max(tier_map.values()) + 1 if tier_map else 1,
+                )
+                self._complete_phase("FE: Component DAG")
+            except Exception as exc:
+                logger.exception("Component DAG construction failed")
+                errors.append(f"Component DAG failed: {exc}")
+                self._fail_phase("FE: Component DAG", str(exc))
+                # Non-fatal: fall back to planner order
+
+            # ── Phase 4: Component Generation (tier-by-tier) ──────────────────────
+            self._phase("FE: Component Generation", "running")
+
+            # Detect ghost dependencies — components referenced in depends_on but
+            # not present in the plan — and synthesize minimal stubs so they are
+            # generated rather than left as empty nodes in the dependency graph.
+            planned_names = {c.name for c in ordered_components}
+            ghost_components = self._find_ghost_dependencies(ordered_components, planned_names)
+            if ghost_components:
+                logger.info(
+                    "[FE Phase 4] Adding %d unplanned dependency stubs: %s",
+                    len(ghost_components),
+                    [c.name for c in ghost_components],
+                )
+                # Ghosts go in tier 0 (no dependencies of their own)
+                for gc in ghost_components:
+                    tier_map[gc.name] = 0
+                ordered_components = list(ghost_components) + list(ordered_components)
+                # Rebuild the blueprint to include ghost paths
+                frontend_blueprint = self._make_frontend_blueprint(requirements, component_plan)
+            max_tier = max(tier_map.values()) + 1 if tier_map else 1
+
+            logger.info("[FE Phase 4] Generating %d components...", len(ordered_components))
+            generator = agent_manager._create_agent(TaskType.GENERATE_COMPONENT)
+            gen_errors: list[str] = []
+
+            for tier_idx in range(max_tier):
+                tier_components = [
+                    c for c in ordered_components
+                    if tier_map.get(c.name, 0) == tier_idx
+                ] if tier_map else (
+                    ordered_components if tier_idx == 0 else []
+                )
+
+                # Run all components within the same tier concurrently
+                tasks_coros = [
+                    generator.execute(
+                        AgentContext(
+                            task=Task(
+                                task_id=i,
+                                task_type=TaskType.GENERATE_COMPONENT,
+                                file=comp.file_path,
+                                description=f"Generate {comp.name} component",
+                                metadata={
+                                    "component": comp,
+                                    "component_plan": component_plan,
+                                    "api_contract": api_contract,
+                                },
+                            ),
+                            blueprint=frontend_blueprint,
+                        )
                     )
+                    for i, comp in enumerate(tier_components)
+                ]
+                results = await asyncio.gather(*tasks_coros, return_exceptions=True)
+                for comp, res in zip(tier_components, results):
+                    if isinstance(res, Exception):
+                        gen_errors.append(f"{comp.name}: {res}")
+                        logger.error("Component generation failed for %s: %s", comp.name, res)
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_FAILED,
+                            task_type=TaskType.GENERATE_COMPONENT.value,
+                            file_path=comp.file_path,
+                            agent_name="ComponentGeneratorAgent",
+                            data={"error": str(res)},
+                        ))
+                    elif not res.success:
+                        gen_errors.append(f"{comp.name}: {'; '.join(res.errors)}")
+                        logger.warning("Component generation incomplete for %s", comp.name)
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_FAILED,
+                            task_type=TaskType.GENERATE_COMPONENT.value,
+                            file_path=comp.file_path,
+                            agent_name="ComponentGeneratorAgent",
+                            data={"errors": res.errors},
+                        ))
+                    else:
+                        logger.debug("Generated component: %s", comp.file_path)
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_COMPLETED,
+                            task_type=TaskType.GENERATE_COMPONENT.value,
+                            file_path=comp.file_path,
+                            agent_name="ComponentGeneratorAgent",
+                        ))
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.FILE_WRITTEN,
+                            file_path=comp.file_path,
+                            agent_name="ComponentGeneratorAgent",
+                        ))
+
+            if gen_errors:
+                errors.extend(gen_errors)
+                logger.warning("%d component generation errors", len(gen_errors))
+            metrics["components_generated"] = len(ordered_components) - len(gen_errors)
+            self._complete_phase("FE: Component Generation")
+
+            # ── Phase 4.5: TSX Compilation Check with Fix-Retry ───────────────────
+            self._phase("FE: TypeScript Compilation", "running")
+            logger.info("[FE Phase 4.5] Running TypeScript compilation check...")
+            tsx_compiler = TSXCompiler()
+            checkpoint_def = FRONTEND_PIPELINE.phases[0].checkpoint
+            max_fix_retries = checkpoint_def.max_retries if checkpoint_def else 2
+
+            compile_result = await tsx_compiler.check(workspace)
+            tsx_build_passed = True
+
+            if not compile_result.tsc_available:
+                logger.info(
+                    "[FE Phase 4.5] tsc not on PATH — skipping TypeScript compilation check"
                 )
-                for i, comp in enumerate(tier_components)
-            ]
-            results = await asyncio.gather(*tasks_coros, return_exceptions=True)
-            for comp, res in zip(tier_components, results):
-                if isinstance(res, Exception):
-                    gen_errors.append(f"{comp.name}: {res}")
-                    logger.error("Component generation failed for %s: %s", comp.name, res)
-                elif not res.success:
-                    gen_errors.append(f"{comp.name}: {'; '.join(res.errors)}")
-                    logger.warning("Component generation incomplete for %s", comp.name)
+            elif compile_result.errors:
+                # Fix-retry loop: group errors by file, dispatch FIX_CODE tasks
+                for retry in range(max_fix_retries):
+                    logger.warning(
+                        "[FE Phase 4.5] %d TSX error(s) — fix attempt %d/%d",
+                        len(compile_result.errors), retry + 1, max_fix_retries,
+                    )
+                    # Group errors by file
+                    errors_by_file: dict[str, list[str]] = defaultdict(list)
+                    for err in compile_result.errors:
+                        errors_by_file[err.file].append(
+                            f"{err.file}:{err.line}: [{err.code}] {err.message}"
+                        )
+
+                    # Dispatch fix tasks for each affected file
+                    fix_coros = []
+                    for file_path, file_errors in errors_by_file.items():
+                        fix_agent = agent_manager._create_agent(TaskType.FIX_CODE)
+                        fix_ctx = AgentContext(
+                            task=Task(
+                                task_id=10000 + retry * 100 + len(fix_coros),
+                                task_type=TaskType.FIX_CODE,
+                                file=file_path,
+                                description=f"Fix TSX compilation errors in {file_path}",
+                                metadata={
+                                    "fix_trigger": "build",
+                                    "build_errors": "\n".join(file_errors),
+                                },
+                            ),
+                            blueprint=frontend_blueprint,
+                        )
+                        fix_coros.append(fix_agent.execute(fix_ctx))
+
+                    fix_results = await asyncio.gather(*fix_coros, return_exceptions=True)
+                    for fix_res in fix_results:
+                        if isinstance(fix_res, Exception):
+                            logger.error("Fix task failed: %s", fix_res)
+
+                    # Re-check compilation
+                    compile_result = await tsx_compiler.check(workspace)
+                    if not compile_result.errors:
+                        logger.info("[FE Phase 4.5] TSX compilation passed after %d fix(es)", retry + 1)
+                        break
                 else:
-                    logger.debug("Generated component: %s", comp.file_path)
+                    # Exhausted retries
+                    tsx_build_passed = False
 
-        if gen_errors:
-            errors.extend(gen_errors)
-            logger.warning("%d component generation errors", len(gen_errors))
-        metrics["components_generated"] = len(ordered_components) - len(gen_errors)
-        self._complete_phase("FE: Component Generation")
+                if compile_result.errors:
+                    metrics["tsx_compile_errors"] = len(compile_result.errors)
+                    for err in compile_result.errors:
+                        errors.append(
+                            f"TSX compile error {err.file}:{err.line}: [{err.code}] {err.message}"
+                        )
+                    logger.warning(
+                        "[FE Phase 4.5] %d TSX error(s) remain after %d retries",
+                        len(compile_result.errors), max_fix_retries,
+                    )
+            else:
+                logger.info("[FE Phase 4.5] TypeScript compilation passed")
 
-        # ── Phase 4.5: TypeScript Compilation Check ───────────────────────────
-        self._phase("FE: TypeScript Compilation", "running")
-        logger.info("[FE Phase 4.5] Running TypeScript compilation check...")
-        tsx_compiler = TSXCompiler()
-        compile_result = await tsx_compiler.check(workspace)
-        if not compile_result.tsc_available:
-            logger.info(
-                "[FE Phase 4.5] tsc not on PATH — skipping TypeScript compilation check"
-            )
-        elif compile_result.errors:
-            metrics["tsx_compile_errors"] = len(compile_result.errors)
-            for err in compile_result.errors:
-                errors.append(
-                    f"TSX compile error {err.file}:{err.line}: [{err.code}] {err.message}"
-                )
-            logger.warning(
-                "[FE Phase 4.5] %d TypeScript compile error(s)", len(compile_result.errors)
-            )
-        else:
-            logger.info("[FE Phase 4.5] TypeScript compilation passed")
-        self._complete_phase("FE: TypeScript Compilation")
-
-        # ── Phase 4.6: Cross-component import validation ───────────────────────
-        self._phase("FE: Import Validation", "running")
-        logger.info("[FE Phase 4.6] Validating cross-component imports...")
-        import_errors = self._validate_component_imports(workspace, ordered_components)
-        if import_errors:
-            metrics["import_errors"] = len(import_errors)
-            errors.extend(import_errors)
-            logger.warning("[FE Phase 4.6] %d unresolved import(s)", len(import_errors))
-        else:
-            logger.info("[FE Phase 4.6] All component imports resolved")
-        self._complete_phase("FE: Import Validation")
-
-        # ── Phase 5: API Integration ──────────────────────────────────────────
-        self._phase("FE: API Integration", "running")
-        logger.info("[FE Phase 5] Generating API client layer...")
-        try:
-            integrator = APIIntegrationAgent(llm_client=self._llm, repo_manager=repo_manager)
-            api_ctx = AgentContext(
-                task=Task(
-                    task_id=9000,
-                    task_type=TaskType.INTEGRATE_API,
-                    file="src/lib/api.ts",
-                    description="Generate typed API client and hooks",
-                    metadata={
-                        "api_contract": api_contract,
-                        "component_plan": component_plan,
+            # Publish build event
+            if tsx_build_passed:
+                await event_bus.publish(AgentEvent(
+                    type=BusEventType.BUILD_PASSED,
+                    data={"checkpoint": "tsx_compilation"},
+                ))
+            else:
+                await event_bus.publish(AgentEvent(
+                    type=BusEventType.BUILD_FAILED,
+                    data={
+                        "checkpoint": "tsx_compilation",
+                        "error_count": len(compile_result.errors) if compile_result.errors else 0,
                     },
-                ),
-                blueprint=frontend_blueprint,
-                file_blueprint=FileBlueprint(
-                    path="src/lib/api.ts",
-                    purpose="Base Axios/Fetch API client with auth interceptors",
-                    language="typescript",
-                    layer="lib",
-                ),
-            )
-            api_result = await integrator.execute(api_ctx)
-            if not api_result.success:
-                errors.extend(api_result.errors)
-            self._complete_phase("FE: API Integration")
-        except Exception as exc:
-            logger.exception("API integration failed")
-            errors.append(f"API integration failed: {exc}")
-            self._fail_phase("FE: API Integration", str(exc))
+                ))
+            self._complete_phase("FE: TypeScript Compilation")
 
-        # ── Phase 6: State Management ─────────────────────────────────────────
-        self._phase("FE: State Management", "running")
-        logger.info("[FE Phase 6] Generating state management layer (%s)...",
-                    component_plan.state_solution)
-        try:
-            state_agent = StateManagementAgent(llm_client=self._llm, repo_manager=repo_manager)
-            state_ctx = AgentContext(
-                task=Task(
-                    task_id=9001,
-                    task_type=TaskType.MANAGE_STATE,
-                    file="src/store/index.ts",
-                    description=f"Generate {component_plan.state_solution} store layer",
-                    metadata={"component_plan": component_plan},
-                ),
-                blueprint=frontend_blueprint,
-                file_blueprint=FileBlueprint(
-                    path="src/store/index.ts",
-                    purpose="State management barrel / root store",
-                    language="typescript",
-                    layer="store",
-                ),
-            )
-            state_result = await state_agent.execute(state_ctx)
-            if not state_result.success:
-                errors.extend(state_result.errors)
-            self._complete_phase("FE: State Management")
-        except Exception as exc:
-            logger.exception("State management generation failed")
-            errors.append(f"State management failed: {exc}")
-            self._fail_phase("FE: State Management", str(exc))
+            # ── Phase 4.6: Cross-component import validation ───────────────────────
+            self._phase("FE: Import Validation", "running")
+            logger.info("[FE Phase 4.6] Validating cross-component imports...")
+            import_errors = self._validate_component_imports(workspace, ordered_components)
+            if import_errors:
+                metrics["import_errors"] = len(import_errors)
+                errors.extend(import_errors)
+                logger.warning("[FE Phase 4.6] %d unresolved import(s)", len(import_errors))
+            else:
+                logger.info("[FE Phase 4.6] All component imports resolved")
+            self._complete_phase("FE: Import Validation")
 
-        # ── Finalise: persist dep graph, repo index, and embeddings ──────────
-        try:
-            fe_settings = copy.copy(self._settings)
-            fe_settings.workspace_dir = workspace
-            fe_settings.memory = dataclasses.replace(
-                self._settings.memory,
-                chroma_persist_dir=str(workspace / ".chroma"),
+            # ── Phase 5: API Integration ──────────────────────────────────────────
+            self._phase("FE: API Integration", "running")
+            logger.info("[FE Phase 5] Generating API client layer...")
+            try:
+                integrator = agent_manager._create_agent(TaskType.INTEGRATE_API)
+                api_ctx = AgentContext(
+                    task=Task(
+                        task_id=9000,
+                        task_type=TaskType.INTEGRATE_API,
+                        file="src/lib/api.ts",
+                        description="Generate typed API client and hooks",
+                        metadata={
+                            "api_contract": api_contract,
+                            "component_plan": component_plan,
+                        },
+                    ),
+                    blueprint=frontend_blueprint,
+                    file_blueprint=FileBlueprint(
+                        path="src/lib/api.ts",
+                        purpose="Base Axios/Fetch API client with auth interceptors",
+                        language="typescript",
+                        layer="lib",
+                    ),
+                )
+                api_result = await integrator.execute(api_ctx)
+                if api_result.success:
+                    await event_bus.publish(AgentEvent(
+                        type=BusEventType.TASK_COMPLETED,
+                        task_id=9000,
+                        task_type=TaskType.INTEGRATE_API.value,
+                        file_path="src/lib/api.ts",
+                        agent_name="APIIntegrationAgent",
+                    ))
+                else:
+                    errors.extend(api_result.errors)
+                    await event_bus.publish(AgentEvent(
+                        type=BusEventType.TASK_FAILED,
+                        task_id=9000,
+                        task_type=TaskType.INTEGRATE_API.value,
+                        file_path="src/lib/api.ts",
+                        agent_name="APIIntegrationAgent",
+                        data={"errors": api_result.errors},
+                    ))
+                self._complete_phase("FE: API Integration")
+            except Exception as exc:
+                logger.exception("API integration failed")
+                errors.append(f"API integration failed: {exc}")
+                self._fail_phase("FE: API Integration", str(exc))
+
+            # ── Phase 6: State Management ─────────────────────────────────────────
+            self._phase("FE: State Management", "running")
+            logger.info("[FE Phase 6] Generating state management layer (%s)...",
+                        component_plan.state_solution)
+            try:
+                state_agent = agent_manager._create_agent(TaskType.MANAGE_STATE)
+                state_ctx = AgentContext(
+                    task=Task(
+                        task_id=9001,
+                        task_type=TaskType.MANAGE_STATE,
+                        file="src/store/index.ts",
+                        description=f"Generate {component_plan.state_solution} store layer",
+                        metadata={"component_plan": component_plan},
+                    ),
+                    blueprint=frontend_blueprint,
+                    file_blueprint=FileBlueprint(
+                        path="src/store/index.ts",
+                        purpose="State management barrel / root store",
+                        language="typescript",
+                        layer="store",
+                    ),
+                )
+                state_result = await state_agent.execute(state_ctx)
+                if state_result.success:
+                    await event_bus.publish(AgentEvent(
+                        type=BusEventType.TASK_COMPLETED,
+                        task_id=9001,
+                        task_type=TaskType.MANAGE_STATE.value,
+                        file_path="src/store/index.ts",
+                        agent_name="StateManagementAgent",
+                    ))
+                else:
+                    errors.extend(state_result.errors)
+                    await event_bus.publish(AgentEvent(
+                        type=BusEventType.TASK_FAILED,
+                        task_id=9001,
+                        task_type=TaskType.MANAGE_STATE.value,
+                        file_path="src/store/index.ts",
+                        agent_name="StateManagementAgent",
+                        data={"errors": state_result.errors},
+                    ))
+                self._complete_phase("FE: State Management")
+            except Exception as exc:
+                logger.exception("State management generation failed")
+                errors.append(f"State management failed: {exc}")
+                self._fail_phase("FE: State Management", str(exc))
+
+            # ── Finalise: persist dep graph, repo index, and embeddings ──────────
+            try:
+                fe_settings = copy.copy(self._settings)
+                fe_settings.workspace_dir = workspace
+                fe_settings.memory = dataclasses.replace(
+                    self._settings.memory,
+                    chroma_persist_dir=str(workspace / ".chroma"),
+                )
+                index_workspace(repo_manager, fe_settings)
+            except Exception:
+                logger.warning("Frontend workspace indexing failed", exc_info=True)
+
+            elapsed = time.monotonic() - start_time
+            success = not any(
+                e for e in errors
+                if "Component planning failed" in e
             )
-            index_workspace(repo_manager, fe_settings)
-        except Exception:
-            logger.warning("Frontend workspace indexing failed", exc_info=True)
+
+            token_cost = self._build_token_cost()
+
+            # Write frontend report
+            self._write_report(
+                workspace=workspace,
+                success=success,
+                elapsed=elapsed,
+                requirements=requirements,
+                component_plan=component_plan,
+                metrics=metrics,
+                errors=errors,
+                token_cost=token_cost,
+            )
+
+            return PipelineResult(
+                success=success,
+                workspace_path=workspace,
+                blueprint=frontend_blueprint,
+                metrics=metrics,
+                errors=errors,
+                elapsed_seconds=elapsed,
+                token_cost=token_cost,
+            )
         finally:
+            # Ensure sandbox and MCP client are cleaned up even on failure.
+            try:
+                if sandbox is not None:
+                    await sandbox.teardown()
+            except Exception:
+                logger.warning("Error during sandbox teardown", exc_info=True)
             if mcp_client:
                 await mcp_client.close()
 
-        success = not any(
-            e for e in errors
-            if "Component planning failed" in e
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _build_token_cost(self) -> TokenCost:
+        cost = calculate_cost(
+            self._llm.config.model,
+            self._llm.total_input_tokens,
+            self._llm.total_output_tokens,
         )
-        return PipelineResult(
-            success=success,
-            workspace_path=workspace,
-            blueprint=frontend_blueprint,
-            metrics=metrics,
-            errors=errors,
-            elapsed_seconds=time.monotonic() - start_time,
+        return TokenCost(
+            input_tokens=self._llm.total_input_tokens,
+            output_tokens=self._llm.total_output_tokens,
+            model=self._llm.config.model,
+            cost_usd=cost,
         )
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
+    @staticmethod
+    def _write_report(
+        *,
+        workspace: Path,
+        success: bool,
+        elapsed: float,
+        requirements: ProductRequirements,
+        component_plan: ComponentPlan,
+        metrics: dict,
+        errors: list[str],
+        token_cost: TokenCost,
+    ) -> None:
+        """Write frontend_report.json to the workspace."""
+        report = {
+            "mode": "frontend",
+            "success": success,
+            "elapsed_seconds": round(elapsed, 2),
+            "project": requirements.title,
+            "framework": component_plan.framework,
+            "state_solution": component_plan.state_solution,
+            "metrics": metrics,
+            "errors": errors,
+            "components_planned": len(component_plan.components),
+            "components_generated": metrics.get("components_generated", 0),
+            "token_cost": {
+                "input_tokens": token_cost.input_tokens,
+                "output_tokens": token_cost.output_tokens,
+                "model": token_cost.model,
+                "cost_usd": round(token_cost.cost_usd, 4),
+            },
+        }
+        report_path = workspace / "frontend_report.json"
+        try:
+            report_path.write_text(_json.dumps(report, indent=2), encoding="utf-8")
+            logger.info("Wrote frontend_report.json")
+        except Exception:
+            logger.warning("Failed to write frontend_report.json", exc_info=True)
 
     def _make_frontend_blueprint(
         self,
@@ -496,8 +737,6 @@ class FrontendPipeline:
         .env.local contains placeholder environment variables that the
         developer needs to fill in before running the app.
         """
-        import json as _json
-
         # ── package.json ─────────────────────────────────────────────────────
         pkg = dict(plan.package_json) if plan.package_json else {}
         if not pkg.get("name"):
