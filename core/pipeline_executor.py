@@ -235,12 +235,8 @@ class PipelineExecutor:
         _GEN_TYPES = {TaskType.GENERATE_FILE, TaskType.MODIFY_FILE}
 
         # ── Phase loop ──────────────────────────────────────────────────────
-        # Tracks the set of files whose build errors could never be resolved.
-        # Downstream files that transitively depend ONLY on these broken files
-        # are failed; files with no dependency on them proceed normally.
         tier_hard_blocked = False
         skip_agents = self._settings.skip_agents
-        _permanently_failed_files: set[str] = set()
 
         for phase in phases:
             if tier_hard_blocked:
@@ -317,90 +313,29 @@ class PipelineExecutor:
                             new_stubs = stub_gen.generate_stubs(later_files, bp_map)
                             active_stubs.extend(new_stubs)
 
-                        # Snapshot the files in BUILDING before the checkpoint
-                        # so we can identify exactly which files had unresolvable
-                        # build errors after the checkpoint returns (those files
-                        # may already be FAILED by the time we check).
-                        pre_checkpoint_building = {
-                            f for f in tier.files
-                            if engine.get_lifecycle(f).phase == FilePhase.BUILDING
-                        }
-
                         cycle_result = await self._run_checkpoint(
                             engine, ck_def, tier,
                         )
                         checkpoint_results.append(cycle_result)
                         total_checkpoint_fixes += len(cycle_result.files_fixed)
 
-                        # ── Partial gate: only fail downstream files that
-                        # transitively depend on an unresolved BUILDING file.
+                        # ── Hard gate: failed checkpoint blocks downstream tiers ─
                         if not cycle_result.passed:
-                            # Use the pre-checkpoint snapshot — those were the
-                            # files with unresolved build errors (they may already
-                            # be FAILED by the time we reach this point).
-                            still_broken = list(pre_checkpoint_building)
-                            _permanently_failed_files.update(still_broken)
-
-                            # Fail the broken files themselves.
-                            for path in still_broken:
-                                engine.process_event(path, EventType.RETRIES_EXHAUSTED)
-
-                            # For downstream tiers only fail files whose deps
-                            # are ALL failed/broken; files with at least one
-                            # clean dep can still be generated.
-                            blocked_downstream: list[str] = []
+                            logger.error(
+                                "Tier %d checkpoint failed permanently — "
+                                "blocking %d downstream tier(s) from starting",
+                                tier.index, len(tiers) - tier_idx - 1,
+                            )
                             for blocked_tier in tiers[tier_idx + 1:]:
                                 for path in blocked_tier.files:
-                                    lc = engine.get_lifecycle(path)
-                                    if lc.is_terminal:
-                                        continue
-                                    file_deps = [
-                                        d for d in engine._deps.get(path, [])
-                                        if d in engine._lifecycles
-                                    ]
-                                    # If every non-terminal dep is in the failed set,
-                                    # this file cannot possibly compile — fail it.
-                                    all_deps_broken = file_deps and all(
-                                        d in _permanently_failed_files for d in file_deps
-                                    )
-                                    if all_deps_broken:
+                                    if not engine.get_lifecycle(path).is_terminal:
                                         engine.process_event(
                                             path, EventType.RETRIES_EXHAUSTED,
                                         )
-                                        blocked_downstream.append(path)
-
-                            if blocked_downstream:
-                                logger.error(
-                                    "Tier %d checkpoint failed — %d file(s) with "
-                                    "unresolvable build errors: %s. "
-                                    "%d downstream file(s) blocked: %s. "
-                                    "Remaining downstream files will proceed.",
-                                    tier.index, len(still_broken), still_broken,
-                                    len(blocked_downstream), blocked_downstream,
-                                )
-                            else:
-                                logger.warning(
-                                    "Tier %d checkpoint failed — %d file(s) with "
-                                    "unresolvable build errors: %s. "
-                                    "No downstream files have exclusive deps on "
-                                    "these files; downstream tiers will proceed.",
-                                    tier.index, len(still_broken), still_broken,
-                                )
-
-                            # Only set tier_hard_blocked if every file in every
-                            # downstream tier was just blocked (total failure).
-                            remaining_downstream = [
-                                f
-                                for bt in tiers[tier_idx + 1:]
-                                for f in bt.files
-                                if not engine.get_lifecycle(f).is_terminal
-                            ]
-                            if not remaining_downstream:
-                                tier_hard_blocked = True
-
                             if active_stubs:
                                 stub_gen.cleanup_stubs(active_stubs)
                                 active_stubs = []
+                            tier_hard_blocked = True
                             break
 
                         # Clean up stubs after a passed checkpoint.
