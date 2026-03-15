@@ -33,7 +33,7 @@ import time
 from typing import Any, TYPE_CHECKING
 
 from core.checkpoint import BuildCheckpoint, CheckpointCycleResult, CheckpointResult
-from core.error_attributor import CompilerErrorAttributor
+from core.error_attributor import CompilerErrorAttributor, extract_error_lines
 from core.event_bus import AgentEvent, BusEventType
 from core.models import Task, TaskType
 from core.state_machine import EventType, FilePhase, LifecycleEngine
@@ -731,17 +731,18 @@ class PipelineExecutor:
 
                 fix_context = checkpoint.get_fix_context_for_file(file_path, result)
 
-                # When no errors were attributed to specific files, inject the
-                # raw build output so the fix agent has real compiler feedback
-                # instead of an empty error string.
+                # When no errors were attributed to specific files, extract
+                # just the error lines from the build output instead of
+                # sending the entire log (which can be 50K+ of noise).
                 if unattributed_fallback and not fix_context.get("build_errors"):
-                    raw_errors = result.raw_output or ""
-                    # Also include unattributed error lines for clarity
+                    # raw_output is already filtered by extract_error_lines
+                    # in checkpoint.run_once(), but add unattributed lines too
+                    error_summary = result.raw_output or ""
                     if result.attribution and result.attribution.unattributed_errors:
-                        raw_errors += "\n\nKey error lines:\n" + "\n".join(
-                            result.attribution.unattributed_errors[:20]
-                        )
-                    fix_context["build_errors"] = raw_errors[:4000]
+                        extra = "\n".join(result.attribution.unattributed_errors[:20])
+                        if extra not in error_summary:
+                            error_summary += "\n" + extra
+                    fix_context["build_errors"] = error_summary[:4000]
                     fix_context["fix_trigger"] = "build_unattributed"
 
                 # Skip if this file's errors haven't changed since the last fix

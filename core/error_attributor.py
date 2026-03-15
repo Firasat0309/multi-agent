@@ -70,6 +70,96 @@ class AttributionResult:
         return "\n".join(lines)
 
 
+def extract_error_lines(build_output: str, *, max_chars: int = 4000) -> str:
+    """Extract only error-relevant lines from build output.
+
+    Build tools (Maven, Gradle, npm, tsc, cargo, go) can produce huge
+    output filled with download progress, info lines, and warnings.
+    This function extracts just the lines that matter for diagnosing
+    failures:
+
+    **Java/Maven/Gradle:**
+      ``[ERROR]`` lines, ``BUILD FAILURE`` section, compilation errors.
+
+    **npm/Node/Next.js:**
+      ``ERR!`` lines, ``error TS`` lines, ``Module not found``,
+      ``SyntaxError``, ``ERESOLVE``, ``Could not resolve``.
+
+    **Go/Rust/C#:**
+      ``error:``, ``error[E]``, ``undefined reference``, etc.
+
+    Returns a compact string of deduplicated error lines, capped at
+    *max_chars* to fit within LLM context budgets.
+    """
+    lines = build_output.splitlines()
+    error_lines: list[str] = []
+    in_failure_section = False
+    seen: set[str] = set()
+
+    # Keywords that mark a line as error-relevant (matched case-insensitively)
+    _ERROR_KEYWORDS = (
+        # Java / Maven / Gradle
+        "[error]", "error:", "error[", "cannot find symbol",
+        "build failure", "compilation failure", "failed to execute",
+        "does not exist", "cannot resolve", "non-resolvable",
+        "undefined reference", "unresolved",
+        # npm / Node / Next.js / TypeScript
+        "err!", "errno", "eresolve", "module not found",
+        "syntaxerror", "typeerror", "referenceerror",
+        "could not resolve", "cannot find module",
+        "failed to compile", "build error",
+        "error ts", "error:", "is not assignable to",
+        "has no exported member", "property .* does not exist",
+        # Go
+        "cannot load", "no required module",
+        # Rust / Cargo
+        "aborting due to", "could not compile",
+    )
+
+    # Patterns that mark the start of a "capture everything" section
+    _FAILURE_MARKERS = (
+        "BUILD FAILURE",        # Maven
+        "FAILED",               # Gradle
+        "npm ERR!",             # npm
+        "error: aborting",      # Rust
+        "FAIL",                 # Go test
+        "Failed to compile",    # Next.js / webpack
+    )
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Once we hit a failure summary marker, capture everything remaining
+        if not in_failure_section:
+            for marker in _FAILURE_MARKERS:
+                if marker in stripped:
+                    in_failure_section = True
+                    break
+
+        lower = stripped.lower()
+        is_error = (
+            in_failure_section
+            or any(kw in lower for kw in _ERROR_KEYWORDS)
+        )
+
+        if is_error and stripped not in seen:
+            seen.add(stripped)
+            error_lines.append(stripped)
+
+    if not error_lines:
+        # No recognizable error lines — return the last portion of output
+        # which typically has the most relevant info.
+        return build_output[-max_chars:].strip()
+
+    result = "\n".join(error_lines)
+    if len(result) > max_chars:
+        # Keep the tail (most relevant errors are at the end)
+        result = result[-max_chars:]
+    return result
+
+
 class BaseErrorAttributor(ABC):
     """Abstract base for error attributors."""
 
@@ -132,6 +222,17 @@ class CompilerErrorAttributor(BaseErrorAttributor):
         ("csharp", re.compile(
             r"(.+?\.cs)\((\d+),(\d+)\):\s*(?:error|warning)\s+\w+:\s*(.*)",
         ), 4),
+        # Next.js/webpack: ./src/file.tsx
+        # Module not found: Can't resolve './Bar' in '/abs/path/src/components'
+        # Groups: (file, message) — no line/col
+        ("nextjs_module", re.compile(
+            r"\./(.+?\.tsx?)\s*$",
+        ), 1),
+        # npm/webpack inline: ERROR in ./src/file.tsx 10:5
+        # Groups: (file, line, col)
+        ("webpack_error", re.compile(
+            r"ERROR in \./(.+?\.tsx?)\s+(\d+):(\d+)",
+        ), 3),
         # Generic: file.ext:line:col: message  OR  file.ext:line: message
         # Groups: (file, line, col?, message)
         ("generic", re.compile(
@@ -142,10 +243,11 @@ class CompilerErrorAttributor(BaseErrorAttributor):
     # Rust has a special pattern where the error message comes before the location
     _RUST_ERROR_PATTERN = re.compile(r"^error(?:\[E\d+\])?: (.+)")
 
-    # Maven build-level errors that are not file-specific but indicate a failed build.
+    # Build-level errors that are not file-specific but indicate a failed build.
     # These are captured as unattributed errors so the caller knows the build failed
     # even when no file-specific errors could be parsed.
-    _MAVEN_BUILD_ERRORS: list[re.Pattern[str]] = [
+    _BUILD_LEVEL_ERRORS: list[re.Pattern[str]] = [
+        # Java / Maven
         re.compile(r"\[ERROR\]\s+.*Could not resolve dependencies.*", re.IGNORECASE),
         re.compile(r"\[ERROR\]\s+.*Failed to execute goal.*", re.IGNORECASE),
         re.compile(r"\[ERROR\]\s+.*Compilation failure.*", re.IGNORECASE),
@@ -154,6 +256,14 @@ class CompilerErrorAttributor(BaseErrorAttributor):
         re.compile(r"\[ERROR\]\s+.*Plugin .+ or one of its dependencies could not be resolved.*", re.IGNORECASE),
         re.compile(r"\[ERROR\]\s+.*package .+ does not exist.*", re.IGNORECASE),
         re.compile(r"\[ERROR\]\s+.*cannot find symbol.*", re.IGNORECASE),
+        # npm / Node / Next.js
+        re.compile(r"npm ERR!\s+.*", re.IGNORECASE),
+        re.compile(r"ERR!\s+.*ERESOLVE.*", re.IGNORECASE),
+        re.compile(r"Module not found:\s+.*", re.IGNORECASE),
+        re.compile(r"Failed to compile.*", re.IGNORECASE),
+        re.compile(r"Error:\s+Cannot find module.*", re.IGNORECASE),
+        re.compile(r"SyntaxError:\s+.*", re.IGNORECASE),
+        re.compile(r"TypeError:\s+.*", re.IGNORECASE),
     ]
 
     def attribute(
@@ -162,17 +272,23 @@ class CompilerErrorAttributor(BaseErrorAttributor):
         known_files: set[str] | None = None,
     ) -> AttributionResult:
         result = AttributionResult()
-        lines = build_output.splitlines()
+        raw_lines = build_output.splitlines()
         pending_rust_msg: str | None = None
 
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
+        # Pre-strip and filter empty lines, keeping index for lookahead
+        lines: list[str] = []
+        for raw_line in raw_lines:
+            s = raw_line.strip()
+            if s:
+                lines.append(s)
 
-            # Check for Maven build-level errors (not file-specific)
-            for mvn_pat in self._MAVEN_BUILD_ERRORS:
-                if mvn_pat.search(stripped):
+        i = 0
+        while i < len(lines):
+            stripped = lines[i]
+
+            # Check for build-level errors (not file-specific)
+            for pat in self._BUILD_LEVEL_ERRORS:
+                if pat.search(stripped):
                     result.unattributed_errors.append(stripped)
                     break
 
@@ -180,6 +296,7 @@ class CompilerErrorAttributor(BaseErrorAttributor):
             rust_msg = self._RUST_ERROR_PATTERN.match(stripped)
             if rust_msg:
                 pending_rust_msg = rust_msg.group(1)
+                i += 1
                 continue
 
             attributed = False
@@ -204,6 +321,21 @@ class CompilerErrorAttributor(BaseErrorAttributor):
                     # rust: (file, line, col) — message from pending_rust_msg
                     col = int(groups[2]) if groups[2] else None
                     msg = pending_rust_msg or stripped
+                elif expected_groups == 3 and pattern_name == "webpack_error":
+                    # webpack: (file, line, col) — message is the full line
+                    col = int(groups[2]) if groups[2] else None
+                    msg = stripped
+                elif expected_groups == 1 and pattern_name == "nextjs_module":
+                    # Next.js/webpack: file path on one line, error on next.
+                    # e.g.:  ./src/LoginForm.tsx
+                    #        Module not found: Can't resolve '../../store/auth'
+                    # Look ahead to grab the actual error message.
+                    line_no = None
+                    col = None
+                    msg = stripped
+                    if i + 1 < len(lines) and not lines[i + 1].startswith("./"):
+                        msg = lines[i + 1]
+                        i += 1  # consume the lookahead line
                 else:
                     col = None
                     msg = stripped
@@ -234,6 +366,8 @@ class CompilerErrorAttributor(BaseErrorAttributor):
 
             if not attributed and self._looks_like_error(stripped):
                 result.unattributed_errors.append(stripped)
+
+            i += 1
 
         # Deduplicate errors per file (same line+message)
         for path in result.errors_by_file:

@@ -17,7 +17,7 @@ from typing import Any
 from agents.base_agent import BaseAgent
 from core.language import detect_language_from_blueprint
 from core.models import AgentContext, AgentRole, TaskResult
-from core.error_attributor import CompilerErrorAttributor
+from core.error_attributor import CompilerErrorAttributor, extract_error_lines
 from tools.terminal_tools import TerminalTools
 
 logger = logging.getLogger(__name__)
@@ -92,8 +92,9 @@ class BuildVerifierAgent(BaseAgent):
         if targeted_errors:
             error_message = "\n".join(targeted_errors)
         else:
-            # Fallback to the truncated compiler output if error lines couldn't be correctly mapped 
-            error_message = compiler_output[:1000]
+            # Extract only error-relevant lines instead of blind truncation.
+            # Maven output can be 50K+ chars of download noise.
+            error_message = extract_error_lines(compiler_output, max_chars=2000)
 
         logger.warning(
             "Build failed for %s:\n%s", context.task.file, error_message

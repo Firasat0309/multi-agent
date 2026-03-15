@@ -30,7 +30,12 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from core.error_attributor import AttributionResult, BaseErrorAttributor, CompilerErrorAttributor
+from core.error_attributor import (
+    AttributionResult,
+    BaseErrorAttributor,
+    CompilerErrorAttributor,
+    extract_error_lines,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -201,11 +206,17 @@ class BuildCheckpoint:
                 self.name, len(attribution.unattributed_errors),
             )
 
+        # Extract only error-relevant lines instead of truncating blindly.
+        # Maven output can be 50K+ chars of download noise; the actual errors
+        # are buried deep.  extract_error_lines() pulls just the [ERROR] lines
+        # and BUILD FAILURE section.
+        compact_output = extract_error_lines(raw_output, max_chars=6000)
+
         return CheckpointResult(
             passed=False,
             attempt=attempt,
             attribution=attribution,
-            raw_output=raw_output[:8000],  # cap for context size
+            raw_output=compact_output,
         )
 
     def get_fix_context_for_file(
