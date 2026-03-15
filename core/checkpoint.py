@@ -205,7 +205,7 @@ class BuildCheckpoint:
             passed=False,
             attempt=attempt,
             attribution=attribution,
-            raw_output=raw_output[:2000],  # cap for context size
+            raw_output=raw_output[:8000],  # cap for context size
         )
 
     def get_fix_context_for_file(

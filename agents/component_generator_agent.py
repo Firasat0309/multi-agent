@@ -131,6 +131,25 @@ class ComponentGeneratorAgent(BaseAgent):
         component: UIComponent | None = context.task.metadata.get("component")
         if component is None:
             return TaskResult(success=False, errors=["No component in task metadata"])
+
+        # Inject the target file path into file_blueprint so the base agent's
+        # agentic loop can detect when the file has been written and exit early
+        # instead of looping until max_iterations rewriting the same file.
+        if context.file_blueprint is None and component.file_path:
+            from core.models import FileBlueprint
+            context = AgentContext(
+                task=context.task,
+                blueprint=context.blueprint,
+                file_blueprint=FileBlueprint(
+                    path=component.file_path,
+                    purpose=component.description or component.name,
+                    depends_on=component.depends_on or [],
+                ),
+                related_files=context.related_files,
+                architecture_summary=context.architecture_summary,
+                dependency_info=context.dependency_info,
+            )
+
         try:
             result = await self.execute_agentic(context)
             if result.success:

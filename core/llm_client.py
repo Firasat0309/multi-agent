@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -552,6 +553,25 @@ class LLMClient:
         # Non-Anthropic providers: fall back to non-streaming generate
         return await self.generate(system_prompt, user_prompt, max_tokens=max_tokens)
 
+    @staticmethod
+    def _repair_json_text(text: str) -> str:
+        """Best-effort repair of common LLM JSON mistakes.
+
+        Handles trailing commas, single-quoted strings, JS comments,
+        and unquoted property names.
+        """
+        # Strip JS-style comments
+        text = re.sub(r"//[^\n]*", "", text)
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        # Replace single-quoted strings with double-quoted
+        text = re.sub(r"(?<=[:,\[\{])\s*'([^']*)'", r' "\1"', text)
+        text = re.sub(r"'([^']*)'(?=\s*[:,\]\}])", r'"\1"', text)
+        # Remove trailing commas before } or ]
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+        # Quote unquoted property names
+        text = re.sub(r'(?<=[{,])\s*([a-zA-Z_]\w*)\s*:', r' "\1":', text)
+        return text
+
     async def generate_json(
         self,
         system_prompt: str,
@@ -572,20 +592,41 @@ class LLMClient:
             if lines and lines[-1].strip() == "```":
                 lines = lines[:-1]
             text = "\n".join(lines)
+
+        # Attempt 1: strict parse
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            logger.warning("LLM returned non-JSON; extracting first JSON object from response")
-            # Try to extract a JSON object from anywhere in the text
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start != -1 and end > start:
+            pass
+
+        # Attempt 2: extract JSON object from surrounding prose
+        logger.warning("LLM returned non-JSON; extracting first JSON object from response")
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start != -1 and end > start:
+            snippet = text[start:end]
+            try:
+                return json.loads(snippet)
+            except json.JSONDecodeError:
+                # Attempt 3: repair common JSON mistakes then re-parse
                 try:
-                    return json.loads(text[start:end])
+                    repaired = self._repair_json_text(snippet)
+                    return json.loads(repaired)
                 except json.JSONDecodeError:
                     pass
-            logger.error(f"Could not parse JSON from LLM response: {text[:200]}")
-            return {}
+
+        # Attempt 4: repair the full text as a last resort
+        try:
+            repaired = self._repair_json_text(text)
+            r_start = repaired.find("{")
+            r_end = repaired.rfind("}") + 1
+            if r_start != -1 and r_end > r_start:
+                return json.loads(repaired[r_start:r_end])
+        except json.JSONDecodeError:
+            pass
+
+        logger.error(f"Could not parse JSON from LLM response: {text[:200]}")
+        return {}
 
     async def generate_with_tools(
         self,

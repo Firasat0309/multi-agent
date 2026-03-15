@@ -139,6 +139,26 @@ class DesignParserAgent(BaseAgent):
             )
         return spec
 
+    @staticmethod
+    def _repair_json(text: str) -> str:
+        """Best-effort repair of common LLM JSON mistakes.
+
+        Handles: trailing commas before } or ], single-quoted strings,
+        JS-style comments (// and /* */), and unquoted property names.
+        """
+        # Strip JS-style comments
+        text = re.sub(r"//[^\n]*", "", text)
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        # Replace single-quoted strings with double-quoted
+        # (only when the single quote is used as a string delimiter)
+        text = re.sub(r"(?<=[:,\[\{])\s*'([^']*)'", r' "\1"', text)
+        text = re.sub(r"'([^']*)'(?=\s*[:,\]\}])", r'"\1"', text)
+        # Remove trailing commas before } or ]
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+        # Quote unquoted property names: { key: "val" } → { "key": "val" }
+        text = re.sub(r'(?<=[{,])\s*([a-zA-Z_]\w*)\s*:', r' "\1":', text)
+        return text
+
     async def execute(self, context: AgentContext) -> TaskResult:
         figma_url: str = context.task.metadata.get("figma_url", "")
         try:
@@ -146,7 +166,7 @@ class DesignParserAgent(BaseAgent):
             result = await self.execute_agentic(context)
             if not result.success:
                 return result
-                
+
             # Parse the final text output into the UIDesignSpec
             import json
             try:
@@ -156,14 +176,26 @@ class DesignParserAgent(BaseAgent):
                     content = content.split("\n", 1)[1]
                     if content.endswith("```"):
                         content = content[:-3].rsplit("```", 1)[0].rsplit("\n", 1)[0]
-                
-                raw = json.loads(content)
+
+                # Try strict parse first, then repair on failure
+                try:
+                    raw = json.loads(content)
+                except json.JSONDecodeError:
+                    repaired = self._repair_json(content)
+                    # Try to extract a JSON object if there's surrounding text
+                    start = repaired.find("{")
+                    end = repaired.rfind("}") + 1
+                    if start != -1 and end > start:
+                        repaired = repaired[start:end]
+                    raw = json.loads(repaired)
+                    logger.info("DesignParserAgent: JSON repair succeeded")
+
                 requirements: ProductRequirements | None = context.task.metadata.get("requirements")
                 spec = self._parse_spec(raw, requirements, figma_url)
-                
+
                 # Overwrite metadata so next agent in DAG has it
                 context.task.metadata["design_spec"] = spec
-                
+
                 return TaskResult(
                     success=True,
                     output=f"Design parsed: {len(spec.pages)} pages, framework={spec.framework}",

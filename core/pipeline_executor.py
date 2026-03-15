@@ -321,6 +321,15 @@ class PipelineExecutor:
 
                         # ── Hard gate: failed checkpoint blocks downstream tiers ─
                         if not cycle_result.passed:
+                            # Mark the current tier's BUILDING files as FAILED.
+                            # (_run_checkpoint does this internally, but if it
+                            # was overridden or returned early, ensure it here.)
+                            for path in tier.files:
+                                lc = engine.get_lifecycle(path)
+                                if lc.phase == FilePhase.BUILDING:
+                                    engine.process_event(
+                                        path, EventType.RETRIES_EXHAUSTED,
+                                    )
                             logger.error(
                                 "Tier %d checkpoint failed permanently — "
                                 "blocking %d downstream tier(s) from starting",
@@ -682,17 +691,25 @@ class PipelineExecutor:
 
             # Build failed — fix affected files
             affected = result.affected_files
+            unattributed_fallback = False
             if not affected:
-                # Errors couldn't be attributed — log and continue
+                # Errors couldn't be attributed to specific files — pass
+                # the raw build output to all tier files so the fix agent
+                # has something actionable to work with (instead of empty
+                # error context which produces identical-content fixes).
                 logger.warning(
-                    "[Checkpoint] Build failed but no errors could be attributed. "
-                    "Raw output: %s", result.raw_output[:500],
+                    "[Checkpoint] Build failed but no errors could be attributed "
+                    "to specific files. %d unattributed error lines. "
+                    "Raw output (first 500 chars): %s",
+                    len(result.attribution.unattributed_errors) if result.attribution else 0,
+                    result.raw_output[:500],
                 )
                 # Try to fix all tier files as a fallback
                 affected = [
                     f for f in tier.files
                     if not engine.get_lifecycle(f).is_terminal
                 ]
+                unattributed_fallback = True
 
             # Dispatch parallel fix tasks for affected files
             fix_tasks: list[asyncio.Task[None]] = []
@@ -713,6 +730,19 @@ class PipelineExecutor:
                     continue
 
                 fix_context = checkpoint.get_fix_context_for_file(file_path, result)
+
+                # When no errors were attributed to specific files, inject the
+                # raw build output so the fix agent has real compiler feedback
+                # instead of an empty error string.
+                if unattributed_fallback and not fix_context.get("build_errors"):
+                    raw_errors = result.raw_output or ""
+                    # Also include unattributed error lines for clarity
+                    if result.attribution and result.attribution.unattributed_errors:
+                        raw_errors += "\n\nKey error lines:\n" + "\n".join(
+                            result.attribution.unattributed_errors[:20]
+                        )
+                    fix_context["build_errors"] = raw_errors[:4000]
+                    fix_context["fix_trigger"] = "build_unattributed"
 
                 # Skip if this file's errors haven't changed since the last fix
                 # attempt — the previous fix made no progress, so another

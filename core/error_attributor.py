@@ -142,6 +142,20 @@ class CompilerErrorAttributor(BaseErrorAttributor):
     # Rust has a special pattern where the error message comes before the location
     _RUST_ERROR_PATTERN = re.compile(r"^error(?:\[E\d+\])?: (.+)")
 
+    # Maven build-level errors that are not file-specific but indicate a failed build.
+    # These are captured as unattributed errors so the caller knows the build failed
+    # even when no file-specific errors could be parsed.
+    _MAVEN_BUILD_ERRORS: list[re.Pattern[str]] = [
+        re.compile(r"\[ERROR\]\s+.*Could not resolve dependencies.*", re.IGNORECASE),
+        re.compile(r"\[ERROR\]\s+.*Failed to execute goal.*", re.IGNORECASE),
+        re.compile(r"\[ERROR\]\s+.*Compilation failure.*", re.IGNORECASE),
+        re.compile(r"\[ERROR\]\s+.*BUILD FAILURE.*"),
+        re.compile(r"\[ERROR\]\s+.*Non-resolvable parent POM.*", re.IGNORECASE),
+        re.compile(r"\[ERROR\]\s+.*Plugin .+ or one of its dependencies could not be resolved.*", re.IGNORECASE),
+        re.compile(r"\[ERROR\]\s+.*package .+ does not exist.*", re.IGNORECASE),
+        re.compile(r"\[ERROR\]\s+.*cannot find symbol.*", re.IGNORECASE),
+    ]
+
     def attribute(
         self,
         build_output: str,
@@ -155,6 +169,12 @@ class CompilerErrorAttributor(BaseErrorAttributor):
             stripped = line.strip()
             if not stripped:
                 continue
+
+            # Check for Maven build-level errors (not file-specific)
+            for mvn_pat in self._MAVEN_BUILD_ERRORS:
+                if mvn_pat.search(stripped):
+                    result.unattributed_errors.append(stripped)
+                    break
 
             # Check for Rust error message line (comes before location)
             rust_msg = self._RUST_ERROR_PATTERN.match(stripped)

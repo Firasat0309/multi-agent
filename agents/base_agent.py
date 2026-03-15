@@ -173,6 +173,25 @@ class BaseAgent(ABC):
                         "%s: end_turn reached but %s not yet written — injecting write_file reminder (iter %d)",
                         self.__class__.__name__, target_file, iteration,
                     )
+                    # Check if the LLM's text response contains a code block
+                    # that looks like the file content — extract it so the
+                    # reminder can reference it directly.
+                    code_hint = ""
+                    text = response.content or ""
+                    if "```" in text:
+                        import re as _re
+                        code_blocks = _re.findall(
+                            r"```(?:\w+)?\n(.*?)```", text, _re.DOTALL,
+                        )
+                        if code_blocks:
+                            # Use the longest code block as the likely file content
+                            longest = max(code_blocks, key=len)
+                            if len(longest.strip()) > 50:
+                                code_hint = (
+                                    f"\n\nIt looks like you already wrote the code as "
+                                    f"plain text. Use exactly that code as the content "
+                                    f"argument to write_file."
+                                )
                     messages.append({"role": "assistant", "content": response.raw_content})
                     messages.append({
                         "role": "user",
@@ -181,6 +200,7 @@ class BaseAgent(ABC):
                             f"Please call write_file with path='{target_file}' "
                             f"and the complete file content now. "
                             f"Do NOT respond with plain text — use the write_file tool."
+                            f"{code_hint}"
                         ),
                     })
                     continue
@@ -334,13 +354,24 @@ class BaseAgent(ABC):
         # Relay broken-import warnings so the LLM can correct or accept them
         broken = getattr(self.repo, "_last_broken_imports", [])
         if broken:
+            # Collect existing workspace files that might be the correct targets
+            # so the LLM can fix the import path instead of guessing.
+            repo_index = self.repo.get_repo_index()
+            existing_files = sorted(f.path for f in repo_index.files)[:50]
+            existing_hint = ""
+            if existing_files:
+                existing_hint = (
+                    "\nFiles currently in the workspace:\n"
+                    + "\n".join(f"  {f}" for f in existing_files)
+                )
             msg += (
                 f"\n⚠ Unresolvable imports in {path}: {broken}."
                 " These paths do not match any file currently in the workspace."
-                " If the missing file will be generated later, you may leave the import as-is."
-                " Otherwise, fix the import path or inline the dependency."
+                f"{existing_hint}"
+                "\nIf the missing file will be generated later, you may leave the import as-is."
+                " Otherwise, fix the import path to point to the correct existing file."
                 " Do NOT rewrite this file just to fix the import — only rewrite if the"
-                " component logic itself is wrong."
+                " import path is clearly wrong and should point to an existing file above."
             )
         return msg
 
@@ -460,13 +491,18 @@ class BaseAgent(ABC):
                 f"LLM output truncated (stop_reason={response.stop_reason!r}), "
                 f"requesting continuation {continuation_count}/{self._MAX_CONTINUATIONS}"
             )
+            # Show more trailing context so the LLM can reliably find
+            # the cut-off point and avoid re-emitting class/method headers.
+            tail_chars = min(600, len(content))
             continuation_prompt = (
                 f"{user_prompt}\n\n"
                 f"IMPORTANT: Your previous response was cut off mid-way. "
-                f"Here is the end of what you wrote:\n"
-                f"```\n{content[-300:]}\n```\n"
+                f"Here is the end of what you wrote (last {tail_chars} chars):\n"
+                f"```\n{content[-tail_chars:]}\n```\n"
                 f"Continue EXACTLY from where the output was cut off. "
-                f"Output only the continuation — no preamble, no repetition."
+                f"Do NOT repeat any class, function, or method definition that "
+                f"already appears above — duplicates will be rejected. "
+                f"Output only the remaining code — no preamble, no repetition."
             )
             response = await self.llm.generate(
                 system_prompt=system_override or self.system_prompt,
