@@ -9,6 +9,7 @@ from typing import Any
 
 from agents.base_agent import BaseAgent
 from core.agent_tools import CODER_TOOLS, ToolDefinition
+from core.error_attributor import extract_error_lines
 from core.language import get_language_profile, LanguageProfile
 from core.models import AgentContext, AgentRole, TaskResult, TaskType
 
@@ -439,6 +440,7 @@ class CoderAgent(BaseAgent):
         review_errors: list[str] = context.task.metadata.get("review_errors", [])
         review_output: str = context.task.metadata.get("review_output", "")
         build_errors: str = context.task.metadata.get("build_errors", "")
+        test_errors: str = context.task.metadata.get("test_errors", "")
         fix_trigger: str = context.task.metadata.get("fix_trigger", "review")
 
         # Read current file content from the repo (non-blocking)
@@ -460,21 +462,22 @@ class CoderAgent(BaseAgent):
         logger.info(f"Fixing {file_path} based on {len(review_errors)} review issue(s)")
 
         # ── Cap error text to avoid token explosion ──────────────────────────
-        # Build output (Maven, javac, tsc) can be 50K+ chars.  Keep the last
-        # _MAX_ERROR_CHARS which contain the actual error lines, not the build
-        # setup noise at the start.
+        # Build output (Maven, javac, tsc) can be 50K+ chars.  Use
+        # extract_error_lines() to pull only error-relevant lines instead of
+        # blind tail truncation.  Tail truncation loses the root-cause error
+        # (first file that broke) in favour of downstream cascading failures,
+        # causing the fix agent to treat symptoms rather than the cause.
         if fix_trigger == "build" and build_errors:
-            raw = build_errors
-            issues_text = (
-                "Compilation/build errors to fix:\n"
-                + (raw[-_MAX_ERROR_CHARS:] if len(raw) > _MAX_ERROR_CHARS
-                   else raw)
-            )
+            filtered = extract_error_lines(build_errors, max_chars=_MAX_ERROR_CHARS)
+            issues_text = "Compilation/build errors to fix:\n" + filtered
+        elif fix_trigger == "test" and test_errors:
+            filtered = extract_error_lines(test_errors, max_chars=_MAX_ERROR_CHARS)
+            issues_text = "Test failures to fix:\n" + filtered
         elif review_errors:
             issues_text = "\n".join(f"- {e}" for e in review_errors)
         else:
             raw = review_output
-            issues_text = raw[-_MAX_ERROR_CHARS:] if len(raw) > _MAX_ERROR_CHARS else raw
+            issues_text = extract_error_lines(raw, max_chars=_MAX_ERROR_CHARS) if len(raw) > _MAX_ERROR_CHARS else raw
 
         # For compiled languages add an explicit post-fix syntax checklist so the
         # model validates its own output before returning.

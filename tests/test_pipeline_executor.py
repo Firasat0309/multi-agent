@@ -522,6 +522,79 @@ class TestCheckpointRetrySimulation:
         assert result.passed is False
 
 
+# ── Timeout scaling tests ──────────────────────────────────────────────────────
+
+
+class TestTimeoutScaling:
+    """Verify that build checkpoint and phase timeouts scale with tier size."""
+
+    @pytest.mark.anyio
+    async def test_checkpoint_timeout_scales_with_files(self) -> None:
+        """Checkpoint timeout should be at least 60s × file count."""
+        from core.checkpoint import BuildCheckpoint, CheckpointResult
+        from core.pipeline_definition import CheckpointDef
+
+        executor = _make_executor()
+
+        # Create a large tier with 10 files
+        large_files = [f"File{i}.java" for i in range(10)]
+        large_tier = Tier(index=1, files=large_files)
+        engine = LifecycleEngine(
+            file_paths=large_files,
+            file_deps={f: [] for f in large_files},
+            compiled=True, checkpoint_mode=True,
+        )
+
+        ck_def = CheckpointDef(name="build", max_retries=1, timeout=180)
+
+        # Capture the timeout passed to BuildCheckpoint
+        captured_timeouts: list[int] = []
+        original_init = BuildCheckpoint.__init__
+
+        def patched_init(self, *args, **kwargs):
+            captured_timeouts.append(kwargs.get("timeout", 0))
+            original_init(self, *args, **kwargs)
+
+        pass_result = CheckpointResult(passed=True, attempt=1)
+
+        with patch.object(BuildCheckpoint, "__init__", patched_init):
+            with patch.object(BuildCheckpoint, "run_once", new=AsyncMock(return_value=pass_result)):
+                await executor._run_checkpoint(engine, ck_def, large_tier)
+
+        assert captured_timeouts, "BuildCheckpoint was not created"
+        # 10 files × 60s = 600s, must be at least that
+        assert captured_timeouts[0] >= 600
+
+    @pytest.mark.anyio
+    async def test_tier0_gets_extra_timeout(self) -> None:
+        """Tier 0 (first build) should get at least 600s for dependency downloads."""
+        from core.checkpoint import BuildCheckpoint, CheckpointResult
+        from core.pipeline_definition import CheckpointDef
+
+        executor = _make_executor()
+        engine = _make_engine()
+
+        tier0 = Tier(index=0, files=["Model.java"])  # only 1 file
+        ck_def = CheckpointDef(name="build", max_retries=1, timeout=180)
+
+        captured_timeouts: list[int] = []
+        original_init = BuildCheckpoint.__init__
+
+        def patched_init(self, *args, **kwargs):
+            captured_timeouts.append(kwargs.get("timeout", 0))
+            original_init(self, *args, **kwargs)
+
+        pass_result = CheckpointResult(passed=True, attempt=1)
+
+        with patch.object(BuildCheckpoint, "__init__", patched_init):
+            with patch.object(BuildCheckpoint, "run_once", new=AsyncMock(return_value=pass_result)):
+                await executor._run_checkpoint(engine, ck_def, tier0)
+
+        assert captured_timeouts, "BuildCheckpoint was not created"
+        # Tier 0 with 1 file: max(180, 60*1) = 180, but tier 0 bonus → max(180, 600) = 600
+        assert captured_timeouts[0] >= 600
+
+
 # ── Concurrent execution tests ────────────────────────────────────────────────
 
 

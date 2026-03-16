@@ -327,3 +327,199 @@ class TestImplementsClause:
         cls = sig.types[0]
         assert "UserService" in cls.implements
         assert "Auditable" in cls.implements
+
+
+# ── Regex fallback extraction (TypeScript, Go, Rust, C#) ────────────────
+
+TYPESCRIPT_SOURCE = """\
+import { Injectable } from '@nestjs/common';
+import { User } from './user.model';
+import { Repository } from 'typeorm';
+
+@Injectable()
+export class UserService {
+    constructor(private readonly userRepo: Repository<User>) {
+        this.userRepo = userRepo;
+    }
+
+    async findById(id: number): Promise<User> {
+        const user = await this.userRepo.findOne(id);
+        if (!user) {
+            throw new Error('Not found');
+        }
+        return user;
+    }
+
+    async findAll(): Promise<User[]> {
+        return this.userRepo.find();
+    }
+
+    async create(data: CreateUserDto): Promise<User> {
+        const user = this.userRepo.create(data);
+        return this.userRepo.save(user);
+    }
+}
+"""
+
+GO_SOURCE = """\
+package handlers
+
+import (
+    "encoding/json"
+    "net/http"
+    "github.com/gorilla/mux"
+)
+
+type UserHandler struct {
+    service *UserService
+    logger  *Logger
+}
+
+func NewUserHandler(svc *UserService, log *Logger) *UserHandler {
+    return &UserHandler{service: svc, logger: log}
+}
+
+func (h *UserHandler) GetUser(w http.ResponseWriter, r *http.Request) {
+    vars := mux.Vars(r)
+    id := vars["id"]
+    user, err := h.service.FindByID(id)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusNotFound)
+        return
+    }
+    json.NewEncoder(w).Encode(user)
+}
+
+func (h *UserHandler) CreateUser(w http.ResponseWriter, r *http.Request) {
+    var req CreateUserRequest
+    if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+        http.Error(w, err.Error(), http.StatusBadRequest)
+        return
+    }
+    user, err := h.service.Create(req)
+    if err != nil {
+        http.Error(w, err.Error(), http.StatusInternalServerError)
+        return
+    }
+    w.WriteHeader(http.StatusCreated)
+    json.NewEncoder(w).Encode(user)
+}
+"""
+
+RUST_SOURCE = """\
+use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct User {
+    pub id: u64,
+    pub name: String,
+    pub email: String,
+}
+
+pub trait UserRepository {
+    fn find_by_id(&self, id: u64) -> Option<&User>;
+    fn find_all(&self) -> Vec<&User>;
+    fn save(&mut self, user: User) -> Result<(), String>;
+}
+
+pub struct InMemoryUserRepo {
+    users: HashMap<u64, User>,
+}
+
+impl UserRepository for InMemoryUserRepo {
+    fn find_by_id(&self, id: u64) -> Option<&User> {
+        self.users.get(&id)
+    }
+
+    fn find_all(&self) -> Vec<&User> {
+        self.users.values().collect()
+    }
+
+    fn save(&mut self, user: User) -> Result<(), String> {
+        self.users.insert(user.id, user);
+        Ok(())
+    }
+}
+"""
+
+
+class TestRegexFallback:
+    """Tests for the regex-based fallback extractor (non-tree-sitter languages)."""
+
+    def test_typescript_stub_extracts_imports(self, extractor):
+        stub = extractor.extract_stub("user.service.ts", TYPESCRIPT_SOURCE, "typescript")
+        assert stub is not None
+        assert "import" in stub
+        assert "Injectable" in stub or "User" in stub
+
+    def test_typescript_stub_extracts_class(self, extractor):
+        stub = extractor.extract_stub("user.service.ts", TYPESCRIPT_SOURCE, "typescript")
+        assert stub is not None
+        assert "class UserService" in stub
+
+    def test_typescript_stub_extracts_methods(self, extractor):
+        stub = extractor.extract_stub("user.service.ts", TYPESCRIPT_SOURCE, "typescript")
+        assert stub is not None
+        assert "findById" in stub
+        assert "findAll" in stub
+        assert "create" in stub
+
+    def test_typescript_stub_omits_bodies(self, extractor):
+        stub = extractor.extract_stub("user.service.ts", TYPESCRIPT_SOURCE, "typescript")
+        assert stub is not None
+        # Body details should not appear
+        assert "throw new Error" not in stub
+        assert "this.userRepo.find()" not in stub
+
+    def test_typescript_stub_much_smaller(self, extractor):
+        stub = extractor.extract_stub("user.service.ts", TYPESCRIPT_SOURCE, "typescript")
+        assert stub is not None
+        # Stub should be significantly smaller than source
+        assert len(stub) < len(TYPESCRIPT_SOURCE) * 0.6
+
+    def test_go_stub_extracts_imports_and_package(self, extractor):
+        stub = extractor.extract_stub("handlers.go", GO_SOURCE, "go")
+        assert stub is not None
+        assert "package handlers" in stub
+
+    def test_go_stub_extracts_struct_and_funcs(self, extractor):
+        stub = extractor.extract_stub("handlers.go", GO_SOURCE, "go")
+        assert stub is not None
+        assert "struct" in stub or "UserHandler" in stub
+        assert "NewUserHandler" in stub
+        assert "GetUser" in stub
+        assert "CreateUser" in stub
+
+    def test_go_stub_omits_bodies(self, extractor):
+        stub = extractor.extract_stub("handlers.go", GO_SOURCE, "go")
+        assert stub is not None
+        assert "mux.Vars" not in stub
+        assert "json.NewEncoder" not in stub
+
+    def test_rust_stub_extracts_use_and_structs(self, extractor):
+        stub = extractor.extract_stub("user.rs", RUST_SOURCE, "rust")
+        assert stub is not None
+        assert "use std::collections::HashMap" in stub
+        assert "User" in stub
+
+    def test_rust_stub_extracts_trait_and_impl(self, extractor):
+        stub = extractor.extract_stub("user.rs", RUST_SOURCE, "rust")
+        assert stub is not None
+        assert "trait UserRepository" in stub or "UserRepository" in stub
+        assert "impl" in stub
+
+    def test_extract_returns_none_for_tree_sitter_langs(self, extractor):
+        """tree-sitter extract() returns None for TS, but extract_stub() uses regex fallback."""
+        sig = extractor.extract("foo.ts", TYPESCRIPT_SOURCE, "typescript")
+        assert sig is None  # tree-sitter not available
+        stub = extractor.extract_stub("foo.ts", TYPESCRIPT_SOURCE, "typescript")
+        assert stub is not None  # regex fallback kicks in
+
+    def test_empty_source_returns_none(self, extractor):
+        stub = extractor.extract_stub("empty.ts", "", "typescript")
+        assert stub is None
+
+    def test_no_declarations_returns_none(self, extractor):
+        stub = extractor.extract_stub("trivial.ts", "// just a comment\n", "typescript")
+        assert stub is None

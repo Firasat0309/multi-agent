@@ -78,6 +78,37 @@ class BaseAgent(ABC):
         """
         return self._format_context(context)
 
+    @staticmethod
+    def _estimate_max_tokens(context: AgentContext) -> int:
+        """Estimate max_tokens needed for the agentic loop based on context.
+
+        Heuristic: a source file is roughly 3-4 tokens per character.  We need
+        enough headroom for the model's reasoning *plus* the file content it
+        will write via ``write_file``.  The base is 16384; we scale up when we
+        can estimate a larger file.
+        """
+        _BASE = 16384
+        _CHARS_PER_TOKEN = 3.5  # conservative estimate
+
+        # If the target file already exists (FIX_CODE / REVIEW), use its size
+        if context.related_files and context.file_blueprint:
+            existing = context.related_files.get(context.file_blueprint.path, "")
+            if existing:
+                # Need room for reasoning + full rewrite of existing file
+                file_tokens = int(len(existing) / _CHARS_PER_TOKEN)
+                # 2x for reasoning overhead + full file output
+                return max(_BASE, file_tokens * 2)
+
+        # Estimate from dependency count: more deps typically → larger file
+        if context.file_blueprint:
+            dep_count = len(context.file_blueprint.depends_on)
+            if dep_count >= 5:
+                return max(_BASE, 24576)  # complex file with many deps
+            if dep_count >= 3:
+                return max(_BASE, 20480)
+
+        return _BASE
+
     async def execute_agentic(self, context: AgentContext) -> TaskResult:
         """Tool-use loop: agent may request reads, searches, writes, and MCP extensions.
 
@@ -104,6 +135,7 @@ class BaseAgent(ABC):
         max_iterations = 10
         _target = (context.file_blueprint.path if context.file_blueprint else None) or "task"
         _heartbeat_interval = 15  # seconds between "still waiting" log lines
+        _max_tokens = self._estimate_max_tokens(context)
 
         async def _llm_call_with_heartbeat(iteration: int) -> "LLMResponseWithTools":
             """Wrap generate_with_tools with a pre-call log and a periodic heartbeat.
@@ -115,8 +147,8 @@ class BaseAgent(ABC):
             import time as _time
             _t0 = _time.monotonic()
             logger.info(
-                "[%s] LLM call iter %d/%d for %s — waiting for response…",
-                self.__class__.__name__, iteration + 1, max_iterations, _target,
+                "[%s] LLM call iter %d/%d for %s (max_tokens=%d) — waiting for response…",
+                self.__class__.__name__, iteration + 1, max_iterations, _target, _max_tokens,
             )
 
             async def _heartbeat() -> None:
@@ -135,6 +167,7 @@ class BaseAgent(ABC):
                     messages=messages,
                     tools=self.tools,
                     system_prompt=self.system_prompt,
+                    max_tokens=_max_tokens,
                 )
             finally:
                 hb.cancel()
@@ -206,6 +239,29 @@ class BaseAgent(ABC):
                     continue
                 return self._parse_agentic_result(context, response.content, files_written)
 
+            # ── Truncation recovery ────────────────────────────────────────
+            # When the model hits max_tokens without completing a tool call,
+            # it means the output was cut off mid-generation.  Ask it to
+            # continue rather than treating the partial response as final.
+            if response.stop_reason in ("max_tokens", "length", "MAX_TOKENS") and not response.tool_calls:
+                if iteration < max_iterations - 1:
+                    logger.warning(
+                        "%s: output truncated (stop_reason=%r) with no tool calls — "
+                        "requesting continuation (iter %d)",
+                        self.__class__.__name__, response.stop_reason, iteration,
+                    )
+                    messages.append({"role": "assistant", "content": response.raw_content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Your response was cut off before you could call any tools. "
+                            "Please continue and call the appropriate tool (e.g. write_file) "
+                            "to complete the task. Do NOT repeat what you already said — "
+                            "pick up from where you left off."
+                        ),
+                    })
+                    continue
+
             if not response.tool_calls:
                 # Model returned a non-tool_use stop that isn't "end_turn" — treat as done
                 logger.warning(
@@ -243,11 +299,12 @@ class BaseAgent(ABC):
             messages.append({"role": "assistant", "content": response.raw_content})
             messages.append({"role": "user", "content": tool_results})
 
-            # If the target file was just written, return immediately rather
-            # than waiting for the model to emit end_turn.  This prevents
-            # hitting max_iterations when the write happens on the last turn.
+            # If the target file was just written, return immediately — unless
+            # the code was detected as truncated, in which case keep going so
+            # the model sees the warning and can rewrite with complete content.
+            has_truncation = any("TRUNCATED CODE DETECTED" in r.get("content", "") for r in tool_results)
             target_file = context.file_blueprint.path if context.file_blueprint else None
-            if target_file and target_file in files_written:
+            if target_file and target_file in files_written and not has_truncation:
                 return self._parse_agentic_result(context, response.content, files_written)
 
         raise RuntimeError(
@@ -343,6 +400,29 @@ class BaseAgent(ABC):
             header += f"  — use start_line={end + 1} to continue"
         return header + "\n" + "\n".join(chunk)
 
+    @staticmethod
+    def _detect_truncated_code(content: str, path: str) -> str | None:
+        """Check if written code looks truncated (unbalanced braces/brackets).
+
+        Returns a warning message if the code appears incomplete, None otherwise.
+        Applies only to languages that use braces for scoping.
+        """
+        ext = path.rsplit(".", 1)[-1] if "." in path else ""
+        if ext not in ("java", "ts", "tsx", "js", "jsx", "go", "rs", "cs", "kt", "scala", "c", "cpp", "h"):
+            return None
+
+        # Count braces (ignoring those inside string literals and comments)
+        # Simple heuristic: just count raw braces — good enough for detection
+        opens = content.count("{") - content.count("}")
+        if opens >= 2:
+            return (
+                f"⚠ TRUNCATED CODE DETECTED: {opens} unclosed braces in {path}. "
+                f"The file content appears incomplete — it likely ends mid-class or mid-method. "
+                f"Please call write_file again with the COMPLETE file content. "
+                f"Make sure all classes, methods, and blocks are properly closed."
+            )
+        return None
+
     async def _tool_write_file(self, inp: dict) -> str:
         path = inp.get("path", "")
         content = inp.get("content", "")
@@ -351,6 +431,11 @@ class BaseAgent(ABC):
         # Security: async_write_file is scoped to workspace root
         await self.repo.async_write_file(path, content)
         msg = f"Written {len(content)} bytes to {path}"
+        # Detect truncated code (unbalanced braces) and warn the LLM
+        trunc_warning = self._detect_truncated_code(content, path)
+        if trunc_warning:
+            logger.warning("Truncated code detected in %s", path)
+            msg += f"\n{trunc_warning}"
         # Relay broken-import warnings so the LLM can correct or accept them
         broken = getattr(self.repo, "_last_broken_imports", [])
         if broken:

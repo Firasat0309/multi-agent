@@ -13,6 +13,7 @@ class TestStubGenerator:
         gen = self._make_generator("java", tmp_path)
         created = gen.generate_stubs(["src/main/java/com/example/services/UserService.java"])
         assert len(created) == 1
+        gen.flush()
         content = (tmp_path / "src/main/java/com/example/services/UserService.java").read_text()
         assert "package com.example.services;" in content
         assert "public class UserService {" in content
@@ -20,6 +21,7 @@ class TestStubGenerator:
     def test_java_interface_stub(self, tmp_path):
         gen = self._make_generator("java", tmp_path)
         gen.generate_stubs(["src/main/java/com/example/UserRepository.java"])
+        gen.flush()
         content = (tmp_path / "src/main/java/com/example/UserRepository.java").read_text()
         assert "public interface UserRepository {" in content
 
@@ -27,24 +29,28 @@ class TestStubGenerator:
         gen = self._make_generator("go", tmp_path)
         created = gen.generate_stubs(["pkg/handlers/user.go"])
         assert len(created) == 1
+        gen.flush()
         content = (tmp_path / "pkg/handlers/user.go").read_text()
         assert "package handlers" in content
 
     def test_typescript_stub(self, tmp_path):
         gen = self._make_generator("typescript", tmp_path)
         gen.generate_stubs(["src/services/UserService.ts"])
+        gen.flush()
         content = (tmp_path / "src/services/UserService.ts").read_text()
         assert "export class UserService {}" in content
 
     def test_rust_stub(self, tmp_path):
         gen = self._make_generator("rust", tmp_path)
         gen.generate_stubs(["src/user_service.rs"])
+        gen.flush()
         content = (tmp_path / "src/user_service.rs").read_text()
         assert "pub struct UserService;" in content
 
     def test_csharp_stub(self, tmp_path):
         gen = self._make_generator("csharp", tmp_path)
         gen.generate_stubs(["Services/UserService.cs"])
+        gen.flush()
         content = (tmp_path / "Services/UserService.cs").read_text()
         assert "namespace Services" in content
         assert "public class UserService" in content
@@ -64,6 +70,7 @@ class TestStubGenerator:
         gen = self._make_generator("java", tmp_path)
         created = gen.generate_stubs(["src/Foo.java"])
         assert len(created) == 1
+        gen.flush()
         assert (tmp_path / "src/Foo.java").exists()
 
         gen.cleanup_stubs(created)
@@ -83,6 +90,7 @@ class TestStubGenerator:
         ]
         created = gen.generate_stubs(files)
         assert len(created) == 3
+        gen.flush()
         # IPayment should be an interface
         content = (tmp_path / "src/main/java/com/example/IPayment.java").read_text()
         assert "public interface IPayment {" in content
@@ -93,6 +101,7 @@ class TestStubGenerator:
         gen = self._make_generator("kotlin", tmp_path)
         created = gen.generate_stubs(["src/main/kotlin/com/example/services/UserService.kt"])
         assert len(created) == 1
+        gen.flush()
         content = (tmp_path / "src/main/kotlin/com/example/services/UserService.kt").read_text()
         assert "package com.example.services" in content
         assert "class UserService" in content
@@ -100,6 +109,7 @@ class TestStubGenerator:
     def test_kotlin_interface_stub(self, tmp_path):
         gen = self._make_generator("kotlin", tmp_path)
         gen.generate_stubs(["src/main/kotlin/com/example/UserRepository.kt"])
+        gen.flush()
         content = (tmp_path / "src/main/kotlin/com/example/UserRepository.kt").read_text()
         assert "interface UserRepository" in content
 
@@ -109,6 +119,7 @@ class TestStubGenerator:
         gen = self._make_generator("python", tmp_path)
         created = gen.generate_stubs(["src/services/user_service.py"])
         assert len(created) == 1
+        gen.flush()
         content = (tmp_path / "src/services/user_service.py").read_text()
         assert "Auto-generated stub" in content
 
@@ -125,6 +136,7 @@ class TestStubGenerator:
             blueprints={"src/models/user.py": bp},
         )
         assert len(created) == 1
+        gen.flush()
         content = (tmp_path / "src/models/user.py").read_text()
         assert "class UserModel:" in content
         assert "def validate_email" in content

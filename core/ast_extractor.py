@@ -17,6 +17,7 @@ Planned: Go, TypeScript, Rust, C#
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -286,9 +287,25 @@ class ASTExtractor:
         language: str,
         checksum: str = "",
     ) -> str | None:
-        """Extract and render a compact stub, or None if unsupported."""
+        """Extract and render a compact stub, or None if unsupported.
+
+        Tries tree-sitter first, then falls back to regex-based extraction
+        for languages without a tree-sitter grammar (TypeScript, Go, Rust, C#).
+        Returns None only if both methods fail.
+        """
         sig = self.extract(file_path, source_code, language, checksum)
-        return sig.to_stub() if sig else None
+        if sig:
+            return sig.to_stub()
+
+        # Regex fallback for unsupported languages
+        stub = _extract_regex_stub(file_path, source_code, language)
+        if stub:
+            logger.debug(
+                "Regex fallback stub for %s (%d→%d chars, %.0f%% reduction)",
+                file_path, len(source_code), len(stub),
+                (1 - len(stub) / len(source_code)) * 100 if source_code else 0,
+            )
+        return stub
 
     @staticmethod
     def is_supported(language: str) -> bool:
@@ -692,3 +709,202 @@ def _extract_python_function(
         parameters=parameters,
         annotations=decorators or [],
     )
+
+
+# ── Regex-based fallback extraction ──────────────────────────────────────
+#
+# For languages without tree-sitter support (TypeScript, Go, Rust, C#),
+# this extracts imports + declaration signatures via regex.  It skips
+# function/method bodies by tracking brace depth, producing a compact
+# stub (~2KB) instead of blind char-truncation (~8-20KB).
+
+# Patterns that match import / use / require lines across languages.
+_IMPORT_RE = re.compile(
+    r"^(?:"
+    r"import\s+.+|"                        # Java, Python, TS, Go
+    r"from\s+\S+\s+import\s+.+|"          # Python
+    r"(?:const|let|var)\s+.+=\s*require\(.+|"  # Node CJS
+    r"use\s+.+|"                           # Rust
+    r"using\s+.+"                          # C#
+    r")$",
+    re.MULTILINE,
+)
+
+# Patterns that match type/class/interface/struct/enum declaration headers.
+_DECL_HEADER_RE = re.compile(
+    r"^[ \t]*"
+    r"(?:export\s+)?(?:default\s+)?(?:abstract\s+)?"
+    r"(?:pub(?:\(crate\))?\s+)?"
+    r"(?:async\s+)?"
+    r"(?:"
+    r"(?:class|interface|struct|enum|type|trait|impl|namespace|module)\s+"
+    r"|func\s+"                             # Go top-level func
+    r"|fn\s+"                               # Rust fn
+    r"|function\s+"                         # TS/JS function
+    r"|(?:public|private|protected|internal|static)\s+"  # C# member prefix
+    r")"
+    r".+",
+    re.MULTILINE,
+)
+
+# Decorator / annotation lines that precede declarations.
+_DECORATOR_RE = re.compile(r"^[ \t]*(?:@\w+|#\[.+\]).*$", re.MULTILINE)
+
+
+def _extract_regex_stub(file_path: str, source_code: str, language: str) -> str | None:
+    """Extract a compact signature stub using regex heuristics.
+
+    Works for any language — extracts imports, type headers, and
+    function/method signatures while skipping implementation bodies.
+    Returns None only if the file has no recognizable declarations.
+    """
+    lines = source_code.split("\n")
+    out: list[str] = []
+    brace_depth = 0
+    in_body = False
+    body_start_depth = 0
+
+    # Phase 1: collect imports (always at top)
+    in_import_block = False  # Go: import ( ... )
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//") or stripped.startswith("#"):
+            continue
+        # Handle Go multi-line import blocks: import ( ... )
+        if in_import_block:
+            out.append(line.rstrip())
+            if ")" in stripped:
+                in_import_block = False
+            continue
+        if _IMPORT_RE.match(stripped):
+            out.append(line.rstrip())
+            # Check for Go-style `import (` without closing paren
+            if stripped.startswith("import") and "(" in stripped and ")" not in stripped:
+                in_import_block = True
+        elif stripped.startswith("package ") or stripped.startswith("namespace "):
+            out.append(line.rstrip())
+        else:
+            # Stop collecting imports once we hit non-import code
+            break
+
+    if out:
+        out.append("")
+
+    # Phase 2: extract declarations, skip bodies
+    i = 0
+    pending_decorators: list[str] = []
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+
+        # Skip empty lines and comments when not tracking body
+        if not in_body:
+            if not stripped or stripped.startswith("//") or stripped.startswith("/*"):
+                i += 1
+                continue
+
+            # Collect decorators/annotations
+            if _DECORATOR_RE.match(stripped):
+                pending_decorators.append(line.rstrip())
+                i += 1
+                continue
+
+            # Check if this is a declaration header
+            if _DECL_HEADER_RE.match(stripped):
+                # Emit pending decorators
+                out.extend(pending_decorators)
+                pending_decorators = []
+
+                # Extract just the signature (up to opening brace)
+                sig_line = line.rstrip()
+
+                # Count braces on this line
+                open_b = stripped.count("{") - stripped.count("}")
+
+                if _is_type_declaration(stripped):
+                    # Type/class/struct: emit header, enter body-skipping at depth 1
+                    # but still extract nested method signatures
+                    out.append(sig_line)
+                    if open_b > 0:
+                        brace_depth = open_b
+                        in_body = True
+                        body_start_depth = 0  # we want to extract members at depth 1
+                elif "{" in stripped:
+                    # Function with body on same line — emit sig only
+                    sig_only = sig_line.split("{")[0].rstrip()
+                    out.append(sig_only + ";")
+                    # Skip the body
+                    if open_b > 0:
+                        brace_depth = open_b
+                        in_body = True
+                        body_start_depth = brace_depth
+                else:
+                    # No brace yet (e.g., Go func signature spans lines)
+                    out.append(sig_line)
+            else:
+                pending_decorators = []
+
+        else:
+            # We're inside a body — track braces
+            open_b = stripped.count("{") - stripped.count("}")
+            prev_depth = brace_depth
+            brace_depth += open_b
+
+            # At depth 1 inside a type body, extract member signatures
+            if prev_depth == 1 and body_start_depth == 0:
+                if _DECORATOR_RE.match(stripped):
+                    out.append(line.rstrip())
+                elif _is_member_signature(stripped):
+                    sig_only = line.rstrip()
+                    if "{" in sig_only:
+                        sig_only = sig_only.split("{")[0].rstrip() + ";"
+                    out.append(sig_only)
+
+            if brace_depth <= 0:
+                if body_start_depth == 0:
+                    out.append("}")  # close the type
+                    out.append("")
+                in_body = False
+                brace_depth = 0
+
+        i += 1
+
+    # Filter out duplicate/empty and check we got something useful
+    result = "\n".join(out).strip()
+    if not result or len(result) < 20:
+        return None
+
+    return result + "\n"
+
+
+def _is_type_declaration(line: str) -> bool:
+    """Check if a line declares a type (class/interface/struct/enum/trait/impl)."""
+    # Remove common prefixes
+    stripped = re.sub(
+        r"^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:pub(?:\(crate\))?\s+)?",
+        "", line,
+    ).strip()
+    return bool(re.match(
+        r"(?:"
+        r"(?:class|interface|struct|enum|trait|impl|namespace|module)\s"
+        r"|type\s+\w+\s*=\s*\{"       # TS: type X = {
+        r"|type\s+\w+\s+(?:struct|interface)\s"  # Go: type X struct {
+        r")",
+        stripped,
+    ))
+
+
+def _is_member_signature(line: str) -> bool:
+    """Check if a line looks like a method/field declaration inside a type body."""
+    return bool(re.match(
+        r"(?:"
+        r"(?:public|private|protected|internal|static|abstract|async|override|readonly|final|virtual)\s+.+"
+        r"|(?:fn|func|function|def|get|set)\s+\w+"
+        r"|(?:const|let|var|val)\s+\w+"
+        r"|(?:pub(?:\(crate\))?\s+)?fn\s+\w+"  # Rust methods
+        r"|\w+\s*\(.*\)\s*(?::\s*\w+)?"  # TS method shorthand: name(...): Type
+        r"|[a-zA-Z_]\w*\s+[*&]?[a-zA-Z_][\w.<>\[\]*&]*"  # Go struct fields: name Type
+        r"|(?:pub\s+)?[a-zA-Z_]\w*\s*:\s*\S+"  # Rust struct fields: name: Type
+        r")",
+        line,
+    ))

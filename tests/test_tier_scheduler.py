@@ -26,10 +26,9 @@ class TestTierScheduler:
                 "service.java": ["repo.java"],
             },
         )
-        assert len(tiers) == 3
-        assert tiers[0].files == ["model.java"]
-        assert tiers[1].files == ["repo.java"]
-        assert tiers[2].files == ["service.java"]
+        # Linear chain: all single-file tiers merge into one combined tier
+        assert len(tiers) == 1
+        assert tiers[0].files == ["model.java", "repo.java", "service.java"]
 
     def test_diamond_deps(self):
         tiers = self.scheduler.compute_tiers(
@@ -41,6 +40,8 @@ class TestTierScheduler:
                 "top.java": ["left.java", "right.java"],
             },
         )
+        # base (1 file) merges with nothing (next tier has 2 files = fan-out)
+        # [base], [left,right], [top]
         assert len(tiers) == 3
         assert tiers[0].files == ["base.java"]
         assert set(tiers[1].files) == {"left.java", "right.java"}
@@ -82,12 +83,14 @@ class TestTierScheduler:
     # ── Tier indices ───────────────────────────────────────────────
 
     def test_tier_indices_are_sequential(self):
+        # Use a diamond pattern to get multiple tiers (linear chains get merged)
         tiers = self.scheduler.compute_tiers(
-            file_paths=["a.java", "b.java", "c.java"],
+            file_paths=["a.java", "b.java", "c.java", "d.java"],
             file_deps={
                 "a.java": [],
                 "b.java": ["a.java"],
-                "c.java": ["b.java"],
+                "c.java": ["a.java"],
+                "d.java": ["b.java", "c.java"],
             },
         )
         for i, tier in enumerate(tiers):

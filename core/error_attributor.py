@@ -155,8 +155,14 @@ def extract_error_lines(build_output: str, *, max_chars: int = 4000) -> str:
 
     result = "\n".join(error_lines)
     if len(result) > max_chars:
-        # Keep the tail (most relevant errors are at the end)
-        result = result[-max_chars:]
+        # Keep the HEAD — root-cause errors appear first in compiler output.
+        # Cascading "cannot find symbol" errors from downstream files are
+        # symptoms; the fix agent needs the first error to diagnose the cause.
+        result = result[:max_chars]
+        # Don't cut mid-line
+        last_nl = result.rfind("\n")
+        if last_nl > max_chars * 0.8:
+            result = result[:last_nl]
     return result
 
 

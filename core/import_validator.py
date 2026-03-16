@@ -36,7 +36,16 @@ class ImportValidator:
 
     Returns a list of unresolvable import strings so the caller can report
     them without failing the write.
+
+    **Caching**: results are cached by ``(file_path, content_hash, known_files_hash)``
+    so repeated validation of the same file (common during fix cycles) is
+    essentially free.  Call ``clear_cache()`` at checkpoint boundaries if
+    the known-files set changes.
     """
+
+    def __init__(self) -> None:
+        # Cache: (file_path, content_hash, known_files_fingerprint) → broken imports
+        self._cache: dict[tuple[str, int, int], list[str]] = {}
 
     def validate(
         self,
@@ -53,21 +62,47 @@ class ImportValidator:
         if not known_files:
             return []
 
+        # Build cache key: hash content + known_files set for fast lookup.
+        cache_key = (file_path, hash(content), hash(frozenset(known_files)))
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         try:
             if lang.name == "python":
-                return self._validate_python(content, known_files)
-            if lang.name == "java":
-                return self._validate_java(content, known_files)
-            if lang.name == "go":
-                return self._validate_go(content, known_files)
-            if lang.name in ("typescript", "tsx"):
-                return self._validate_typescript(content, file_path, known_files)
+                result = self._validate_python(content, known_files)
+            elif lang.name == "java":
+                result = self._validate_java(content, known_files)
+            elif lang.name == "go":
+                result = self._validate_go(content, known_files)
+            elif lang.name in ("typescript", "tsx"):
+                result = self._validate_typescript(content, file_path, known_files)
+            else:
+                result = []
         except Exception as exc:
             logger.debug(
                 "Import validation error for %s (%s): %s",
                 file_path, lang.name, exc,
             )
-        return []
+            result = []
+
+        self._cache[cache_key] = result
+        # Evict oldest entries when cache grows too large.
+        if len(self._cache) > 500:
+            # Remove ~half the cache (oldest entries first — dict is insertion-ordered).
+            keys = list(self._cache.keys())
+            for k in keys[:250]:
+                del self._cache[k]
+
+        return result
+
+    def clear_cache(self) -> None:
+        """Clear the validation cache.
+
+        Call at checkpoint boundaries when the known-files set changes
+        significantly (new tier generated, stubs added/removed, etc.).
+        """
+        self._cache.clear()
 
     # ── Language-specific validators ─────────────────────────────────────────
 

@@ -36,6 +36,93 @@ _MAX_SEMANTIC_HITS = 3
 _ast_extractor = ASTExtractor()
 
 
+def _smart_truncate(content: str, max_chars: int) -> str:
+    """Truncate source code preserving imports and tail signatures.
+
+    When AST extraction fails, this is far better than blind ``[:max_chars]``
+    which cuts at an arbitrary point and loses critical declarations that
+    appear late in the file (e.g., public methods at line 300+).
+
+    Strategy:
+      1. Always keep imports/package/use lines (top of file)
+      2. Keep the first section of code (class header, early fields)
+      3. Keep the LAST section (public methods the dependent needs)
+      4. Insert a ``... (N lines omitted)`` marker in the middle
+
+    This ensures the LLM sees the API surface at both ends of the file.
+    """
+    if len(content) <= max_chars:
+        return content
+
+    lines = content.split("\n")
+
+    # Phase 1: collect import/package lines (always at top)
+    import_end = 0
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("//") or stripped.startswith("#") or stripped.startswith("/*"):
+            continue
+        if any(stripped.startswith(kw) for kw in (
+            "import ", "from ", "package ", "namespace ", "use ", "using ",
+            "require(", "const ", "let ", "var ",  # JS/TS requires
+        )):
+            import_end = i + 1
+        elif import_end > 0:
+            break  # past the import block
+
+    # Phase 2: split budget — 60% for head (imports + early code), 40% for tail
+    head_budget = int(max_chars * 0.6)
+    tail_budget = max_chars - head_budget
+
+    # Build head: always include ALL import lines, then fill remaining budget
+    # with early code.  This guarantees the LLM sees every import even when
+    # the import block is large (common in Java files with 30+ imports).
+    head_lines: list[str] = []
+    head_chars = 0
+    for i, line in enumerate(lines):
+        if i < import_end:
+            # Import lines are mandatory — include even if over budget
+            head_lines.append(line)
+            head_chars += len(line) + 1
+        elif head_chars + len(line) + 1 > head_budget:
+            break
+        else:
+            head_lines.append(line)
+            head_chars += len(line) + 1
+
+    # Recalculate tail budget: subtract what the head actually consumed.
+    # When mandatory imports exceed the 60% head budget, the tail gets
+    # whatever is left so we still show some API surface from the file end.
+    remaining_budget = max(0, max_chars - head_chars)
+    effective_tail_budget = min(tail_budget, remaining_budget)
+
+    # Build tail: work backwards from end of file
+    tail_lines: list[str] = []
+    tail_chars = 0
+    if effective_tail_budget > 0:
+        for line in reversed(lines):
+            if tail_chars + len(line) + 1 > effective_tail_budget:
+                break
+            tail_lines.append(line)
+            tail_chars += len(line) + 1
+        tail_lines.reverse()
+
+    # Check for overlap (small files might have head and tail overlap)
+    head_end = len(head_lines)
+    tail_start = len(lines) - len(tail_lines) if tail_lines else len(lines)
+    if head_end >= tail_start:
+        # Overlap — just return head (imports are most critical)
+        result = "\n".join(head_lines)
+        if len(result) > max_chars:
+            return result[:max_chars]
+        return result
+
+    omitted = tail_start - head_end
+    marker = f"\n// ... ({omitted} lines omitted) ...\n"
+
+    return "\n".join(head_lines) + marker + "\n".join(tail_lines)
+
+
 # ── Context priority model ───────────────────────────────────────────────────
 
 @dataclass
@@ -143,7 +230,7 @@ class ContextBuilder:
                         priority=2, relevance_score=0.9, is_stub=True,
                     ))
                 else:
-                    trunc = content[:8_000] + "\n# ... (truncated)" if len(content) > 8_000 else content
+                    trunc = _smart_truncate(content, 8_000)
                     candidates.append(ContextFile(
                         path=dep_path, content=trunc,
                         priority=2, relevance_score=0.9, is_stub=False,
@@ -176,7 +263,7 @@ class ContextBuilder:
                     body = (
                         f"// Semantic match\n{stub}"
                         if stub is not None
-                        else content[:4_000] + ("\n# ... (truncated)" if len(content) > 4_000 else "")
+                        else _smart_truncate(content, 4_000)
                     )
                     dist = hit.get("distance", 0.5)
                     score = max(0.0, 1.0 - dist)
@@ -206,7 +293,7 @@ class ContextBuilder:
                 body = (
                     f"// AST stub (signatures only)\n{stub}"
                     if stub is not None
-                    else (content[:8_000] + "\n# ... (truncated)" if len(content) > 8_000 else content)
+                    else _smart_truncate(content, 8_000)
                 )
                 # Relevance score descends linearly from 0.9 (rank 0) to 0.5 (last).
                 relevance = 0.9 - 0.4 * (rank / max(n_ranked - 1, 1))
@@ -412,7 +499,7 @@ class ContextBuilder:
             snippet = (
                 f"// Semantic match (similarity search)\n{stub}"
                 if stub is not None
-                else content[:4_000] + ("\n# ... (truncated)" if len(content) > 4_000 else "")
+                else _smart_truncate(content, 4_000)
             )
             related[file_path] = snippet
             total_chars += len(snippet)
@@ -506,9 +593,7 @@ class ContextBuilder:
                 related[up_path] = f"// AST stub (signatures only)\n{stub}"
                 total_chars += len(stub)
             else:
-                truncated = content[:6_000]
-                if len(content) > 6_000:
-                    truncated += "\n# ... (truncated)"
+                truncated = _smart_truncate(content, 6_000)
                 related[up_path] = truncated
                 total_chars += len(truncated)
 
@@ -528,9 +613,7 @@ class ContextBuilder:
                 related[down_path] = f"// AST stub (dependents)\n{stub}"
                 total_chars += len(stub)
             else:
-                truncated = content[:4_000]
-                if len(content) > 4_000:
-                    truncated += "\n# ... (truncated)"
+                truncated = _smart_truncate(content, 4_000)
                 related[down_path] = truncated
                 total_chars += len(truncated)
 
@@ -553,9 +636,7 @@ class ContextBuilder:
                     related[change.file] = f"// AST stub (related change)\n{stub}"
                     total_chars += len(stub)
                 else:
-                    truncated = content[:4_000]
-                    if len(content) > 4_000:
-                        truncated += "\n# ... (truncated)"
+                    truncated = _smart_truncate(content, 4_000)
                     related[change.file] = truncated
                     total_chars += len(truncated)
 

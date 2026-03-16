@@ -489,29 +489,96 @@ class RepositoryManager:
         than the static blueprint dependencies.  Writes updated
         ``dependency_graph.json`` to the workspace.
         """
-        graph: dict[str, list[str]] = {}
-        known_exports: dict[str, str] = {}  # export_name -> file_path
+        graph = self._compute_full_dep_graph()
 
-        # First pass: build export→file mapping
+        dep_path = self.workspace / "dependency_graph.json"
+        dep_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
+        logger.info(f"Rebuilt dependency graph: {len(graph)} files, "
+                    f"{sum(len(v) for v in graph.values())} edges")
+        return graph
+
+    def update_dependency_graph(self, changed_files: list[str]) -> dict[str, list[str]]:
+        """Incrementally update the dependency graph for only the changed files.
+
+        Instead of recomputing the full O(files × exports) graph, this only
+        recomputes edges for ``changed_files`` and their reverse-dependents
+        (files that import symbols from a changed file).  Much faster when
+        only a handful of files changed in a fix cycle.
+
+        Falls back to a full rebuild if no cached graph exists.
+        """
+        dep_path = self.workspace / "dependency_graph.json"
+        if not dep_path.exists():
+            return self.rebuild_dependency_graph()
+
+        try:
+            raw = json.loads(dep_path.read_text(encoding="utf-8"))
+            if not isinstance(raw, dict):
+                return self.rebuild_dependency_graph()
+            graph: dict[str, list[str]] = raw
+        except (json.JSONDecodeError, OSError):
+            return self.rebuild_dependency_graph()
+
+        # Build export → file mapping (needed to resolve imports)
+        known_exports: dict[str, str] = {}
         for fi in self._repo_index.files:
             for exp in fi.exports:
                 known_exports[exp] = fi.path
 
-        # Second pass: resolve imports to file paths
+        changed_set = set(changed_files)
+
+        # Also recompute edges for files that previously depended on a changed
+        # file — their edges may have become stale if the changed file's exports
+        # were renamed or removed.
+        files_to_update = set(changed_files)
+        for path, deps in graph.items():
+            if any(d in changed_set for d in deps):
+                files_to_update.add(path)
+
+        # Recompute edges only for affected files.
         for fi in self._repo_index.files:
+            if fi.path not in files_to_update:
+                continue
             deps: list[str] = []
             for imp_line in fi.imports:
-                # Extract imported names from the import statement
                 for exp_name, exp_file in known_exports.items():
                     if exp_name in imp_line and exp_file != fi.path:
                         if exp_file not in deps:
                             deps.append(exp_file)
             graph[fi.path] = deps
 
-        dep_path = self.workspace / "dependency_graph.json"
+        # Remove entries for files no longer in the index.
+        indexed_paths = {fi.path for fi in self._repo_index.files}
+        for stale in list(graph.keys()):
+            if stale not in indexed_paths:
+                del graph[stale]
+
         dep_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
-        logger.info(f"Rebuilt dependency graph: {len(graph)} files, "
-                    f"{sum(len(v) for v in graph.values())} edges")
+        logger.info(
+            "Incremental dep graph update: %d files recomputed out of %d total, %d edges",
+            len(files_to_update), len(graph),
+            sum(len(v) for v in graph.values()),
+        )
+        return graph
+
+    def _compute_full_dep_graph(self) -> dict[str, list[str]]:
+        """Compute the full dependency graph from the repo index."""
+        graph: dict[str, list[str]] = {}
+        known_exports: dict[str, str] = {}
+
+        for fi in self._repo_index.files:
+            for exp in fi.exports:
+                known_exports[exp] = fi.path
+
+        for fi in self._repo_index.files:
+            deps: list[str] = []
+            for imp_line in fi.imports:
+                for exp_name, exp_file in known_exports.items():
+                    if exp_name in imp_line and exp_file != fi.path:
+                        if exp_file not in deps:
+                            deps.append(exp_file)
+            graph[fi.path] = deps
+
         return graph
 
     def _build_dep_graph(self, blueprint: RepositoryBlueprint) -> dict[str, list[str]]:

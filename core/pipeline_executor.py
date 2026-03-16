@@ -313,6 +313,9 @@ class PipelineExecutor:
                             new_stubs = stub_gen.generate_stubs(later_files, bp_map)
                             active_stubs.extend(new_stubs)
 
+                        # Flush in-memory stubs to disk just before the build.
+                        stub_gen.flush()
+
                         cycle_result = await self._run_checkpoint(
                             engine, ck_def, tier,
                         )
@@ -465,7 +468,14 @@ class PipelineExecutor:
         by the repo-level checkpoint after the tier completes.
         """
         semaphore = asyncio.Semaphore(self._settings.max_concurrent_agents)
-        phase_timeout = float(self._settings.phase_timeout_seconds)
+        # Per-file timeout: each individual file gets a fixed timeout for any
+        # single lifecycle phase (generate, review, fix).  This should NOT
+        # scale with tier size — a stuck LLM call for one file shouldn't be
+        # allowed to hang for 40+ minutes just because the tier is large.
+        base_phase_timeout = float(self._settings.phase_timeout_seconds)
+        per_file_timeout = min(base_phase_timeout, 600.0)  # cap at 10 min per file
+        # Total tier timeout for staleness detection scales with tier size.
+        phase_timeout = max(base_phase_timeout, 120.0 * len(tier.files))
 
         in_flight: set[str] = set()
         running_tasks: set[asyncio.Task[None]] = set()
@@ -487,12 +497,12 @@ class PipelineExecutor:
                 try:
                     await asyncio.wait_for(
                         self._am._execute_lifecycle_phase(engine, path, phase),
-                        timeout=phase_timeout,
+                        timeout=per_file_timeout,
                     )
                 except asyncio.TimeoutError:
                     logger.error(
                         "[%s] %s timed out after %ds — marking FAILED",
-                        path, phase.value, int(phase_timeout),
+                        path, phase.value, int(per_file_timeout),
                     )
                     try:
                         engine.process_event(path, EventType.RETRIES_EXHAUSTED)
@@ -629,13 +639,28 @@ class PipelineExecutor:
         # Collect all known files for attribution
         known_files = set(engine._lifecycles.keys())
 
+        # Scale timeout with project size.  The base timeout (180s) is fine for
+        # incremental rebuilds, but the first `mvn package` on a 50-file project
+        # downloads all dependencies + compiles everything — easily 5-10 minutes.
+        # If the process is killed early, we get 0 error output → 0 attributed
+        # errors → the same death-spiral as the parse-failure bug.
+        base_timeout = checkpoint_def.timeout
+        scaled_timeout = max(base_timeout, 60 * len(tier.files))
+        # First build (tier 0) gets extra time for dependency downloads.
+        if tier.index == 0:
+            scaled_timeout = max(scaled_timeout, 600)  # at least 10 min
+        logger.debug(
+            "[Checkpoint] Timeout: base=%ds, scaled=%ds (tier=%d, files=%d)",
+            base_timeout, scaled_timeout, tier.index, len(tier.files),
+        )
+
         checkpoint = BuildCheckpoint(
             build_command=build_command,
             terminal=self._am.build_terminal,
             attributor=CompilerErrorAttributor(),
             known_files=known_files,
             max_retries=checkpoint_def.max_retries,
-            timeout=checkpoint_def.timeout,
+            timeout=scaled_timeout,
             checkpoint_name=f"tier{tier.index}_{checkpoint_def.name}",
         )
 
@@ -912,7 +937,11 @@ class PipelineExecutor:
     async def _run_test_phase(self, engine: LifecycleEngine) -> None:
         """Run test generation for all files that reached TESTING phase."""
         semaphore = asyncio.Semaphore(self._settings.max_concurrent_agents)
-        phase_timeout = float(self._settings.phase_timeout_seconds)
+        # Scale with the number of files being tested
+        testable = engine.get_files_in_phase(FilePhase.TESTING)
+        n_test_files = len(testable) if testable else 1
+        base_phase_timeout = float(self._settings.phase_timeout_seconds)
+        phase_timeout = max(base_phase_timeout, 120.0 * n_test_files)
 
         in_flight: set[str] = set()
         running_tasks: set[asyncio.Task[None]] = set()

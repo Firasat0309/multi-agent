@@ -633,7 +633,7 @@ class LLMClient:
         messages: list[dict],
         tools: list[ToolDefinition],
         system_prompt: str = "",
-        max_tokens: int = 8192,
+        max_tokens: int = 16384,
     ) -> LLMResponseWithTools:
         """Multi-turn tool-use call — supported for all three providers.
 

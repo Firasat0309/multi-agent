@@ -36,7 +36,14 @@ logger = logging.getLogger(__name__)
 
 
 class StubGenerator:
-    """Creates minimal type stubs for files that haven't been generated yet."""
+    """Creates minimal type stubs for files that haven't been generated yet.
+
+    Stubs are kept in an in-memory overlay and only flushed to disk just
+    before a build checkpoint needs them.  This avoids 2× disk I/O per stub
+    (write + delete) on every checkpoint cycle.  Call ``flush()`` to write
+    all pending stubs to disk, and ``cleanup_stubs()`` to remove them after
+    the build.
+    """
 
     def __init__(
         self,
@@ -45,16 +52,21 @@ class StubGenerator:
     ) -> None:
         self._lang = language_name
         self._workspace = workspace
+        # Virtual overlay: path → stub content (not yet on disk)
+        self._overlay: dict[str, str] = {}
+        # Paths that were actually written to disk (need cleanup)
+        self._on_disk: set[str] = set()
 
     def generate_stubs(
         self,
         stub_files: list[str],
         blueprints: dict[str, object] | None = None,
     ) -> list[str]:
-        """Generate stub files on disk for the given paths.
+        """Add stubs to the in-memory overlay for the given paths.
 
-        Only creates stubs for files that don't already exist.
-        Returns list of paths that were actually created (for cleanup).
+        Only generates stubs for files that don't already exist on disk.
+        Returns list of paths that were added (for tracking).
+        Call ``flush()`` to write them to disk before a build.
 
         Args:
             stub_files: Workspace-relative paths to create stubs for.
@@ -66,31 +78,63 @@ class StubGenerator:
             abs_path = self._workspace / file_path
             if abs_path.exists():
                 continue  # file already generated, no stub needed
+            if file_path in self._overlay:
+                continue  # already in overlay
 
             content = self._generate_stub_content(file_path, blueprints)
             if content is None:
                 continue
 
-            # Ensure parent dirs exist
-            abs_path.parent.mkdir(parents=True, exist_ok=True)
-            abs_path.write_text(content, encoding="utf-8")
+            self._overlay[file_path] = content
             created.append(file_path)
-            logger.debug("Created stub: %s", file_path)
+            logger.debug("Queued stub (in-memory): %s", file_path)
 
         if created:
-            logger.info("Generated %d stubs for forward references: %s", len(created), created)
+            logger.info("Queued %d stubs for forward references: %s", len(created), created)
         return created
 
+    def flush(self) -> int:
+        """Write all in-memory stubs to disk.
+
+        Called just before a build checkpoint so the compiler can see them.
+        Returns the number of stubs written.
+        """
+        written = 0
+        for file_path, content in self._overlay.items():
+            abs_path = self._workspace / file_path
+            if abs_path.exists():
+                continue  # real file appeared in the meantime
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_text(content, encoding="utf-8")
+            self._on_disk.add(file_path)
+            written += 1
+            logger.debug("Flushed stub to disk: %s", file_path)
+        if written:
+            logger.info("Flushed %d stubs to disk for build checkpoint", written)
+        return written
+
     def cleanup_stubs(self, stub_files: list[str]) -> None:
-        """Delete previously generated stub files.
+        """Delete previously generated stub files from disk and overlay.
 
         Called before the actual file generation begins for a tier.
         """
         for file_path in stub_files:
+            self._overlay.pop(file_path, None)
+            if file_path in self._on_disk:
+                abs_path = self._workspace / file_path
+                if abs_path.exists():
+                    abs_path.unlink()
+                    logger.debug("Cleaned up stub: %s", file_path)
+                self._on_disk.discard(file_path)
+
+    def cleanup_all(self) -> None:
+        """Remove all stubs from disk and clear the overlay."""
+        for file_path in list(self._on_disk):
             abs_path = self._workspace / file_path
             if abs_path.exists():
                 abs_path.unlink()
-                logger.debug("Cleaned up stub: %s", file_path)
+        self._on_disk.clear()
+        self._overlay.clear()
 
     def _generate_stub_content(
         self,
