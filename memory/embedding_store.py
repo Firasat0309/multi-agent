@@ -77,26 +77,31 @@ class EmbeddingStore:
         """Inner init that runs under ``_chroma_init_lock``."""
         try:
             import chromadb
-            from chromadb.utils.embedding_functions import (
-                SentenceTransformerEmbeddingFunction,
-            )
+        except ImportError:
+            logger.warning("chromadb not installed, vector memory disabled")
+            self._client = None
+            return
 
+        try:
             # chromadb >= 0.4 uses PersistentClient; the old Settings-based
             # constructor was removed.
             self._client = chromadb.PersistentClient(path=self._persist_dir)
 
             # Use the configured embedding model so collection semantics stay
             # consistent across runs and match the user's hardware budget.
+            ef = None
             try:
+                from chromadb.utils.embedding_functions import (
+                    SentenceTransformerEmbeddingFunction,
+                )
                 ef = SentenceTransformerEmbeddingFunction(
                     model_name=self._embedding_model
                 )
-            except Exception as e:
+            except (ImportError, Exception) as e:
                 logger.warning(
                     "Could not load embedding model '%s' (%s); falling back to ChromaDB default",
                     self._embedding_model, e,
                 )
-                ef = None  # chromadb will use its built-in default
 
             kwargs: dict[str, Any] = {
                 "name": self._collection_name,
@@ -106,8 +111,6 @@ class EmbeddingStore:
                 kwargs["embedding_function"] = ef
 
             self._collection = self._client.get_or_create_collection(**kwargs)
-        except ImportError:
-            logger.warning("chromadb not installed, vector memory disabled")
             self._client = None
         except Exception as e:
             logger.warning("ChromaDB init failed (%s) — vector memory disabled", e)
