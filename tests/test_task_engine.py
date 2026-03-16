@@ -234,7 +234,10 @@ class TestLifecyclePlanBuilder:
         _, global_graph = builder.build(self._make_blueprint())
 
         task_types = {t.task_type for t in global_graph.tasks.values()}
-        assert TaskType.SECURITY_SCAN in task_types
+        # Security and integration are now handled by dedicated checkpoints
+        assert TaskType.SECURITY_SCAN not in task_types
+        assert TaskType.GENERATE_INTEGRATION_TEST not in task_types
+        # Advisory tasks remain in the global DAG
         assert TaskType.REVIEW_MODULE in task_types
         assert TaskType.REVIEW_ARCHITECTURE in task_types
         assert TaskType.GENERATE_DEPLOY in task_types

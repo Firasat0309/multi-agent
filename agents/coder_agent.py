@@ -455,6 +455,7 @@ class CoderAgent(BaseAgent):
         review_output: str = context.task.metadata.get("review_output", "")
         build_errors: str = context.task.metadata.get("build_errors", "")
         test_errors: str = context.task.metadata.get("test_errors", "")
+        security_errors: str = context.task.metadata.get("security_vulnerabilities", "")
         fix_trigger: str = context.task.metadata.get("fix_trigger", "review")
 
         # Read current file content from the repo (non-blocking)
@@ -481,12 +482,44 @@ class CoderAgent(BaseAgent):
         # blind tail truncation.  Tail truncation loses the root-cause error
         # (first file that broke) in favour of downstream cascading failures,
         # causing the fix agent to treat symptoms rather than the cause.
-        if fix_trigger == "build" and build_errors:
+        if fix_trigger in ("build", "build_unattributed") and build_errors:
             filtered = extract_error_lines(build_errors, max_chars=_MAX_ERROR_CHARS)
             issues_text = "Compilation/build errors to fix:\n" + filtered
-        elif fix_trigger == "test" and test_errors:
+        elif fix_trigger == "security" and security_errors:
+            # Security vulnerabilities — already formatted with severity,
+            # type, description, and remediation guidance.
+            capped = security_errors[:_MAX_ERROR_CHARS]
+            issues_text = (
+                "Security vulnerabilities to fix:\n" + capped + "\n\n"
+                "IMPORTANT: Apply the remediation for each vulnerability. "
+                "Do NOT remove or break existing functionality — only fix "
+                "the security issue (e.g., parameterize queries, sanitize "
+                "inputs, remove hardcoded secrets, add auth checks)."
+            )
+        elif fix_trigger == "security_rebuild" and build_errors:
+            filtered = extract_error_lines(build_errors, max_chars=_MAX_ERROR_CHARS)
+            issues_text = (
+                "Security fixes broke the build. Fix compilation errors:\n"
+                + filtered
+            )
+        elif fix_trigger in ("test", "integration_test") and test_errors:
             filtered = extract_error_lines(test_errors, max_chars=_MAX_ERROR_CHARS)
             issues_text = "Test failures to fix:\n" + filtered
+        elif fix_trigger == "integration_test_code" and test_errors:
+            # Fixing the test code itself, not the source
+            filtered = extract_error_lines(test_errors, max_chars=_MAX_ERROR_CHARS)
+            issues_text = (
+                "Integration test code has errors — fix the TEST code:\n"
+                + filtered + "\n\n"
+                "IMPORTANT: Fix the test imports, assertions, endpoint paths, "
+                "or test setup — do NOT change the source code being tested."
+            )
+        elif fix_trigger == "integration_rebuild" and build_errors:
+            filtered = extract_error_lines(build_errors, max_chars=_MAX_ERROR_CHARS)
+            issues_text = (
+                "Source fix for integration tests broke the build. "
+                "Fix compilation errors:\n" + filtered
+            )
         elif review_errors:
             issues_text = "\n".join(f"- {e}" for e in review_errors)
         else:
@@ -559,11 +592,16 @@ class CoderAgent(BaseAgent):
     def _format_fix_context(self, context: AgentContext) -> str:
         """Minimal context for fix tasks — architecture + blueprint only.
 
-        Deliberately excludes related_files: during a fix the agent already has
-        the broken file content in the prompt, and dumping dependency source code
-        on top of it consumes tokens without improving fix quality.  The model
-        can call read_file via tools if it genuinely needs an interface.
+        For build fixes, related_files are excluded: the error is within the
+        file itself.
+
+        For security and integration fixes, related_files are INCLUDED
+        (truncated) because the fix often requires knowing the interface of
+        dependent files (e.g., DTO field names for parameterized queries,
+        controller signatures for integration test fixes).
         """
+        fix_trigger: str = context.task.metadata.get("fix_trigger", "review")
+
         parts: list[str] = []
         if context.architecture_summary:
             parts.append(f"## Architecture\n{context.architecture_summary[:1000]}")
@@ -577,6 +615,38 @@ class CoderAgent(BaseAgent):
                 f"Depends on: {', '.join(fb.depends_on) or 'none'}\n"
                 f"Exports: {', '.join(fb.exports) or 'TBD'}"
             )
+
+        # Security and integration fixes benefit from seeing dependency code.
+        # A SQL injection fix needs DTO field names; an integration test
+        # source fix needs the controller + service interface.
+        _TRIGGERS_NEEDING_DEPS = (
+            "security", "integration_test", "integration_test_code",
+        )
+        if fix_trigger in _TRIGGERS_NEEDING_DEPS and context.related_files:
+            dep_sections: list[str] = []
+            total_chars = 0
+            max_dep_chars = 4000  # budget for dependency context
+
+            for dep_path, dep_content in context.related_files.items():
+                # Skip the target file itself — it's already in the prompt
+                if dep_path == context.task.file:
+                    continue
+                if not dep_content:
+                    continue
+                # Truncate each dependency to keep within budget
+                chunk = dep_content[:1500]
+                dep_sections.append(f"--- {dep_path} ---\n{chunk}")
+                total_chars += len(chunk)
+                if total_chars >= max_dep_chars:
+                    dep_sections.append("... (remaining dependencies omitted)")
+                    break
+
+            if dep_sections:
+                parts.append(
+                    "## Related Files (for reference — do NOT modify these)\n"
+                    + "\n\n".join(dep_sections)
+                )
+
         return "\n\n".join(parts)
 
     async def _try_diff_fix(

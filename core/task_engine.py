@@ -209,7 +209,16 @@ class LifecyclePlanBuilder:
             if fb.layer in ("test", "config", "deploy"):
                 engine.skip_testing(fb.path)
 
-        # ── Build global task graph (runs after all files terminal) ──
+        # ── Build global task graph (advisory tasks — runs in parallel with
+        #    security/integration checkpoints) ──
+        #
+        # Security scan and integration tests are NO LONGER in the global DAG.
+        # They are handled by dedicated checkpoints in PipelineExecutor with
+        # feedback loops (scan → fix → rebuild → re-scan).
+        #
+        # The global DAG now contains only advisory/fire-and-forget tasks:
+        # module review, architecture review, deploy, and docs — all running
+        # in parallel (only gated by the sentinel).
         global_graph = TaskGraph()
 
         # Sentinel task: marks lifecycle completion (auto-completed by executor)
@@ -222,16 +231,6 @@ class LifecyclePlanBuilder:
             metadata={"sentinel": True},
         )
         global_graph.add_task(lifecycle_done)
-
-        # Security scan
-        sec_task = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.SECURITY_SCAN,
-            file="*",
-            description="Security scan of entire codebase",
-            dependencies=[lifecycle_done.task_id],
-        )
-        global_graph.add_task(sec_task)
 
         # Module review
         mod_review = Task(
@@ -259,43 +258,33 @@ class LifecyclePlanBuilder:
             global_graph.add_task(mod_fix)
             mod_fix_ids.append(mod_fix.task_id)
 
-        # Integration tests — run after all per-file fixes and module review
-        integration_test = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.GENERATE_INTEGRATION_TEST,
-            file="tests/integration/",
-            description="Generate integration tests verifying cross-module interactions",
-            dependencies=mod_fix_ids + [sec_task.task_id],
-        )
-        global_graph.add_task(integration_test)
-
-        # Architecture review (after integration tests + security)
+        # Architecture review — depends only on sentinel (advisory, no feedback)
         arch_review = Task(
             task_id=self._alloc_id(),
             task_type=TaskType.REVIEW_ARCHITECTURE,
             file="*",
             description="Architecture review for dependency cycles and layer violations",
-            dependencies=[integration_test.task_id],
+            dependencies=[lifecycle_done.task_id],
         )
         global_graph.add_task(arch_review)
 
-        # Deploy
+        # Deploy — depends only on sentinel (runs in parallel with everything)
         deploy_task = Task(
             task_id=self._alloc_id(),
             task_type=TaskType.GENERATE_DEPLOY,
             file="deploy/",
             description="Generate Dockerfile and Kubernetes manifests",
-            dependencies=[arch_review.task_id],
+            dependencies=[lifecycle_done.task_id],
         )
         global_graph.add_task(deploy_task)
 
-        # Docs
+        # Docs — depends only on sentinel (runs in parallel with everything)
         docs_task = Task(
             task_id=self._alloc_id(),
             task_type=TaskType.GENERATE_DOCS,
             file="docs/",
             description="Generate README, changelog, API docs",
-            dependencies=[arch_review.task_id],
+            dependencies=[lifecycle_done.task_id],
         )
         global_graph.add_task(docs_task)
 

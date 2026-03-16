@@ -129,10 +129,26 @@ class SecurityAgent(BaseAgent):
         summary = validated.summary or "Security scan complete"
         status = "PASSED" if passed else f"NEEDS ATTENTION ({len(critical)} critical/high)"
 
+        # Build structured vulnerability data for downstream fix cycles.
+        # Each entry maps directly to an AttributedError for the security
+        # checkpoint to dispatch targeted SECURITY_FIX tasks.
+        vuln_details = [
+            {
+                "file": v.file,
+                "line": v.line,
+                "severity": v.severity,
+                "type": v.type,
+                "description": v.description,
+                "remediation": v.remediation,
+            }
+            for v in vulns
+        ]
+
         return TaskResult(
-            # Security scan completing is always a successful task execution.
-            # Vulnerabilities are findings, not task failures — they don't block the pipeline.
-            success=True,
+            # When critical/high vulnerabilities exist, report failure so the
+            # security checkpoint can trigger fix cycles.  Medium/low findings
+            # are informational and do not fail the task.
+            success=passed,
             output=f"[{status}] {summary}",
             errors=[v.description for v in critical],
             metrics={
@@ -140,6 +156,7 @@ class SecurityAgent(BaseAgent):
                 "critical_count": len(critical),
                 "passed": passed,
                 "bandit_findings": len(bandit_findings),
+                "vulnerabilities": vuln_details,
                 **self.get_metrics(),
             },
         )

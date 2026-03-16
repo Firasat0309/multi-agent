@@ -300,17 +300,28 @@ class RunPipeline:
                 and checkpoints_passed
             )
             tests_passed = stats.get("lifecycle_tests_degraded", 0) == 0
-            # Overall success requires code to generate correctly; test quality is
-            # reported separately so a run with working code is never masked as
-            # a total failure just because generated tests are imperfect.
+
+            # Security and integration checkpoints are soft gates — failures
+            # result in DEGRADED quality, not pipeline failure.
+            sec_ck = exec_result.get("security_checkpoint", {})
+            int_ck = exec_result.get("integration_checkpoint", {})
+            security_passed = sec_ck.get("passed", True)
+            integration_passed = int_ck.get("passed", True)
+            quality_passed = security_passed and integration_passed
+
+            # Overall success requires code to generate correctly; security and
+            # integration are quality signals reported separately.
             success = code_success
 
             self._complete_phase("Finalize")
             logger.info(
-                "Pipeline %s | code_success=%s tests_passed=%s | stats=%s | elapsed=%.1fs",
+                "Pipeline %s | code_success=%s tests_passed=%s "
+                "security_passed=%s integration_passed=%s | stats=%s | elapsed=%.1fs",
                 "SUCCEEDED" if success else "COMPLETED WITH ISSUES",
                 code_success,
                 tests_passed,
+                security_passed,
+                integration_passed,
                 stats,
                 elapsed,
             )

@@ -137,6 +137,42 @@ class Phase:
 
 
 @dataclass
+class SecurityCheckpointDef:
+    """Definition for the post-generation security hardening checkpoint.
+
+    After all tiers complete, the security agent scans the full codebase.
+    Critical/high findings are attributed to files and dispatched as
+    SECURITY_FIX tasks.  A rebuild verifies the fixes compile, then
+    a re-scan confirms the findings are resolved.
+
+    Only critical and high severity vulnerabilities trigger fix cycles.
+    Medium/low findings are reported but do not block the pipeline.
+
+    Attributes:
+        max_cycles: Maximum scan → fix → rebuild → re-scan iterations.
+        max_fixes_per_file: Cap on fix dispatches per file across all cycles.
+    """
+
+    max_cycles: int = 2
+    max_fixes_per_file: int = 2
+
+
+@dataclass
+class IntegrationCheckpointDef:
+    """Definition for the integration test verification checkpoint.
+
+    After security hardening, integration tests are generated and run.
+    On failure, an LLM triage determines whether the test code or source
+    code is at fault, and the appropriate fix is dispatched.
+
+    Attributes:
+        max_cycles: Maximum generate/run → triage → fix → re-run iterations.
+    """
+
+    max_cycles: int = 2
+
+
+@dataclass
 class PipelineDefinition:
     """Complete declarative pipeline specification.
 
@@ -147,6 +183,8 @@ class PipelineDefinition:
     name: str
     phases: list[Phase] = field(default_factory=list)
     global_tasks: list[TaskType] = field(default_factory=list)
+    security_checkpoint: SecurityCheckpointDef | None = None
+    integration_checkpoint: IntegrationCheckpointDef | None = None
 
     @property
     def has_checkpoints(self) -> bool:
@@ -195,14 +233,17 @@ GENERATE_PIPELINE = PipelineDefinition(
             ],
         ),
     ],
+    # Advisory tasks — run in parallel with security/integration, no feedback loop.
     global_tasks=[
-        TaskType.SECURITY_SCAN,
         TaskType.REVIEW_MODULE,
-        TaskType.GENERATE_INTEGRATION_TEST,
         TaskType.REVIEW_ARCHITECTURE,
         TaskType.GENERATE_DEPLOY,
         TaskType.GENERATE_DOCS,
     ],
+    # Security hardening: scan → fix critical/high → rebuild → re-scan (max 2 cycles)
+    security_checkpoint=SecurityCheckpointDef(max_cycles=2, max_fixes_per_file=2),
+    # Integration verification: generate → run → triage → fix → re-run (max 2 cycles)
+    integration_checkpoint=IntegrationCheckpointDef(max_cycles=2),
 )
 
 
@@ -241,6 +282,7 @@ ENHANCE_PIPELINE = PipelineDefinition(
     global_tasks=[
         TaskType.REVIEW_MODULE,
     ],
+    security_checkpoint=SecurityCheckpointDef(max_cycles=2, max_fixes_per_file=2),
 )
 
 

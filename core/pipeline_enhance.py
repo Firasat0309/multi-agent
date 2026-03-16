@@ -404,13 +404,19 @@ class EnhancePipeline:
             and stats.get("lifecycle_failed", 0) == 0
             and checkpoints_passed
         )
+
+        # Security checkpoint is a soft gate for enhance pipeline
+        sec_ck = exec_result.get("security_checkpoint", {})
+        security_passed = sec_ck.get("passed", True)
+
         success = code_success
 
         self._complete_phase("Finalize")
         logger.info(
-            "Modification pipeline %s | code_success=%s | stats=%s | elapsed=%.1fs",
+            "Modification pipeline %s | code_success=%s security_passed=%s "
+            "| stats=%s | elapsed=%.1fs",
             "SUCCEEDED" if success else "COMPLETED WITH ISSUES",
-            code_success, stats, elapsed,
+            code_success, security_passed, stats, elapsed,
         )
 
         token_cost = self._build_token_cost()

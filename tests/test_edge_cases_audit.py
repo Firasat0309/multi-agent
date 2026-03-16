@@ -103,7 +103,9 @@ class TestCoderFixCodeTestErrors:
         import inspect
         source = inspect.getsource(CoderAgent._fix_code)
         assert "test_errors" in source
-        assert 'fix_trigger == "test"' in source
+        # test and integration_test triggers both use test_errors
+        assert '"test"' in source
+        assert '"integration_test"' in source
 
 
 class TestIncrementalDepGraphEdgeCases:

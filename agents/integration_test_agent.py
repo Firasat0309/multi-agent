@@ -126,12 +126,19 @@ class IntegrationTestAgent(BaseAgent):
 
         # Optionally run integration tests when a terminal is available
         run_result: dict[str, Any] = {}
+        tests_passed = True
+        test_output = ""
         if self.terminal:
             run_result = await self._run_integration_tests(test_file, profile)
+            tests_passed = run_result.get("integration_tests_passed", True)
+            test_output = run_result.get("integration_test_output", "")
 
         return TaskResult(
-            success=True,
+            # Report failure when integration tests actually ran and failed,
+            # so the integration checkpoint can trigger fix cycles.
+            success=tests_passed,
             output=f"Integration tests written: {test_file}",
+            errors=[test_output] if not tests_passed and test_output else [],
             files_modified=[test_file],
             metrics={
                 **self.get_metrics(),
@@ -246,22 +253,37 @@ class IntegrationTestAgent(BaseAgent):
     async def _run_integration_tests(
         self, test_file: str, profile: LanguageProfile
     ) -> dict[str, Any]:
-        """Run integration tests if a terminal is available. Non-blocking on failure."""
+        """Run integration tests if a terminal is available.
+
+        Returns pass/fail status and captured test output for downstream
+        triage by the integration checkpoint.
+        """
         cmd = self._build_run_command(test_file, profile)
         logger.info("Running integration tests: %s", cmd)
         try:
             result = await self.terminal.run_command(cmd)
             passed = result.exit_code == 0
+            raw_output = "\n".join(
+                filter(None, [result.stdout, result.stderr])
+            ).strip()
             if not passed:
                 logger.warning(
                     "Integration tests did not pass (exit=%d): %s",
                     result.exit_code,
-                    (result.stdout + result.stderr)[:400],
+                    raw_output[:400],
                 )
-            return {"integration_tests_passed": passed, "integration_exit_code": result.exit_code}
+            return {
+                "integration_tests_passed": passed,
+                "integration_exit_code": result.exit_code,
+                "integration_test_output": raw_output[:6000],
+            }
         except Exception as e:
-            logger.warning("Integration test run failed (non-critical): %s", e)
-            return {"integration_tests_passed": False, "integration_run_error": str(e)}
+            logger.warning("Integration test run failed: %s", e)
+            return {
+                "integration_tests_passed": False,
+                "integration_run_error": str(e),
+                "integration_test_output": str(e),
+            }
 
     def _build_run_command(self, test_file: str, profile: LanguageProfile) -> str:
         if profile.name == "python":

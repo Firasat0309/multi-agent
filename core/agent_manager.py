@@ -89,6 +89,7 @@ TASK_AGENT_MAP: dict[TaskType, type[BaseAgent]] = {
     TaskType.GENERATE_DEPLOY: DeployAgent,
     TaskType.GENERATE_DOCS: WriterAgent,
     TaskType.FIX_CODE: CoderAgent,
+    TaskType.SECURITY_FIX: CoderAgent,
     TaskType.MODIFY_FILE: PatchAgent,
     TaskType.GENERATE_INTEGRATION_TEST: IntegrationTestAgent,
     TaskType.DESIGN_ARCHITECTURE: ArchitectAgent,

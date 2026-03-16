@@ -4,8 +4,10 @@ from core.models import TaskType
 from core.pipeline_definition import (
     CheckpointDef,
     FileTaskDef,
+    IntegrationCheckpointDef,
     Phase,
     PipelineDefinition,
+    SecurityCheckpointDef,
     GENERATE_PIPELINE,
     ENHANCE_PIPELINE,
 )
@@ -28,9 +30,27 @@ class TestPipelineDefinition:
         assert test_phase.checkpoint is None
 
     def test_generate_pipeline_global_tasks(self):
-        assert TaskType.SECURITY_SCAN in GENERATE_PIPELINE.global_tasks
+        # Security and integration are now handled by dedicated checkpoints,
+        # not the global DAG.  Only advisory tasks remain in global_tasks.
+        assert TaskType.SECURITY_SCAN not in GENERATE_PIPELINE.global_tasks
+        assert TaskType.GENERATE_INTEGRATION_TEST not in GENERATE_PIPELINE.global_tasks
         assert TaskType.GENERATE_DEPLOY in GENERATE_PIPELINE.global_tasks
         assert TaskType.GENERATE_DOCS in GENERATE_PIPELINE.global_tasks
+        assert TaskType.REVIEW_MODULE in GENERATE_PIPELINE.global_tasks
+        assert TaskType.REVIEW_ARCHITECTURE in GENERATE_PIPELINE.global_tasks
+
+    def test_generate_pipeline_security_checkpoint(self):
+        assert GENERATE_PIPELINE.security_checkpoint is not None
+        assert GENERATE_PIPELINE.security_checkpoint.max_cycles == 2
+        assert GENERATE_PIPELINE.security_checkpoint.max_fixes_per_file == 2
+
+    def test_generate_pipeline_integration_checkpoint(self):
+        assert GENERATE_PIPELINE.integration_checkpoint is not None
+        assert GENERATE_PIPELINE.integration_checkpoint.max_cycles == 2
+
+    def test_enhance_pipeline_security_checkpoint(self):
+        assert ENHANCE_PIPELINE.security_checkpoint is not None
+        assert ENHANCE_PIPELINE.integration_checkpoint is None
 
     def test_enhance_pipeline_structure(self):
         assert ENHANCE_PIPELINE.name == "enhance"

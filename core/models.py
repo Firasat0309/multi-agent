@@ -50,6 +50,7 @@ class TaskType(str, Enum):
     MODIFY_FILE = "modify_file"
     # ── Quality & validation task types ──
     GENERATE_INTEGRATION_TEST = "generate_integration_test"
+    SECURITY_FIX = "security_fix"
     DESIGN_ARCHITECTURE = "design_architecture"
     CREATE_PLAN = "create_plan"
     VERIFY_BUILD = "verify_build"

@@ -53,6 +53,8 @@ def cli(verbose: bool) -> None:
 )
 @click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
 @click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent")
+@click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
+@click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
 def generate(
     prompt: str,
     workspace: str,
@@ -64,6 +66,8 @@ def generate(
     allow_host_execution: bool,
     skip_tester: bool,
     skip_reviewer: bool,
+    skip_security: bool,
+    skip_integration: bool,
 ) -> None:
     """Generate a backend project from a natural language prompt."""
     try:
@@ -72,6 +76,10 @@ def generate(
             skip.add("tester")
         if skip_reviewer:
             skip.add("reviewer")
+        if skip_security:
+            skip.add("security")
+        if skip_integration:
+            skip.add("integration")
 
         settings = Settings(
             workspace_dir=Path(workspace).resolve(),
@@ -155,6 +163,8 @@ def status(workspace: str) -> None:
 )
 @click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
 @click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent")
+@click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
+@click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
 def enhance(
     prompt: str,
     workspace: str,
@@ -166,6 +176,8 @@ def enhance(
     allow_host_execution: bool,
     skip_tester: bool,
     skip_reviewer: bool,
+    skip_security: bool,
+    skip_integration: bool,
 ) -> None:
     """Modify an existing project based on a natural language prompt.
 
@@ -192,6 +204,10 @@ def enhance(
             skip.add("tester")
         if skip_reviewer:
             skip.add("reviewer")
+        if skip_security:
+            skip.add("security")
+        if skip_integration:
+            skip.add("integration")
 
         settings = Settings(
             workspace_dir=ws,
