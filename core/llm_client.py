@@ -188,7 +188,9 @@ class LLMClient:
                     "Get your key at: https://aistudio.google.com/app/apikey"
                 )
 
-        # Check model validity
+        # Check model validity (skip for custom base URLs — in-house models won't match)
+        if provider == LLMProvider.OPENAI and self.config.openai_base_url:
+            return
         valid_models = self.VALID_MODELS.get(provider, [])
         if valid_models and self.config.model not in valid_models:
             logger.warning(
@@ -210,10 +212,13 @@ class LLMClient:
                 )
             elif self.config.provider == LLMProvider.OPENAI:
                 import openai
-                self._client = openai.OpenAI(
-                    api_key=self.config.openai_api_key,
-                    timeout=_REQUEST_TIMEOUT,
-                )
+                kwargs: dict[str, Any] = {
+                    "api_key": self.config.openai_api_key,
+                    "timeout": _REQUEST_TIMEOUT,
+                }
+                if self.config.openai_base_url:
+                    kwargs["base_url"] = self.config.openai_base_url
+                self._client = openai.OpenAI(**kwargs)
             elif self.config.provider == LLMProvider.GEMINI:
                 import google.generativeai as genai
                 genai.configure(api_key=self.config.gemini_api_key)

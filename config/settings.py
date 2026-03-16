@@ -39,6 +39,7 @@ class LLMConfig:
     temperature: float = 0.2
     api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""))
     openai_api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
+    openai_base_url: str = field(default_factory=lambda: os.environ.get("OPENAI_BASE_URL", ""))
     gemini_api_key: str = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY", ""))
 
 
@@ -105,6 +106,7 @@ class Settings:
                 model=os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514"),
                 api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
                 openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
+                openai_base_url=os.environ.get("OPENAI_BASE_URL", ""),
                 gemini_api_key=os.environ.get("GEMINI_API_KEY", ""),
             ),
             sandbox=SandboxConfig(
