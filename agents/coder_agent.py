@@ -63,9 +63,23 @@ def _validate_rewrite(
     file_path: str,
     operation: str,
 ) -> TaskResult | None:
-    """Validate a code rewrite and return TaskResult if validation fails, None if valid."""
+    """Validate a code rewrite and return TaskResult if validation fails, None if valid.
+
+    Returns ``success=True`` with ``files_modified=[]`` when the rewrite is
+    rejected.  This is deliberate: in the lifecycle flow,
+    ``success=False`` fires ``RETRIES_EXHAUSTED`` which **immediately kills
+    the file** — a single bad LLM output (probabilistic!) would permanently
+    block the file and cascade failures to all downstream dependents.
+    ``success=True`` fires ``FIX_APPLIED`` instead, which sends the file back
+    through the review→fix cycle for another attempt.  It burns one review
+    round on unchanged code, but the file stays alive and the fix-count
+    budget eventually terminates the loop gracefully via DEGRADED.
+
+    For the checkpoint path (``_dispatch_fix``), the return value is
+    discarded anyway — the build simply re-runs regardless.
+    """
     original_size = len(original_content)
-    
+
     # ── Guard: reject rewrites that inflate the file (likely LLM duplication) ──
     if original_size > 0 and len(new_content) > original_size * _MAX_CONTENT_GROWTH:
         logger.warning(
@@ -74,10 +88,10 @@ def _validate_rewrite(
             operation, file_path, len(new_content), _MAX_CONTENT_GROWTH * 100, original_size,
         )
         return TaskResult(
-            success=False,
+            success=True,
             output=f"{operation} for {file_path} skipped — rewrite was too large (likely duplicated content)",
-            errors=[f"Content inflation detected: {len(new_content)} bytes vs {original_size} original"],
-            metrics={},
+            files_modified=[],
+            metrics={"rewrite_rejected": True},
         )
 
     # ── Guard: detect duplicate class/function definitions ────────────────
@@ -88,10 +102,10 @@ def _validate_rewrite(
             operation, file_path,
         )
         return TaskResult(
-            success=False,
+            success=True,
             output=f"{operation} for {file_path} skipped — duplicate definitions detected in LLM output",
-            errors=["Duplicate class/function definitions detected in LLM output"],
-            metrics={},
+            files_modified=[],
+            metrics={"rewrite_rejected": True},
         )
 
     # ── Guard: skip write if content is identical ─────────────────────────
