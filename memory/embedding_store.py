@@ -111,7 +111,6 @@ class EmbeddingStore:
                 kwargs["embedding_function"] = ef
 
             self._collection = self._client.get_or_create_collection(**kwargs)
-            self._client = None
         except Exception as e:
             logger.warning("ChromaDB init failed (%s) — vector memory disabled", e)
             self._client = None
