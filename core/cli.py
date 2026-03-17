@@ -260,6 +260,10 @@ def enhance(
     default=False,
     help="Allow running without Docker isolation (NOT recommended for untrusted prompts)",
 )
+@click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
+@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent")
+@click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
+@click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
 def fullstack(
     prompt: str,
     workspace: str,
@@ -270,6 +274,10 @@ def fullstack(
     no_interactive: bool,
     figma_url: str,
     allow_host_execution: bool,
+    skip_tester: bool,
+    skip_reviewer: bool,
+    skip_security: bool,
+    skip_integration: bool,
 ) -> None:
     """Generate a complete fullstack project (backend + frontend) from a prompt.
 
@@ -286,6 +294,16 @@ def fullstack(
         python -m core.cli fullstack "Build a Task Manager SaaS app" -w ./my-app
     """
     try:
+        skip = set()
+        if skip_tester:
+            skip.add("tester")
+        if skip_reviewer:
+            skip.add("reviewer")
+        if skip_security:
+            skip.add("security")
+        if skip_integration:
+            skip.add("integration")
+
         settings = Settings(
             workspace_dir=Path(workspace).resolve(),
             llm=LLMConfig(
@@ -295,6 +313,7 @@ def fullstack(
             sandbox=SandboxConfig(sandbox_type=SandboxType(sandbox)),
             max_concurrent_agents=max_agents,
             allow_host_execution=allow_host_execution or sandbox == "local",
+            skip_agents=frozenset(skip),
         )
 
         pipeline = Pipeline(settings, interactive=not no_interactive)

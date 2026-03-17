@@ -248,7 +248,7 @@ class DesignParserAgent(BaseAgent):
             "Please return ONLY the corrected JSON object — no explanation, "
             "no markdown fences.  Fix the syntax error and output valid JSON."
         )
-        retry_result = await self.llm_client.generate(
+        retry_result = await self.llm.generate(
             system_prompt=self.system_prompt,
             user_prompt=corrective_prompt,
             max_tokens=4096,
