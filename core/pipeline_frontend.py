@@ -1161,33 +1161,90 @@ class FrontendPipeline:
         (css_dir / css_file).write_text(globals_css, encoding="utf-8")
         logger.info("Wrote %s/%s", css_dir.relative_to(workspace), css_file)
 
-        # ── tsconfig.json (with @/ path alias) ────────────────────────────
-        tsconfig = {
-            "compilerOptions": {
-                "target": "es5",
-                "lib": ["dom", "dom.iterable", "esnext"],
-                "allowJs": True,
-                "skipLibCheck": True,
-                "strict": True,
-                "noEmit": True,
-                "esModuleInterop": True,
-                "module": "esnext",
-                "moduleResolution": "bundler",
-                "resolveJsonModule": True,
-                "isolatedModules": True,
-                "jsx": "preserve",
-                "incremental": True,
-                "plugins": [{"name": "next"}],
-                "paths": {"@/*": ["./src/*"]},
-            },
-            "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts"],
-            "exclude": ["node_modules"],
-        }
+        # ── tsconfig.json (framework-aware) ──────────────────────────────
+        if "vue" in fw:
+            tsconfig = {
+                "compilerOptions": {
+                    "target": "ES2020",
+                    "useDefineForClassFields": True,
+                    "module": "ESNext",
+                    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+                    "skipLibCheck": True,
+                    "moduleResolution": "bundler",
+                    "allowImportingTsExtensions": True,
+                    "resolveJsonModule": True,
+                    "isolatedModules": True,
+                    "noEmit": True,
+                    "jsx": "preserve",
+                    "strict": True,
+                    "noUnusedLocals": False,
+                    "noUnusedParameters": False,
+                    "noFallthroughCasesInSwitch": True,
+                    "paths": {"@/*": ["./src/*"]},
+                },
+                "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue"],
+                "references": [{"path": "./tsconfig.node.json"}],
+            }
+            # Vue also needs tsconfig.node.json for vite config
+            tsconfig_node = {
+                "compilerOptions": {
+                    "composite": True,
+                    "skipLibCheck": True,
+                    "module": "ESNext",
+                    "moduleResolution": "bundler",
+                    "allowSyntheticDefaultImports": True,
+                },
+                "include": ["vite.config.ts"],
+            }
+            (workspace / "tsconfig.node.json").write_text(
+                _json.dumps(tsconfig_node, indent=2), encoding="utf-8"
+            )
+        elif "angular" in fw:
+            tsconfig = {
+                "compilerOptions": {
+                    "target": "ES2022",
+                    "module": "ES2022",
+                    "lib": ["ES2022", "dom"],
+                    "strict": True,
+                    "esModuleInterop": True,
+                    "moduleResolution": "node",
+                    "paths": {"@/*": ["./src/*"]},
+                },
+                "include": ["src/**/*.ts"],
+            }
+        else:
+            # Next.js / React
+            tsconfig = {
+                "compilerOptions": {
+                    "target": "es5",
+                    "lib": ["dom", "dom.iterable", "esnext"],
+                    "allowJs": True,
+                    "skipLibCheck": True,
+                    "strict": True,
+                    "noEmit": True,
+                    "esModuleInterop": True,
+                    "module": "esnext",
+                    "moduleResolution": "bundler",
+                    "resolveJsonModule": True,
+                    "isolatedModules": True,
+                    "jsx": "preserve",
+                    "incremental": True,
+                    "paths": {"@/*": ["./src/*"]},
+                },
+                "include": ["**/*.ts", "**/*.tsx"],
+                "exclude": ["node_modules"],
+            }
+            if "next" in fw:
+                tsconfig["compilerOptions"]["plugins"] = [{"name": "next"}]
+                tsconfig["include"] = [
+                    "next-env.d.ts", "**/*.ts", "**/*.tsx", ".next/types/**/*.ts",
+                ]
+
         tsconfig_path = workspace / "tsconfig.json"
         tsconfig_path.write_text(_json.dumps(tsconfig, indent=2), encoding="utf-8")
         logger.info("Wrote tsconfig.json")
 
-        # ── next.config.js ────────────────────────────────────────────────
+        # ── Framework-specific config ─────────────────────────────────────
         if "next" in fw:
             next_config = (
                 "/** @type {import('next').NextConfig} */\n"
@@ -1196,16 +1253,72 @@ class FrontendPipeline:
             )
             (workspace / "next.config.js").write_text(next_config, encoding="utf-8")
             logger.info("Wrote next.config.js")
+        elif "vue" in fw:
+            vite_config = (
+                "import { defineConfig } from 'vite';\n"
+                "import vue from '@vitejs/plugin-vue';\n"
+                "import { fileURLToPath, URL } from 'node:url';\n\n"
+                "export default defineConfig({\n"
+                "  plugins: [vue()],\n"
+                "  resolve: {\n"
+                "    alias: {\n"
+                "      '@': fileURLToPath(new URL('./src', import.meta.url)),\n"
+                "    },\n"
+                "  },\n"
+                "});\n"
+            )
+            (workspace / "vite.config.ts").write_text(vite_config, encoding="utf-8")
+            logger.info("Wrote vite.config.ts")
+
+            # Vue entry point: index.html
+            index_html = (
+                '<!DOCTYPE html>\n<html lang="en">\n<head>\n'
+                '  <meta charset="UTF-8" />\n'
+                '  <meta name="viewport" content="width=device-width, initial-scale=1.0" />\n'
+                f'  <title>{requirements.title}</title>\n'
+                '</head>\n<body>\n'
+                '  <div id="app"></div>\n'
+                '  <script type="module" src="/src/main.ts"></script>\n'
+                '</body>\n</html>\n'
+            )
+            (workspace / "index.html").write_text(index_html, encoding="utf-8")
+            logger.info("Wrote index.html")
+
+            # Vue main.ts entry point
+            src_dir = workspace / "src"
+            src_dir.mkdir(parents=True, exist_ok=True)
+            main_ts = (
+                "import { createApp } from 'vue';\n"
+                "import { createPinia } from 'pinia';\n"
+                "import App from './App.vue';\n"
+                "import router from './router';\n"
+                "import './assets/main.css';\n\n"
+                "const app = createApp(App);\n"
+                "app.use(createPinia());\n"
+                "app.use(router);\n"
+                "app.mount('#app');\n"
+            )
+            (src_dir / "main.ts").write_text(main_ts, encoding="utf-8")
+            logger.info("Wrote src/main.ts")
 
         # ── tailwind.config.js + postcss.config.js ────────────────────────
         if "tailwind" in styling:
+            if "vue" in fw:
+                content_globs = (
+                    "    './index.html',\n"
+                    "    './src/**/*.{vue,js,ts,jsx,tsx}',\n"
+                )
+            else:
+                content_globs = (
+                    "    './src/pages/**/*.{js,ts,jsx,tsx,mdx}',\n"
+                    "    './src/components/**/*.{js,ts,jsx,tsx,mdx}',\n"
+                    "    './src/app/**/*.{js,ts,jsx,tsx,mdx}',\n"
+                )
             tailwind_config = (
                 "/** @type {import('tailwindcss').Config} */\n"
                 "module.exports = {\n"
                 "  content: [\n"
-                "    './src/pages/**/*.{js,ts,jsx,tsx,mdx}',\n"
-                "    './src/components/**/*.{js,ts,jsx,tsx,mdx}',\n"
-                "    './src/app/**/*.{js,ts,jsx,tsx,mdx}',\n"
+                f"{content_globs}"
                 "  ],\n"
                 "  theme: { extend: {} },\n"
                 "  plugins: [],\n"
