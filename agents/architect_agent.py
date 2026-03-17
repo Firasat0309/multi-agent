@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any
 
 from agents.base_agent import BaseAgent
@@ -204,7 +205,16 @@ class ArchitectAgent(BaseAgent):
                 len(text),
             )
 
-        result = self._parse_json_response(text)
+        try:
+            result = self._parse_json_response(text)
+        except ValueError as parse_err:
+            # Retry: ask the LLM to fix its own malformed JSON
+            logger.warning(
+                "Architecture JSON parse failed (%s) — retrying with corrective prompt",
+                parse_err,
+            )
+            result = await self._retry_json_parse(text, parse_err)
+
         blueprint = self._parse_blueprint(result)
 
         # ── Call 2: architecture_doc (separate, non-critical) ─────────────────
@@ -260,8 +270,53 @@ class ArchitectAgent(BaseAgent):
         return blueprint
 
     @staticmethod
-    def _parse_json_response(text: str) -> dict[str, Any]:
-        """Parse JSON from LLM output, handling fences and partial responses."""
+    def _repair_json(text: str) -> str:
+        """Best-effort repair of common LLM JSON mistakes.
+
+        Handles: trailing commas, single-quoted strings, JS-style comments,
+        unquoted property names, and truncated JSON (unclosed brackets/braces).
+        """
+        # Strip JS-style comments
+        text = re.sub(r"//[^\n]*", "", text)
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        # Replace single-quoted strings with double-quoted
+        text = re.sub(r"(?<=[:,\[\{])\s*'([^']*)'", r' "\1"', text)
+        text = re.sub(r"'([^']*)'(?=\s*[:,\]\}])", r'"\1"', text)
+        # Remove trailing commas before } or ]
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+        # Quote unquoted property names
+        text = re.sub(r'(?<=[{,])\s*([a-zA-Z_]\w*)\s*:', r' "\1":', text)
+
+        # Close truncated JSON: count open/close braces and brackets
+        text = text.rstrip()
+        # Remove trailing comma if the JSON is about to be closed
+        text = re.sub(r",\s*$", "", text)
+        # Close any open string (unmatched quote)
+        in_string = False
+        escaped = False
+        for ch in text:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+        if in_string:
+            text += '"'
+
+        open_braces = text.count("{") - text.count("}")
+        open_brackets = text.count("[") - text.count("]")
+        # Remove trailing comma before closing
+        text = re.sub(r",\s*$", "", text.rstrip())
+        text += "]" * max(0, open_brackets)
+        text += "}" * max(0, open_braces)
+        return text
+
+    @classmethod
+    def _parse_json_response(cls, text: str) -> dict[str, Any]:
+        """Parse JSON from LLM output, handling fences, partial responses, and repair."""
         text = text.strip()
         if text.startswith("```"):
             lines = text.split("\n")
@@ -270,21 +325,70 @@ class ArchitectAgent(BaseAgent):
                 lines = lines[:-1]
             text = "\n".join(lines)
 
+        # 1. Try strict parse
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            # Try to extract the outermost JSON object
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start != -1 and end > start:
-                try:
-                    return json.loads(text[start:end])
-                except json.JSONDecodeError:
-                    pass
-            logger.error("Could not parse architecture JSON: %s...", text[:200])
+            pass
+
+        # 2. Try extracting the outermost JSON object
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start:end])
+            except json.JSONDecodeError:
+                pass
+
+        # 3. Try repair (handles trailing commas, truncated JSON, etc.)
+        try:
+            extracted = text[start:] if start != -1 else text
+            repaired = cls._repair_json(extracted)
+            result = json.loads(repaired)
+            logger.info("Architecture JSON repair succeeded")
+            return result
+        except (json.JSONDecodeError, Exception):
+            pass
+
+        logger.error("Could not parse architecture JSON: %s...", text[:200])
+        raise ValueError(
+            "Failed to parse architecture JSON from LLM response. "
+            "The model returned malformed or truncated JSON. "
+        )
+
+    async def _retry_json_parse(
+        self, malformed_text: str, parse_error: Exception
+    ) -> dict[str, Any]:
+        """Ask the LLM to fix its own malformed architecture JSON.
+
+        Returns the parsed dict on success, raises ValueError on failure.
+        """
+        corrective_prompt = (
+            "Your previous response was not valid JSON. The parser returned:\n"
+            f"  {parse_error}\n\n"
+            "Here is the broken output (first 3000 chars):\n"
+            f"{malformed_text[:3000]}\n\n"
+            "Please return ONLY the corrected and COMPLETE JSON object — no explanation, "
+            "no markdown fences. Fix the syntax error and output valid JSON.\n"
+            "Make sure all arrays and objects are properly closed."
+        )
+        retry_response = await self._llm_with_heartbeat(
+            system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
+            user_prompt=corrective_prompt,
+            max_tokens=12288,
+            label="architecture JSON retry",
+        )
+        self._metrics["llm_calls"] += 1
+        self._metrics["tokens_used"] += sum(retry_response.usage.values())
+
+        try:
+            result = self._parse_json_response(retry_response.content)
+            logger.info("Architecture JSON retry succeeded")
+            return result
+        except ValueError:
             raise ValueError(
-                "Failed to parse architecture JSON from LLM response. "
-                "The model returned malformed or truncated JSON. "
+                "Failed to parse architecture JSON after retry. "
+                "The model returned malformed or truncated JSON on both attempts. "
                 "Please try again — the LLM may need a simpler prompt or a different provider."
             )
 
