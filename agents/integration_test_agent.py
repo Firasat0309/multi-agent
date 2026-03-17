@@ -287,7 +287,9 @@ class IntegrationTestAgent(BaseAgent):
 
     def _build_run_command(self, test_file: str, profile: LanguageProfile) -> str:
         if profile.name == "python":
-            return f"pytest -v --tb=short {profile.test_root}/{test_file}"
+            # test_file is already relative to workspace root (e.g. "tests/integration/...")
+            # so don't prepend test_root again
+            return f"pytest -v --tb=short {test_file}"
         elif profile.name == "java":
             return "mvn failsafe:integration-test"
         elif profile.name == "go":

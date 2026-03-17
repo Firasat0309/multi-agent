@@ -1594,6 +1594,8 @@ class PipelineExecutor:
         # Read the test file content
         try:
             test_content = self._am.repo.read_file(test_file)
+            if test_content is None:
+                test_content = "(could not read test file)"
         except Exception:
             test_content = "(could not read test file)"
 

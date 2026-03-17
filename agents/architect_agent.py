@@ -8,7 +8,7 @@ import logging
 from typing import Any
 
 from agents.base_agent import BaseAgent
-from core.language import detect_language_from_blueprint
+from core.language import LANGUAGE_PROFILES, detect_language_from_blueprint
 from core.models import (
     AgentContext,
     AgentRole,
@@ -50,7 +50,8 @@ class ArchitectAgent(BaseAgent):
             "Plus cross-cutting: config, middleware, util\n\n"
 
             "STEP 4 — PRODUCE JSON:\n"
-            "You MUST respond with a single JSON object (no markdown fences, no prose):\n"
+            "You MUST respond with a single JSON object (no markdown fences, no prose).\n"
+            "Do NOT include an 'architecture_doc' field — it will be generated separately.\n"
             "{\n"
             '  "name": "project-name-in-kebab-case",\n'
             '  "description": "One-sentence description of what this project does",\n'
@@ -71,8 +72,7 @@ class ArchitectAgent(BaseAgent):
             '      "language": "<language-tag>",\n'
             '      "layer": "model|repository|service|controller|config|middleware|util"\n'
             "    }\n"
-            "  ],\n"
-            '  "architecture_doc": "<markdown-string>"\n'
+            "  ]\n"
             "}\n\n"
 
             "RULES FOR file_blueprints:\n"
@@ -95,17 +95,7 @@ class ArchitectAgent(BaseAgent):
             "- ALWAYS include the application entry point / main configuration file\n"
             "- ALWAYS include the database configuration file (application.properties, .env, etc.)\n"
             "- Use consistent naming conventions throughout: snake_case for Python, "
-            "PascalCase for Java/C# classes, camelCase for TypeScript\n\n"
-
-            "RULES FOR architecture_doc:\n"
-            "The architecture_doc MUST be a markdown string with these exact sections:\n"
-            "# Architecture\\n"
-            "## Overview (2-3 sentences)\\n"
-            "## Tech Stack (bullet list of language, framework, db, build tool)\\n"
-            "## Layer Diagram (ASCII showing model→repo→service→controller)\\n"
-            "## API Endpoints (table: Method | Path | Description | Controller)\\n"
-            "## Database Schema (table: Entity | Fields | Relationships)\\n"
-            "## Configuration (list of config files and their purpose)\\n"
+            "PascalCase for Java/C# classes, camelCase for TypeScript\n"
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
@@ -177,10 +167,9 @@ class ArchitectAgent(BaseAgent):
     async def design_architecture(self, user_prompt: str) -> RepositoryBlueprint:
         """Design a complete repository blueprint from user requirements.
 
-        Uses a higher max_tokens limit because the architecture JSON (with
-        15+ file blueprints and a full architecture_doc) routinely exceeds
-        the default 8192 tokens.  If the response is truncated, we attempt
-        one continuation to complete the JSON.
+        Split into two LLM calls:
+        1. Main call — file blueprints + tech_stack (compact JSON, fits in one response)
+        2. Doc call  — architecture_doc markdown (fetched separately to avoid truncation)
         """
         logger.info("Designing architecture from user prompt")
 
@@ -196,12 +185,12 @@ class ArchitectAgent(BaseAgent):
                 "Configure it as an embedded in-memory datasource.]"
             )
 
-        # Architecture responses are large — use 16k tokens to avoid truncation.
-        logger.info("Sending architecture request to LLM (max_tokens=16384) — this may take 30-90s …")
+        # ── Call 1: file blueprints + tech_stack (no architecture_doc) ────────
+        logger.info("Sending architecture request to LLM (max_tokens=12288) — this may take 30-90s …")
         response = await self._llm_with_heartbeat(
             system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
             user_prompt=effective_prompt,
-            max_tokens=16384,
+            max_tokens=12288,
             label="architecture design",
         )
         self._metrics["llm_calls"] += 1
@@ -209,27 +198,66 @@ class ArchitectAgent(BaseAgent):
 
         text = response.content
 
-        # If still truncated, request one continuation
         if response.stop_reason in ("max_tokens", "length", "MAX_TOKENS"):
-            logger.warning("Architecture response truncated — requesting continuation")
-            continuation = await self._llm_with_heartbeat(
-                system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
-                user_prompt=(
-                    f"{effective_prompt}\n\n"
-                    f"Your previous JSON response was cut off. Here is the end:\n"
-                    f"```\n{text[-500:]}\n```\n"
-                    f"Continue EXACTLY from the cut-off point to complete the JSON. "
-                    f"Output only the continuation — no preamble."
-                ),
-                max_tokens=8192,
-                label="architecture continuation",
+            logger.warning(
+                "Architecture response truncated at %d chars — JSON is likely incomplete",
+                len(text),
             )
-            self._metrics["llm_calls"] += 1
-            self._metrics["tokens_used"] += sum(continuation.usage.values())
-            text += continuation.content
 
         result = self._parse_json_response(text)
-        return self._parse_blueprint(result)
+        blueprint = self._parse_blueprint(result)
+
+        # ── Call 2: architecture_doc (separate, non-critical) ─────────────────
+        blueprint = await self._fetch_architecture_doc(blueprint, effective_prompt)
+
+        return blueprint
+
+    async def _fetch_architecture_doc(
+        self, blueprint: RepositoryBlueprint, user_prompt: str
+    ) -> RepositoryBlueprint:
+        """Fetch architecture documentation in a separate LLM call.
+
+        This is intentionally non-fatal — if it fails, the blueprint is still
+        usable with an empty architecture_doc.
+        """
+        file_list = "\n".join(
+            f"  - {fb.path} [{fb.layer}]: {fb.purpose}"
+            for fb in blueprint.file_blueprints
+        )
+        doc_prompt = (
+            f"Generate architecture documentation for this project.\n\n"
+            f"Project: {blueprint.name}\n"
+            f"Description: {blueprint.description}\n"
+            f"Style: {blueprint.architecture_style}\n"
+            f"Tech stack: {blueprint.tech_stack}\n"
+            f"Files:\n{file_list}\n\n"
+            f"Original requirements: {user_prompt[:2000]}\n\n"
+            "Write a markdown document with these exact sections:\n"
+            "# Architecture\n"
+            "## Overview (2-3 sentences)\n"
+            "## Tech Stack (bullet list of language, framework, db, build tool)\n"
+            "## Layer Diagram (ASCII showing model→repo→service→controller)\n"
+            "## API Endpoints (table: Method | Path | Description | Controller)\n"
+            "## Database Schema (table: Entity | Fields | Relationships)\n"
+            "## Configuration (list of config files and their purpose)\n\n"
+            "Output ONLY the markdown — no JSON wrapper, no fences."
+        )
+
+        try:
+            logger.info("Fetching architecture documentation…")
+            doc_response = await self._llm_with_heartbeat(
+                system_prompt="You are a technical writer. Output clean markdown only.",
+                user_prompt=doc_prompt,
+                max_tokens=4096,
+                label="architecture doc",
+            )
+            self._metrics["llm_calls"] += 1
+            self._metrics["tokens_used"] += sum(doc_response.usage.values())
+            blueprint.architecture_doc = doc_response.content.strip()
+        except Exception:
+            logger.warning("Failed to fetch architecture doc — continuing without it")
+
+        return blueprint
 
     @staticmethod
     def _parse_json_response(text: str) -> dict[str, Any]:
@@ -254,13 +282,64 @@ class ArchitectAgent(BaseAgent):
                 except json.JSONDecodeError:
                     pass
             logger.error("Could not parse architecture JSON: %s...", text[:200])
-            return {}
+            raise ValueError(
+                "Failed to parse architecture JSON from LLM response. "
+                "The model returned malformed or truncated JSON. "
+                "Please try again — the LLM may need a simpler prompt or a different provider."
+            )
 
     def _parse_blueprint(self, data: dict[str, Any]) -> RepositoryBlueprint:
         from core.llm_schema import validate_architecture_response
 
         # Raises pydantic.ValidationError on structurally invalid data.
         validated = validate_architecture_response(data)
+
+        # Fail fast if the LLM returned valid JSON but with no useful content
+        if not validated.file_blueprints:
+            raise ValueError(
+                "Architecture design returned 0 file blueprints. "
+                "The LLM response was valid JSON but contained no files to generate. "
+                "This usually means the response was truncated or malformed. "
+                "Please try again."
+            )
+        if not validated.tech_stack.get("language"):
+            raise ValueError(
+                "Architecture design is missing 'language' in tech_stack. "
+                "The LLM did not specify a programming language. "
+                "Please try again with an explicit language in your prompt "
+                "(e.g. 'Java Spring Boot', 'Python FastAPI')."
+            )
+
+        # Validate that the language is recognized — don't silently default
+        raw_lang = validated.tech_stack["language"].lower().strip()
+        if raw_lang not in LANGUAGE_PROFILES:
+            supported = ", ".join(sorted(LANGUAGE_PROFILES.keys()))
+            raise ValueError(
+                f"Architecture design specified unrecognized language '{raw_lang}'. "
+                f"Supported languages: {supported}. "
+                f"Please try again with a supported language in your prompt."
+            )
+
+        # Detect duplicate file paths — last-one-wins silently loses work
+        seen_paths: dict[str, int] = {}
+        for i, fb in enumerate(validated.file_blueprints):
+            if fb.path in seen_paths:
+                logger.warning(
+                    "Duplicate file path '%s' in blueprint (indices %d and %d) "
+                    "— keeping first occurrence, dropping duplicate",
+                    fb.path, seen_paths[fb.path], i,
+                )
+            else:
+                seen_paths[fb.path] = i
+        if len(seen_paths) < len(validated.file_blueprints):
+            # Deduplicate: keep first occurrence of each path
+            deduped: list[Any] = []
+            seen: set[str] = set()
+            for fb in validated.file_blueprints:
+                if fb.path not in seen:
+                    deduped.append(fb)
+                    seen.add(fb.path)
+            validated.file_blueprints = deduped
 
         tech_stack = validated.tech_stack
         project_lang = detect_language_from_blueprint(tech_stack).name

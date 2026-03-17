@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -335,6 +338,11 @@ def get_language_profile(name: str) -> LanguageProfile:
             return RUST
         if any(kw in name_lower for kw in ("asp.net", "dotnet", ".net")):
             return CSHARP
+        logger.warning(
+            "Unrecognized language '%s' — defaulting to Python. "
+            "Supported languages: %s",
+            name, ", ".join(sorted(LANGUAGE_PROFILES.keys())),
+        )
         return PYTHON
     return profile
 
