@@ -24,7 +24,7 @@ _TSC_ERROR_RE = re.compile(
     r"^(?P<file>[^(\n]+)\((?P<line>\d+),(?P<col>\d+)\):\s*error\s+(?P<code>TS\d+):\s*(?P<message>.+)$"
 )
 
-_DEFAULT_TSCONFIG = """{
+_DEFAULT_TSCONFIG_REACT = """{
   "compilerOptions": {
     "target": "ES2020",
     "module": "ESNext",
@@ -37,6 +37,25 @@ _DEFAULT_TSCONFIG = """{
     "allowSyntheticDefaultImports": true
   },
   "include": ["src/**/*"]
+}
+"""
+
+_DEFAULT_TSCONFIG_VUE = """{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "preserve",
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "src/**/*.vue"]
 }
 """
 
@@ -69,22 +88,32 @@ class TSXCompileResult:
 
 
 class TSXCompiler:
-    """Runs the TypeScript compiler in check-only mode and parses its output."""
+    """Runs the TypeScript compiler in check-only mode and parses its output.
 
-    async def check(self, workspace: Path) -> TSXCompileResult:
-        """Run ``tsc --noEmit`` in *workspace* and return structured errors.
+    For Vue projects, uses ``vue-tsc`` (which understands .vue SFC files)
+    instead of plain ``tsc``.
+    """
+
+    async def check(
+        self, workspace: Path, *, framework: str = "",
+    ) -> TSXCompileResult:
+        """Run ``tsc --noEmit`` (or ``vue-tsc`` for Vue) and return structured errors.
 
         A missing ``tsconfig.json`` is created automatically with sensible
         defaults so the check can run even on freshly generated workspaces.
         """
+        is_vue = "vue" in framework.lower()
+        compiler = "vue-tsc" if is_vue else "tsc"
+
         tsconfig = workspace / "tsconfig.json"
         if not tsconfig.exists():
-            tsconfig.write_text(_DEFAULT_TSCONFIG, encoding="utf-8")
+            default_cfg = _DEFAULT_TSCONFIG_VUE if is_vue else _DEFAULT_TSCONFIG_REACT
+            tsconfig.write_text(default_cfg, encoding="utf-8")
             logger.debug("Created default tsconfig.json in %s", workspace)
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tsc",
+                compiler,
                 "--noEmit",
                 "--pretty",
                 "false",
@@ -94,7 +123,8 @@ class TSXCompiler:
             )
         except FileNotFoundError:
             logger.warning(
-                "tsc not found on PATH — skipping TypeScript compilation check"
+                "%s not found on PATH — skipping TypeScript compilation check",
+                compiler,
             )
             return TSXCompileResult(tsc_available=False)
 

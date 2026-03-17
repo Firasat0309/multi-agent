@@ -231,7 +231,9 @@ class FrontendPipeline:
             # not present in the plan — and synthesize minimal stubs so they are
             # generated rather than left as empty nodes in the dependency graph.
             planned_names = {c.name for c in ordered_components}
-            ghost_components = self._find_ghost_dependencies(ordered_components, planned_names)
+            ghost_components = self._find_ghost_dependencies(
+                ordered_components, planned_names, framework=component_plan.framework,
+            )
             if ghost_components:
                 logger.info(
                     "[FE Phase 4] Adding %d unplanned dependency stubs: %s",
@@ -329,7 +331,7 @@ class FrontendPipeline:
             checkpoint_def = FRONTEND_PIPELINE.phases[0].checkpoint
             max_fix_retries = checkpoint_def.max_retries if checkpoint_def else 2
 
-            compile_result = await tsx_compiler.check(workspace)
+            compile_result = await tsx_compiler.check(workspace, framework=component_plan.framework)
             tsx_build_passed = True
 
             if not compile_result.tsc_available:
@@ -375,7 +377,7 @@ class FrontendPipeline:
                             logger.error("Fix task failed: %s", fix_res)
 
                     # Re-check compilation
-                    compile_result = await tsx_compiler.check(workspace)
+                    compile_result = await tsx_compiler.check(workspace, framework=component_plan.framework)
                     if not compile_result.errors:
                         logger.info("[FE Phase 4.5] TSX compilation passed after %d fix(es)", retry + 1)
                         break
@@ -804,13 +806,18 @@ class FrontendPipeline:
             "state": plan.state_solution,
             "styling": requirements.tech_preferences.get("styling", "tailwind"),
         }
+        if "vue" in fw.lower():
+            folders = ["src/components", "src/views", "src/stores", "src/composables",
+                       "src/lib", "src/router", "src/assets"]
+        else:
+            folders = ["src/components", "src/pages", "src/store",
+                       "src/lib", "src/hooks"]
         return RepositoryBlueprint(
             name=f"{requirements.title}-frontend",
             description=f"Frontend for {requirements.title}",
             architecture_style="SPA",
             tech_stack=tech_stack,
-            folder_structure=["src/components", "src/pages", "src/store",
-                              "src/lib", "src/hooks"],
+            folder_structure=folders,
             file_blueprints=file_blueprints,
         )
 
@@ -825,14 +832,11 @@ class FrontendPipeline:
         Returns a list of human-readable error strings, one per broken import.
         """
         validator = ImportValidator()
-        # Build the set of all .ts/.tsx files that exist in the workspace
-        known_files: set[str] = {
-            p.relative_to(workspace).as_posix()
-            for p in workspace.rglob("*.ts")
-        } | {
-            p.relative_to(workspace).as_posix()
-            for p in workspace.rglob("*.tsx")
-        }
+        # Build the set of all .ts/.tsx/.vue files that exist in the workspace
+        known_files: set[str] = set()
+        for ext in ("*.ts", "*.tsx", "*.vue"):
+            for p in workspace.rglob(ext):
+                known_files.add(p.relative_to(workspace).as_posix())
         errors: list[str] = []
         for comp in components:
             file_path: str = comp.file_path
@@ -865,19 +869,45 @@ class FrontendPipeline:
 
         # Build lookup: basename (no extension) → list of workspace-relative paths
         ts_files: dict[str, list[str]] = {}
-        for ext in ("*.ts", "*.tsx"):
+        # Also build a case-insensitive lookup for fuzzy matching
+        ts_files_lower: dict[str, list[str]] = {}
+        for ext in ("*.ts", "*.tsx", "*.vue"):
             for p in workspace.rglob(ext):
                 rel = p.relative_to(workspace).as_posix()
                 stem = p.stem  # e.g. "authStore" from "authStore.ts"
                 ts_files.setdefault(stem, []).append(rel)
+                ts_files_lower.setdefault(stem.lower(), []).append(rel)
+
+        def _find_target(name: str) -> list[str]:
+            """Find target file by basename with fallback strategies."""
+            # 1. Exact match
+            matches = ts_files.get(name, [])
+            if matches:
+                return matches
+            # 2. Strip 'use' prefix: useAuthStore → AuthStore → authStore
+            if name.startswith("use") and len(name) > 3:
+                stripped = name[3:]  # "AuthStore"
+                matches = ts_files.get(stripped, [])
+                if matches:
+                    return matches
+                # Try lowercasing first char: AuthStore → authStore
+                lower_first = stripped[0].lower() + stripped[1:]
+                matches = ts_files.get(lower_first, [])
+                if matches:
+                    return matches
+            # 3. Case-insensitive match
+            matches = ts_files_lower.get(name.lower(), [])
+            if matches:
+                return matches
+            return []
 
         imp_re = re.compile(
             r"""(import\s+(?:type\s+)?(?:[^'"\n;]+?\s+from\s+)?['\"])([^'\"]+)(['\"])"""
         )
 
-        # Pre-compute the set of all TS/TSX files once (avoid re-globbing per import)
+        # Pre-compute the set of all TS/TSX/Vue files once (avoid re-globbing per import)
         existing: set[str] = set()
-        for ext in ("*.ts", "*.tsx"):
+        for ext in ("*.ts", "*.tsx", "*.vue"):
             for p in workspace.rglob(ext):
                 existing.add(p.relative_to(workspace).as_posix())
 
@@ -903,7 +933,7 @@ class FrontendPipeline:
                 if imp.startswith("@/"):
                     # Resolve @/ → src/
                     resolved = "src/" + imp[2:]
-                    candidates = [resolved + e for e in (".ts", ".tsx", ".js", ".jsx",
+                    candidates = [resolved + e for e in (".ts", ".tsx", ".vue", ".js", ".jsx",
                                                           "/index.ts", "/index.tsx")]
                     candidates.append(resolved)
                     if any(c in existing for c in candidates):
@@ -911,10 +941,10 @@ class FrontendPipeline:
 
                     # Broken @/ import — try to find target by basename
                     target_name = posixpath.basename(imp)
-                    matches = ts_files.get(target_name, [])
+                    matches = _find_target(target_name)
                     if len(matches) == 1:
                         target_rel = matches[0]
-                        target_no_ext = re.sub(r"\.(tsx?|jsx?)$", "", target_rel)
+                        target_no_ext = re.sub(r"\.(tsx?|jsx?|vue)$", "", target_rel)
                         new_imp = posixpath.relpath(target_no_ext, file_dir)
                         if not new_imp.startswith("."):
                             new_imp = "./" + new_imp
@@ -945,7 +975,7 @@ class FrontendPipeline:
 
                 # Check if this relative import already resolves
                 raw = posixpath.normpath(posixpath.join(file_dir, imp)).lstrip("/")
-                candidates = [raw + e for e in (".ts", ".tsx", ".js", ".jsx",
+                candidates = [raw + e for e in (".ts", ".tsx", ".vue", ".js", ".jsx",
                                                  "/index.ts", "/index.tsx")]
                 candidates.append(raw)
                 if any(c in existing for c in candidates):
@@ -958,7 +988,7 @@ class FrontendPipeline:
                     # Compute correct relative path
                     target_rel = matches[0]
                     # Remove extension for the import
-                    target_no_ext = re.sub(r"\.(tsx?|jsx?)$", "", target_rel)
+                    target_no_ext = re.sub(r"\.(tsx?|jsx?|vue)$", "", target_rel)
                     new_imp = posixpath.relpath(target_no_ext, file_dir)
                     if not new_imp.startswith("."):
                         new_imp = "./" + new_imp
@@ -1301,6 +1331,47 @@ class FrontendPipeline:
             (src_dir / "main.ts").write_text(main_ts, encoding="utf-8")
             logger.info("Wrote src/main.ts")
 
+            # Vue App.vue root component
+            app_vue = (
+                '<script setup lang="ts">\n'
+                "import { RouterView } from 'vue-router';\n"
+                "</script>\n\n"
+                "<template>\n"
+                "  <RouterView />\n"
+                "</template>\n"
+            )
+            (src_dir / "App.vue").write_text(app_vue, encoding="utf-8")
+            logger.info("Wrote src/App.vue")
+
+            # Vue router stub (components will be wired up by ComponentGenerator)
+            router_dir = src_dir / "router"
+            router_dir.mkdir(parents=True, exist_ok=True)
+            pages = [c for c in plan.components if c.component_type == "pages"]
+            route_entries = ""
+            for page in pages:
+                route_name = page.name.lower().replace("page", "").strip() or "home"
+                route_path = "/" if route_name == "home" else f"/{route_name}"
+                rel_path = page.file_path.removeprefix("src/")
+                route_entries += (
+                    f"  {{ path: '{route_path}', name: '{route_name}', "
+                    f"component: () => import('../{rel_path}') }},\n"
+                )
+            if not route_entries:
+                route_entries = "  { path: '/', name: 'home', component: () => import('../App.vue') },\n"
+            router_ts = (
+                "import { createRouter, createWebHistory } from 'vue-router';\n\n"
+                "const routes = [\n"
+                f"{route_entries}"
+                "];\n\n"
+                "const router = createRouter({\n"
+                "  history: createWebHistory(import.meta.env.BASE_URL),\n"
+                "  routes,\n"
+                "});\n\n"
+                "export default router;\n"
+            )
+            (router_dir / "index.ts").write_text(router_ts, encoding="utf-8")
+            logger.info("Wrote src/router/index.ts")
+
         # ── tailwind.config.js + postcss.config.js ────────────────────────
         if "tailwind" in styling:
             if "vue" in fw:
@@ -1344,6 +1415,8 @@ class FrontendPipeline:
     def _find_ghost_dependencies(
         planned_components: "list",
         planned_names: "set[str]",
+        *,
+        framework: str = "nextjs",
     ) -> "list":
         """Return UIComponent stubs for every component name referenced in
         ``depends_on`` that is not present in ``planned_names``.
@@ -1374,6 +1447,7 @@ class FrontendPipeline:
                 if dep not in planned_names and dep not in referenced:
                     referenced[dep] = comp.name
 
+        ext = ".vue" if "vue" in framework.lower() else ".tsx"
         ghosts: list = []
         for name, implied_by in referenced.items():
             lower = name.lower()
@@ -1387,7 +1461,6 @@ class FrontendPipeline:
                 layer = "shared"
                 folder = "components/shared"
 
-            ext = ".tsx"
             file_path = f"src/{folder}/{name}{ext}"
             ghosts.append(
                 UIComponent(

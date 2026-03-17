@@ -137,10 +137,24 @@ class ComponentPlannerAgent(BaseAgent):
     # ─────────────────────────────────────────────────────────────────────────
 
     def _parse_plan(self, raw: dict[str, Any]) -> ComponentPlan:
-        components = [
-            UIComponent(
+        framework = str(raw.get("framework", "nextjs")).lower()
+        is_vue = "vue" in framework
+
+        components: list[UIComponent] = []
+        for c in raw.get("components", []):
+            if not isinstance(c, dict):
+                continue
+            file_path = str(c.get("file_path", ""))
+
+            # Enforce correct file extension: .vue for Vue, .tsx for React/Next
+            if is_vue and file_path.endswith(".tsx"):
+                file_path = file_path[:-4] + ".vue"
+            elif not is_vue and file_path.endswith(".vue"):
+                file_path = file_path[:-4] + ".tsx"
+
+            components.append(UIComponent(
                 name=str(c.get("name", "Component")),
-                file_path=str(c.get("file_path", "")),
+                file_path=file_path,
                 component_type=str(c.get("component_type", "ui")),
                 description=str(c.get("description", "")),
                 figma_node_id=str(c.get("figma_node_id", "")) if c.get("figma_node_id") else None,
@@ -150,15 +164,21 @@ class ComponentPlannerAgent(BaseAgent):
                 depends_on=[str(d) for d in c.get("depends_on", [])],
                 children=[str(ch) for ch in c.get("children", [])],
                 layer=str(c.get("layer", "")),
-            )
-            for c in raw.get("components", [])
-            if isinstance(c, dict)
-        ]
+            ))
+
+        # Default state solution based on framework
+        default_state = "pinia" if is_vue else "zustand"
+        state_solution = str(raw.get("state_solution", default_state))
+
+        # Default routing solution based on framework
+        default_routing = "vue-router" if is_vue else ""
+        routing_solution = str(raw.get("routing_solution", default_routing))
+
         return ComponentPlan(
             components=components,
             framework=str(raw.get("framework", "nextjs")),
-            state_solution=str(raw.get("state_solution", "zustand")),
+            state_solution=state_solution,
             api_base_url=str(raw.get("api_base_url", "/api/v1")),
-            routing_solution=str(raw.get("routing_solution", "")),
+            routing_solution=routing_solution,
             package_json=raw.get("package_json", {}),
         )

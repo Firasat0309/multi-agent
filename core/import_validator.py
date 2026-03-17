@@ -193,7 +193,7 @@ class ImportValidator:
                     continue
                 raw = "src/" + imp[2:]
                 candidates = [
-                    raw + ".ts", raw + ".tsx", raw + ".js", raw + ".jsx",
+                    raw + ".ts", raw + ".tsx", raw + ".vue", raw + ".js", raw + ".jsx",
                     raw + "/index.ts", raw + "/index.tsx", raw + "/index.js",
                     raw,
                 ]
@@ -210,6 +210,7 @@ class ImportValidator:
             candidates = [
                 raw + ".ts",
                 raw + ".tsx",
+                raw + ".vue",
                 raw + ".js",
                 raw + ".jsx",
                 raw + "/index.ts",
