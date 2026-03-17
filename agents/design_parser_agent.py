@@ -143,21 +143,12 @@ class DesignParserAgent(BaseAgent):
     def _repair_json(text: str) -> str:
         """Best-effort repair of common LLM JSON mistakes.
 
-        Handles: trailing commas before } or ], single-quoted strings,
-        JS-style comments (// and /* */), and unquoted property names.
+        Delegates to the centralized repair in LLMClient which handles
+        trailing commas, single-quoted strings, JS comments, unquoted
+        property names, AND truncated output (unclosed braces/brackets).
         """
-        # Strip JS-style comments
-        text = re.sub(r"//[^\n]*", "", text)
-        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-        # Replace single-quoted strings with double-quoted
-        # (only when the single quote is used as a string delimiter)
-        text = re.sub(r"(?<=[:,\[\{])\s*'([^']*)'", r' "\1"', text)
-        text = re.sub(r"'([^']*)'(?=\s*[:,\]\}])", r'"\1"', text)
-        # Remove trailing commas before } or ]
-        text = re.sub(r",\s*([}\]])", r"\1", text)
-        # Quote unquoted property names: { key: "val" } → { "key": "val" }
-        text = re.sub(r'(?<=[{,])\s*([a-zA-Z_]\w*)\s*:', r' "\1":', text)
-        return text
+        from core.llm_client import LLMClient
+        return LLMClient._repair_json_text(text)
 
     async def execute(self, context: AgentContext) -> TaskResult:
         figma_url: str = context.task.metadata.get("figma_url", "")

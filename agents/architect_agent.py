@@ -273,46 +273,12 @@ class ArchitectAgent(BaseAgent):
     def _repair_json(text: str) -> str:
         """Best-effort repair of common LLM JSON mistakes.
 
-        Handles: trailing commas, single-quoted strings, JS-style comments,
-        unquoted property names, and truncated JSON (unclosed brackets/braces).
+        Delegates to the centralized repair in LLMClient which handles
+        trailing commas, single-quoted strings, JS comments, unquoted
+        property names, AND truncated output (unclosed braces/brackets).
         """
-        # Strip JS-style comments
-        text = re.sub(r"//[^\n]*", "", text)
-        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-        # Replace single-quoted strings with double-quoted
-        text = re.sub(r"(?<=[:,\[\{])\s*'([^']*)'", r' "\1"', text)
-        text = re.sub(r"'([^']*)'(?=\s*[:,\]\}])", r'"\1"', text)
-        # Remove trailing commas before } or ]
-        text = re.sub(r",\s*([}\]])", r"\1", text)
-        # Quote unquoted property names
-        text = re.sub(r'(?<=[{,])\s*([a-zA-Z_]\w*)\s*:', r' "\1":', text)
-
-        # Close truncated JSON: count open/close braces and brackets
-        text = text.rstrip()
-        # Remove trailing comma if the JSON is about to be closed
-        text = re.sub(r",\s*$", "", text)
-        # Close any open string (unmatched quote)
-        in_string = False
-        escaped = False
-        for ch in text:
-            if escaped:
-                escaped = False
-                continue
-            if ch == "\\":
-                escaped = True
-                continue
-            if ch == '"':
-                in_string = not in_string
-        if in_string:
-            text += '"'
-
-        open_braces = text.count("{") - text.count("}")
-        open_brackets = text.count("[") - text.count("]")
-        # Remove trailing comma before closing
-        text = re.sub(r",\s*$", "", text.rstrip())
-        text += "]" * max(0, open_brackets)
-        text += "}" * max(0, open_braces)
-        return text
+        from core.llm_client import LLMClient
+        return LLMClient._repair_json_text(text)
 
     @classmethod
     def _parse_json_response(cls, text: str) -> dict[str, Any]:

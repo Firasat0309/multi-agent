@@ -615,16 +615,47 @@ class LLMClient:
         if in_string:
             text += '"'
 
-        # Strip trailing partial key-value (e.g. `"method": "POST`,  or `"key":`)
-        text = re.sub(r',\s*"[^"]*"\s*:\s*"?[^"}\]]*$', "", text)
-        # Remove dangling comma at end
-        text = re.sub(r",\s*$", "", text)
+        # Iteratively strip trailing incomplete entries and balance brackets.
+        # Each pass peels off one layer of partial data from the end.
+        for _ in range(20):
+            stripped = text.rstrip()
+            # Strip trailing partial key-value: ,"key": "val  or  ,"key":
+            stripped = re.sub(r',\s*"[^"]*"\s*:\s*"[^"]*"\s*$', "", stripped)
+            # Strip key with colon but no value (with or without comma):
+            #   { "key":   or   , "key":
+            stripped = re.sub(r'[,{]\s*"[^"]*"\s*:\s*$', lambda m: "{" if m.group(0).strip().startswith("{") else "", stripped)
+            # Strip trailing dangling value: , "something"
+            stripped = re.sub(r',\s*"[^"]*"\s*$', "", stripped)
+            # Remove dangling comma
+            stripped = re.sub(r",\s*$", "", stripped)
 
-        # Balance braces and brackets
-        open_braces = text.count("{") - text.count("}")
-        open_brackets = text.count("[") - text.count("]")
-        text += "]" * max(open_brackets, 0)
-        text += "}" * max(open_braces, 0)
+            if stripped == text.rstrip():
+                break
+            text = stripped
+
+        # Balance braces and brackets — close innermost first.
+        # Walk the text to track nesting order so we close in the right sequence.
+        stack: list[str] = []
+        in_str = False
+        esc = False
+        for ch in text:
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch in "{[":
+                stack.append("}" if ch == "{" else "]")
+            elif ch in "}]" and stack:
+                stack.pop()
+        # Close in reverse nesting order
+        text += "".join(reversed(stack))
 
         return text
 

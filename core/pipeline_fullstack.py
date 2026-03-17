@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import logging
 import time
 from pathlib import Path
@@ -169,6 +170,32 @@ class FullstackPipeline:
                 "API contract: %s (%d endpoints)",
                 api_contract.title, len(api_contract.endpoints),
             )
+            # Persist the contract to disk for inspection and downstream use
+            contract_path = self._settings.workspace_dir / "api_contract.json"
+            try:
+                contract_data = {
+                    "title": api_contract.title,
+                    "version": api_contract.version,
+                    "base_url": api_contract.base_url,
+                    "contract_format": api_contract.contract_format,
+                    "endpoints": [
+                        {
+                            "path": ep.path,
+                            "method": ep.method,
+                            "description": ep.description,
+                            "auth_required": ep.auth_required,
+                            "tags": ep.tags,
+                        }
+                        for ep in api_contract.endpoints
+                    ],
+                    "schemas": api_contract.schemas,
+                }
+                contract_path.write_text(
+                    _json.dumps(contract_data, indent=2), encoding="utf-8"
+                )
+                logger.info("Wrote api_contract.json (%d endpoints)", len(api_contract.endpoints))
+            except Exception:
+                logger.warning("Failed to write api_contract.json", exc_info=True)
             self._complete_phase("API Contract Generation")
         except Exception as exc:
             logger.exception("API contract generation failed")
