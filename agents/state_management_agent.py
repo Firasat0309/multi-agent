@@ -83,9 +83,16 @@ class StateManagementAgent(BaseAgent):
             "Universal rules:\n"
             "- Use TypeScript throughout.\n"
             "- Keep async operations in the store (thunks, Zustand actions, etc.).\n"
-            "- Write a barrel src/store/index.ts exporting all stores/slices.\n"
+            "- Create ONE file per state slice/store (e.g. src/store/authStore.ts,\n"
+            "  src/store/uiStore.ts). Each file should export a named hook\n"
+            "  (e.g. export const useAuthStore = create<AuthState>(...)).\n"
+            "- Also create convenience alias files so imports like\n"
+            "  'src/store/useAuthStore' resolve: either name the file useAuthStore.ts\n"
+            "  or re-export from a useAuthStore.ts barrel.\n"
+            "- Write a barrel src/store/index.ts that re-exports ALL store hooks.\n"
             "- Write each file to disk using the write_file tool.\n"
-            "- Do NOT duplicate API call logic — import from src/lib/api.ts."
+            "- Do NOT duplicate API call logic — import from src/lib/api.ts.\n"
+            "- Use RELATIVE imports for api.ts (e.g. '../lib/api'), not @/ aliases."
         )
 
     def _build_prompt(self, context: AgentContext) -> str:

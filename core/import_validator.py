@@ -162,11 +162,14 @@ class ImportValidator:
     def _validate_typescript(
         self, content: str, file_path: str, known_files: set[str]
     ) -> list[str]:
-        """Check relative TypeScript/TSX imports against the known workspace file set.
+        """Check relative and @/-alias TypeScript/TSX imports against the workspace.
 
-        Only relative imports (starting with ``./`` or ``../``) are checked.
-        Bare specifiers (``react``, ``@/components/Foo``) are always skipped
-        since we cannot resolve package.json aliases or node_modules here.
+        Checks:
+        - Relative imports (``./`` or ``../``)
+        - Next.js ``@/`` path alias imports (resolved as ``src/``)
+
+        Bare specifiers (``react``, ``next/navigation``, ``@reduxjs/toolkit``)
+        are skipped — we cannot resolve node_modules here.
         """
         file_path = file_path.replace("\\", "/")
         file_dir = "/".join(file_path.split("/")[:-1])
@@ -179,7 +182,26 @@ class ImportValidator:
         broken: list[str] = []
         for m in imp_re.finditer(content):
             imp = m.group(1) or m.group(2)
-            if not imp.startswith("."):  # skip node_modules and @-aliases
+
+            # Handle @/ alias imports (Next.js convention: @/ → src/)
+            if imp.startswith("@/"):
+                # Only validate @/ imports when we have src/ files to check against.
+                # If known_files is empty or has no src/ entries, we can't tell
+                # whether the import is broken or just unresolvable.
+                has_src = any(f.startswith("src/") for f in known_files)
+                if not has_src:
+                    continue
+                raw = "src/" + imp[2:]
+                candidates = [
+                    raw + ".ts", raw + ".tsx", raw + ".js", raw + ".jsx",
+                    raw + "/index.ts", raw + "/index.tsx", raw + "/index.js",
+                    raw,
+                ]
+                if not any(c in known_files for c in candidates):
+                    broken.append(imp)
+                continue
+
+            if not imp.startswith("."):  # skip node_modules and scoped packages
                 continue
             # Resolve relative path
             raw = posixpath.normpath(file_dir + "/" + imp if file_dir else imp)

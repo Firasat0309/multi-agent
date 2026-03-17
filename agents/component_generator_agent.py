@@ -75,7 +75,25 @@ class ComponentGeneratorAgent(BaseAgent):
             "- Wrap async data fetching in a custom hook or SWR/React Query.\n"
             "- Include JSDoc comment block at the top of the component.\n"
             "- Write the full file to disk using the write_file tool.\n"
-            "- Do NOT include test code in the component file."
+            "- Do NOT include test code in the component file.\n\n"
+
+            "NEXT.JS APP ROUTER — CRITICAL RULES:\n"
+            "- Any component that uses React hooks (useState, useEffect, useContext, useRef,\n"
+            "  useCallback, useMemo, useReducer), event handlers (onClick, onChange, onSubmit),\n"
+            "  useRouter, usePathname, useSearchParams, or any browser-only API MUST have\n"
+            '  "use client"; as the VERY FIRST LINE of the file (before all imports).\n'
+            "- Page components in src/app/ that only render other components and do NOT use\n"
+            "  hooks or event handlers directly should be Server Components (no 'use client').\n"
+            "- If in doubt, add 'use client'; — a client component that could be a server\n"
+            "  component is acceptable; a server component that uses hooks is a build error.\n\n"
+
+            "IMPORT RULES:\n"
+            "- Use RELATIVE imports (e.g. '../ui/Button') for importing from other components\n"
+            "  within the same src/ tree. Do NOT use @/ path aliases.\n"
+            "- For store imports, use relative paths (e.g. '../../store/authStore' or\n"
+            "  '../../store/useAuthStore') — NOT '@/store/authStore'.\n"
+            "- For API client imports, use relative paths (e.g. '../../lib/api').\n"
+            "- This ensures all imports resolve correctly without tsconfig path aliases."
         )
 
     def _build_prompt(self, context: AgentContext) -> str:
