@@ -1253,6 +1253,35 @@ class FrontendPipeline:
             )
             (workspace / "next.config.js").write_text(next_config, encoding="utf-8")
             logger.info("Wrote next.config.js")
+
+            # Next.js App Router requires a root layout — without it, every
+            # page.tsx triggers "doesn't have a root layout" and the build fails.
+            app_dir = workspace / "src" / "app"
+            app_dir.mkdir(parents=True, exist_ok=True)
+            layout_path = app_dir / "layout.tsx"
+            if not layout_path.exists():
+                app_name = requirements.title or "App"
+                layout_tsx = (
+                    "import type { Metadata } from 'next';\n"
+                    "import './globals.css';\n\n"
+                    "export const metadata: Metadata = {\n"
+                    f"  title: '{app_name}',\n"
+                    f"  description: '{app_name}',\n"
+                    "};\n\n"
+                    "export default function RootLayout({\n"
+                    "  children,\n"
+                    "}: {\n"
+                    "  children: React.ReactNode;\n"
+                    "}) {\n"
+                    "  return (\n"
+                    '    <html lang="en">\n'
+                    "      <body>{children}</body>\n"
+                    "    </html>\n"
+                    "  );\n"
+                    "}\n"
+                )
+                layout_path.write_text(layout_tsx, encoding="utf-8")
+                logger.info("Wrote src/app/layout.tsx")
         elif "vue" in fw:
             vite_config = (
                 "import { defineConfig } from 'vite';\n"
