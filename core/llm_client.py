@@ -123,6 +123,11 @@ class LLMConfigError(LLMClientError):
     pass
 
 
+class LLMRetryableError(Exception):
+    """Transient LLM error that should be retried (not a subclass of LLMClientError)."""
+    pass
+
+
 class LLMClient:
     """Unified LLM client supporting Anthropic and OpenAI."""
 
@@ -298,6 +303,17 @@ class LLMClient:
                     f"more verbose logging."
                 )
             except CircuitOpenError as e:
+                raise LLMClientError(str(e)) from e
+            except LLMRetryableError as e:
+                # Explicitly retryable (e.g. Gemini blocked/invalid function call)
+                if attempt < _max_attempts - 1:
+                    delay = _base_delay * (2 ** attempt)
+                    logger.warning(
+                        "LLM retryable error on attempt %d/%d — retrying in %.1fs: %s",
+                        attempt + 1, _max_attempts, delay, str(e)[:120],
+                    )
+                    await asyncio.sleep(delay)
+                    continue
                 raise LLMClientError(str(e)) from e
             except LLMClientError:
                 # Config / auth errors are never retried — surface immediately.
@@ -483,12 +499,13 @@ class LLMClient:
         try:
             text = response.text
         except ValueError as ve:
-            # Blocked response — treat as an LLM error so the caller can retry
-            # or surface the message instead of crashing with a traceback.
+            # Blocked response or invalid function call (finish_reason=10).
+            # Raise as retryable so the retry loop gets a chance to re-attempt
+            # before surfacing the error.
             block_reason = ""
             if hasattr(response, "prompt_feedback"):
                 block_reason = str(getattr(response.prompt_feedback, "block_reason", ""))
-            raise LLMClientError(
+            raise LLMRetryableError(
                 f"Gemini response blocked: {ve}. "
                 f"Block reason: {block_reason or 'unknown'}. "
                 f"Try rephrasing the prompt or using a different model."
@@ -856,6 +873,18 @@ class LLMClient:
                 )
                 last_exc = None
                 break
+            except LLMRetryableError as _exc:
+                # Explicitly retryable (e.g. Gemini blocked/invalid function call)
+                last_exc = _exc
+                if _attempt < _max_attempts - 1:
+                    _delay = _base_delay * (2 ** _attempt)
+                    logger.warning(
+                        "Gemini retryable error (attempt %d/%d) — "
+                        "retrying in %.1fs: %s",
+                        _attempt + 1, _max_attempts, _delay, str(_exc)[:120],
+                    )
+                    await asyncio.sleep(_delay)
+                    continue
             except LLMClientError:
                 # Config / auth errors — surface immediately, no retry.
                 raise

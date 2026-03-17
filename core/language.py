@@ -322,12 +322,22 @@ LANGUAGE_PROFILES: dict[str, LanguageProfile] = {
 }
 
 
+# File-type tags that are NOT programming languages — suppress warnings for these.
+_NON_LANGUAGE_TAGS: frozenset[str] = frozenset({
+    "properties", "xml", "yaml", "yml", "json", "toml", "ini", "cfg",
+    "conf", "txt", "md", "markdown", "html", "css", "scss", "sql",
+    "dockerfile", "docker", "makefile", "gradle", "maven", "shell",
+    "bash", "sh", "bat", "ps1", "env", "graphql", "proto", "protobuf",
+    "",  # empty string — no language tag at all
+})
+
+
 def get_language_profile(name: str) -> LanguageProfile:
     """Get a language profile by name. Defaults to Python if unknown."""
     profile = LANGUAGE_PROFILES.get(name.lower().strip())
     if profile is None:
         # Try to detect from common framework names
-        name_lower = name.lower()
+        name_lower = name.lower().strip()
         if any(kw in name_lower for kw in ("spring", "maven", "gradle", "jdk")):
             return JAVA
         if any(kw in name_lower for kw in ("express", "nest", "node")):
@@ -338,11 +348,14 @@ def get_language_profile(name: str) -> LanguageProfile:
             return RUST
         if any(kw in name_lower for kw in ("asp.net", "dotnet", ".net")):
             return CSHARP
-        logger.warning(
-            "Unrecognized language '%s' — defaulting to Python. "
-            "Supported languages: %s",
-            name, ", ".join(sorted(LANGUAGE_PROFILES.keys())),
-        )
+        # Only warn for values that look like they were meant to be a language
+        # — not config file types like "properties", "xml", etc.
+        if name_lower not in _NON_LANGUAGE_TAGS:
+            logger.warning(
+                "Unrecognized language '%s' — defaulting to Python. "
+                "Supported languages: %s",
+                name, ", ".join(sorted(LANGUAGE_PROFILES.keys())),
+            )
         return PYTHON
     return profile
 

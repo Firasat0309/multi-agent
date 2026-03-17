@@ -75,10 +75,13 @@ class TestResolveFileLanguage:
         result = agent._resolve_file_language("", "application.yaml", "go")
         assert result == "go"
 
-    def test_llm_lang_used_when_not_python(self):
+    def test_config_file_uses_project_lang(self):
         agent = self.make_agent()
-        # No extension match, LLM said "java" explicitly
-        result = agent._resolve_file_language("java", "pom.xml", "python")
+        # Non-source files always use project language regardless of LLM tag
+        result = agent._resolve_file_language("java", "pom.xml", "java")
+        assert result == "java"
+        # Even if LLM says something else, project lang wins for config files
+        result = agent._resolve_file_language("xml", "pom.xml", "java")
         assert result == "java"
 
     def test_project_lang_fallback_when_llm_says_python(self):

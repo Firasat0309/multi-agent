@@ -167,9 +167,13 @@ class RunPipeline:
                     elapsed_seconds=time.monotonic() - start_time,
                 )
 
+            lc_stats = lifecycle_engine.get_stats()
+            lc_file_count = sum(lc_stats.values())
             logger.info(
-                "Lifecycle engine: %d files, global DAG: %d tasks",
-                len(lifecycle_engine.get_stats()), len(global_graph.tasks),
+                "Lifecycle engine: %d files (%s), global DAG: %d tasks",
+                lc_file_count,
+                ", ".join(f"{v} {k}" for k, v in lc_stats.items()),
+                len(global_graph.tasks),
             )
             self._complete_phase("Task Planning")
             if self._live:

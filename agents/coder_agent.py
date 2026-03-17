@@ -363,6 +363,19 @@ class CoderAgent(BaseAgent):
         if fmt:
             return await self._generate_config(context, fmt)
 
+        # If extension-based detection missed it but the layer says "config",
+        # treat it as a generic config file so we don't generate source code
+        # for non-source files (e.g., custom .conf, .cfg, resource files).
+        if not fmt and fb.layer == "config":
+            suffix = Path(fb.path).suffix.lower()
+            fallback_fmt = f"{suffix.lstrip('.').upper() or 'plain text'} configuration file"
+            logger.info(
+                "File %s has layer=config but unrecognized extension '%s' — "
+                "treating as config file (%s)",
+                fb.path, suffix, fallback_fmt,
+            )
+            return await self._generate_config(context, fallback_fmt)
+
         # Source files: use the agentic tool-use loop so the agent can
         # read dependency interfaces and write the file directly.
         lang = fb.language or context.blueprint.tech_stack.get("language", "python")

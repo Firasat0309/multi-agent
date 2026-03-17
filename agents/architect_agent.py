@@ -371,8 +371,11 @@ class ArchitectAgent(BaseAgent):
 
         Priority:
         1. Extension-based override — .java/.go/.ts/.rs/.cs/.py files are unambiguous.
-        2. LLM-provided language tag (if non-empty and not the wrong default).
-        3. Project-level language derived from tech_stack.
+        2. Project-level language for everything else (config, build, resource files).
+
+        Non-source files (.properties, .yaml, .xml, pom.xml, Dockerfile, etc.)
+        always get the project language so downstream agents know the ecosystem
+        and use the correct build tools, conventions, and prompts.
         """
         ext_map = {
             ".py": "python", ".java": "java", ".go": "go",
@@ -382,12 +385,6 @@ class ArchitectAgent(BaseAgent):
         for ext, lang in ext_map.items():
             if path.endswith(ext):
                 return lang
-
-        # Non-source files (.properties, .yaml, .xml, .json, pom.xml, Dockerfile …)
-        # Tag them with the project language so the coder knows the ecosystem,
-        # but the coder agent will detect them as config files from the extension.
-        if llm_lang and llm_lang != "python":
-            return llm_lang
 
         return project_lang
 
