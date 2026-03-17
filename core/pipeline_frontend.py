@@ -231,7 +231,9 @@ class FrontendPipeline:
             # not present in the plan — and synthesize minimal stubs so they are
             # generated rather than left as empty nodes in the dependency graph.
             planned_names = {c.name for c in ordered_components}
-            ghost_components = self._find_ghost_dependencies(ordered_components, planned_names)
+            ghost_components = self._find_ghost_dependencies(
+                ordered_components, planned_names, framework=component_plan.framework,
+            )
             if ghost_components:
                 logger.info(
                     "[FE Phase 4] Adding %d unplanned dependency stubs: %s",
@@ -431,12 +433,13 @@ class FrontendPipeline:
                 logger.info("[FE Phase 4.6] All component imports resolved")
             self._complete_phase("FE: Import Validation")
 
-            # ── Phases 5-8: Parallel (API Integration, State, Docs, Deploy) ─────
-            # These four phases have no inter-dependencies — run them all
-            # concurrently to reduce wall-clock time.
+            # ── Phases 5-8: API → State (sequential), Docs + Deploy (parallel) ──
+            # State management depends on api.ts exports, so Phase 6 runs after
+            # Phase 5.  Docs and Deploy have no dependencies — they run in
+            # parallel alongside the API→State sequence.
             logger.info(
-                "[FE Phases 5-8] Running API integration, state management, "
-                "documentation, and deployment in parallel..."
+                "[FE Phases 5-8] Running API integration → state management "
+                "(sequential), documentation + deployment (parallel)..."
             )
 
             async def _run_api_integration() -> None:
@@ -502,7 +505,10 @@ class FrontendPipeline:
                             task_type=TaskType.MANAGE_STATE,
                             file="src/store/index.ts",
                             description=f"Generate {component_plan.state_solution} store layer",
-                            metadata={"component_plan": component_plan},
+                            metadata={
+                                "component_plan": component_plan,
+                                "api_contract": api_contract,
+                            },
                         ),
                         blueprint=frontend_blueprint,
                         file_blueprint=FileBlueprint(
@@ -649,15 +655,24 @@ class FrontendPipeline:
                     errors.append(f"Deployment generation failed: {exc}")
                     self._fail_phase("FE: Deployment", str(exc))
 
+            async def _run_api_then_state_then_docs() -> None:
+                """Phase 5 → 6 → 7: API → State → Documentation (sequential).
+
+                State stores import from api.ts, so api.ts must exist first.
+                Documentation needs generated component + api.ts + store files
+                for accurate related_files context.
+                """
+                await _run_api_integration()
+                await _run_state_management()
+                await _run_documentation()
+
             _parallel_start = time.monotonic()
             await asyncio.gather(
-                _run_api_integration(),
-                _run_state_management(),
-                _run_documentation(),
+                _run_api_then_state_then_docs(),
                 _run_deployment(),
             )
             logger.info(
-                "[FE Phases 5-8] Parallel phases complete in %.1fs",
+                "[FE Phases 5-8] Phases complete in %.1fs",
                 time.monotonic() - _parallel_start,
             )
 
@@ -865,11 +880,35 @@ class FrontendPipeline:
 
         # Build lookup: basename (no extension) → list of workspace-relative paths
         ts_files: dict[str, list[str]] = {}
+        ts_files_lower: dict[str, list[str]] = {}
         for ext in ("*.ts", "*.tsx"):
             for p in workspace.rglob(ext):
                 rel = p.relative_to(workspace).as_posix()
                 stem = p.stem  # e.g. "authStore" from "authStore.ts"
                 ts_files.setdefault(stem, []).append(rel)
+                ts_files_lower.setdefault(stem.lower(), []).append(rel)
+
+        def _find_target(name: str) -> list[str]:
+            """Find target file by basename with fallback strategies."""
+            # Exact match
+            matches = ts_files.get(name, [])
+            if matches:
+                return matches
+            # Strip 'use' prefix: useAuthStore → AuthStore → authStore
+            if name.startswith("use") and len(name) > 3:
+                stripped = name[3:]
+                matches = ts_files.get(stripped, [])
+                if matches:
+                    return matches
+                lower_first = stripped[0].lower() + stripped[1:]
+                matches = ts_files.get(lower_first, [])
+                if matches:
+                    return matches
+            # Case-insensitive fallback
+            matches = ts_files_lower.get(name.lower(), [])
+            if matches:
+                return matches
+            return []
 
         imp_re = re.compile(
             r"""(import\s+(?:type\s+)?(?:[^'"\n;]+?\s+from\s+)?['\"])([^'\"]+)(['\"])"""
@@ -911,7 +950,7 @@ class FrontendPipeline:
 
                     # Broken @/ import — try to find target by basename
                     target_name = posixpath.basename(imp)
-                    matches = ts_files.get(target_name, [])
+                    matches = _find_target(target_name)
                     if len(matches) == 1:
                         target_rel = matches[0]
                         target_no_ext = re.sub(r"\.(tsx?|jsx?)$", "", target_rel)
@@ -1049,6 +1088,8 @@ class FrontendPipeline:
             deps.setdefault("next", "^14.0.0")
             deps.setdefault("react", "^18.0.0")
             deps.setdefault("react-dom", "^18.0.0")
+            deps.setdefault("axios", "^1.7.0")
+            deps.setdefault("swr", "^2.2.0")
             dev_deps = pkg.setdefault("devDependencies", {})
             dev_deps.setdefault("@types/node", "^20.0.0")
             dev_deps.setdefault("@types/react", "^18.0.0")
@@ -1068,6 +1109,7 @@ class FrontendPipeline:
             deps.setdefault("vue", "^3.4.0")
             deps.setdefault("vue-router", "^4.3.0")
             deps.setdefault("pinia", "^2.1.0")
+            deps.setdefault("axios", "^1.7.0")
             dev_deps = pkg.setdefault("devDependencies", {})
             dev_deps.setdefault("vite", "^5.0.0")
             dev_deps.setdefault("@vitejs/plugin-vue", "^5.0.0")
@@ -1090,6 +1132,7 @@ class FrontendPipeline:
             pkg.setdefault("dependencies", {})["zustand"] = pkg.get(
                 "dependencies", {}
             ).get("zustand", "^4.5.0")
+            pkg.setdefault("dependencies", {}).setdefault("immer", "^10.0.0")
         elif "redux" in state:
             pkg.setdefault("dependencies", {}).setdefault("@reduxjs/toolkit", "^2.0.0")
             pkg.setdefault("dependencies", {}).setdefault("react-redux", "^9.0.0")
@@ -1373,6 +1416,8 @@ class FrontendPipeline:
     def _find_ghost_dependencies(
         planned_components: "list",
         planned_names: "set[str]",
+        *,
+        framework: str = "nextjs",
     ) -> "list":
         """Return UIComponent stubs for every component name referenced in
         ``depends_on`` that is not present in ``planned_names``.
@@ -1403,6 +1448,7 @@ class FrontendPipeline:
                 if dep not in planned_names and dep not in referenced:
                     referenced[dep] = comp.name
 
+        ext = ".vue" if "vue" in framework.lower() else ".tsx"
         ghosts: list = []
         for name, implied_by in referenced.items():
             lower = name.lower()
@@ -1416,7 +1462,6 @@ class FrontendPipeline:
                 layer = "shared"
                 folder = "components/shared"
 
-            ext = ".tsx"
             file_path = f"src/{folder}/{name}{ext}"
             ghosts.append(
                 UIComponent(

@@ -9,6 +9,7 @@ from core.agent_tools import ToolDefinition
 from core.models import (
     AgentContext,
     AgentRole,
+    APIContract,
     ComponentPlan,
     TaskResult,
 )
@@ -92,11 +93,14 @@ class StateManagementAgent(BaseAgent):
             "- Write a barrel src/store/index.ts that re-exports ALL store hooks.\n"
             "- Write each file to disk using the write_file tool.\n"
             "- Do NOT duplicate API call logic — import from src/lib/api.ts.\n"
+            "  Read the api.ts file first using read_file to see what functions are exported,\n"
+            "  then import those exact function names in the store.\n"
             "- Use RELATIVE imports for api.ts (e.g. '../lib/api'), not @/ aliases."
         )
 
     def _build_prompt(self, context: AgentContext) -> str:
         plan: ComponentPlan | None = context.task.metadata.get("component_plan")
+        contract: APIContract | None = context.task.metadata.get("api_contract")
 
         if plan is None:
             return "Generate state management files for the frontend application."
@@ -107,11 +111,24 @@ class StateManagementAgent(BaseAgent):
             all_slices.update(comp.state_needs)
 
         slices_text = ", ".join(sorted(all_slices)) if all_slices else "auth, ui"
+
+        # Include API endpoints so store actions know what calls to make
+        api_text = ""
+        if contract and contract.endpoints:
+            endpoint_lines = "\n".join(
+                f"  {ep.method} {ep.path} — {ep.description}"
+                for ep in contract.endpoints
+            )
+            api_text = f"Available API endpoints:\n{endpoint_lines}\n\n"
+
         return (
             f"Framework: {plan.framework}\n"
             f"State solution: {plan.state_solution}\n"
             f"API base URL: {plan.api_base_url}\n"
             f"Required state slices: {slices_text}\n\n"
+            f"{api_text}"
+            "IMPORTANT: Before writing store files, use read_file to read src/lib/api.ts\n"
+            "to see what functions/client it exports. Import those exact exports in your stores.\n\n"
             "Generate ALL state management files and write each to disk using write_file."
         )
 
