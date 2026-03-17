@@ -580,7 +580,8 @@ class LLMClient:
         """Best-effort repair of common LLM JSON mistakes.
 
         Handles trailing commas, single-quoted strings, JS comments,
-        and unquoted property names.
+        unquoted property names, and **truncated output** (unclosed
+        braces, brackets, and strings).
         """
         # Strip JS-style comments
         text = re.sub(r"//[^\n]*", "", text)
@@ -592,6 +593,39 @@ class LLMClient:
         text = re.sub(r",\s*([}\]])", r"\1", text)
         # Quote unquoted property names
         text = re.sub(r'(?<=[{,])\s*([a-zA-Z_]\w*)\s*:', r' "\1":', text)
+
+        # ── Truncation repair ─────────────────────────────────────────────
+        # If Gemini (or any LLM) hits max tokens, the JSON is cut off mid-
+        # stream.  Close any unclosed strings, strip trailing partial
+        # key-value pairs, and balance braces/brackets so json.loads works.
+        # This gives us a *partial* but valid result rather than nothing.
+
+        # Close unclosed string literal
+        in_string = False
+        escaped = False
+        for ch in text:
+            if escaped:
+                escaped = False
+                continue
+            if ch == "\\":
+                escaped = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+        if in_string:
+            text += '"'
+
+        # Strip trailing partial key-value (e.g. `"method": "POST`,  or `"key":`)
+        text = re.sub(r',\s*"[^"]*"\s*:\s*"?[^"}\]]*$', "", text)
+        # Remove dangling comma at end
+        text = re.sub(r",\s*$", "", text)
+
+        # Balance braces and brackets
+        open_braces = text.count("{") - text.count("}")
+        open_brackets = text.count("[") - text.count("]")
+        text += "]" * max(open_brackets, 0)
+        text += "}" * max(open_braces, 0)
+
         return text
 
     async def generate_json(
@@ -647,7 +681,35 @@ class LLMClient:
         except json.JSONDecodeError:
             pass
 
-        logger.error(f"Could not parse JSON from LLM response: {text[:200]}")
+        # Attempt 5: ask the LLM to complete/fix its own truncated JSON
+        logger.warning("All local JSON repair attempts failed — asking LLM to fix its output")
+        try:
+            fix_response = await self.generate(
+                system_prompt="You are a JSON repair tool. Return ONLY valid JSON, no explanation.",
+                user_prompt=(
+                    "The following JSON is truncated or malformed. "
+                    "Complete it and return ONLY the valid JSON object:\n\n"
+                    f"{text[:3000]}"
+                ),
+                temperature=0.0,
+            )
+            fix_text = fix_response.content.strip()
+            if fix_text.startswith("```"):
+                fix_lines = fix_text.split("\n")
+                fix_lines = fix_lines[1:]
+                if fix_lines and fix_lines[-1].strip() == "```":
+                    fix_lines = fix_lines[:-1]
+                fix_text = "\n".join(fix_lines)
+            fix_start = fix_text.find("{")
+            fix_end = fix_text.rfind("}") + 1
+            if fix_start != -1 and fix_end > fix_start:
+                result = json.loads(fix_text[fix_start:fix_end])
+                logger.info("LLM successfully repaired truncated JSON")
+                return result
+        except Exception as repair_exc:
+            logger.debug("LLM JSON repair attempt failed: %s", repair_exc)
+
+        logger.error("Could not parse JSON from LLM response: %s", text[:200])
         return {}
 
     async def generate_with_tools(

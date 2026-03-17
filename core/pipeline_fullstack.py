@@ -159,6 +159,11 @@ class FullstackPipeline:
             api_contract = await contract_agent.generate_contract(
                 requirements, backend_blueprint
             )
+            if not api_contract.endpoints:
+                raise ValueError(
+                    "API contract generation returned 0 endpoints "
+                    "(likely truncated/unparseable LLM response)"
+                )
             fullstack_blueprint.api_contract = api_contract
             logger.info(
                 "API contract: %s (%d endpoints)",
@@ -169,7 +174,12 @@ class FullstackPipeline:
             logger.exception("API contract generation failed")
             errors.append(f"API contract generation failed: {exc}")
             self._fail_phase("API Contract Generation", str(exc))
-            # Non-fatal: proceed without the contract
+            return PipelineResult(
+                success=False,
+                workspace_path=self._settings.workspace_dir,
+                errors=errors,
+                elapsed_seconds=time.monotonic() - start_time,
+            )
 
         # ── Phase 4: Parallel Backend + Frontend ──────────────────────────────
         self._phase("Parallel BE+FE Generation", "running")
