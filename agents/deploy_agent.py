@@ -79,7 +79,7 @@ class DeployAgent(BaseAgent):
             return 8080, "/actuator/health"
         if "go" in lang:
             return 8080, "/health"
-        if "typescript" in lang or "node" in lang or "express" in framework:
+        if "typescript" in lang or "node" in lang or "express" in framework or "next" in framework or "react" in framework or "vue" in framework or "angular" in framework:
             return 3000, "/health"
         if "python" in lang:
             if "django" in framework:

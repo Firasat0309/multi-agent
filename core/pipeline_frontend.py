@@ -243,7 +243,9 @@ class FrontendPipeline:
                     tier_map[gc.name] = 0
                 ordered_components = list(ghost_components) + list(ordered_components)
                 # Rebuild the blueprint to include ghost paths
-                frontend_blueprint = self._make_frontend_blueprint(requirements, component_plan)
+                frontend_blueprint = self._make_frontend_blueprint(
+                    requirements, component_plan, extra_components=ghost_components,
+                )
             max_tier = max(tier_map.values()) + 1 if tier_map else 1
 
             logger.info("[FE Phase 4] Generating %d components...", len(ordered_components))
@@ -429,101 +431,235 @@ class FrontendPipeline:
                 logger.info("[FE Phase 4.6] All component imports resolved")
             self._complete_phase("FE: Import Validation")
 
-            # ── Phase 5: API Integration ──────────────────────────────────────────
-            self._phase("FE: API Integration", "running")
-            logger.info("[FE Phase 5] Generating API client layer...")
-            try:
-                integrator = agent_manager._create_agent(TaskType.INTEGRATE_API)
-                api_ctx = AgentContext(
-                    task=Task(
-                        task_id=9000,
-                        task_type=TaskType.INTEGRATE_API,
-                        file="src/lib/api.ts",
-                        description="Generate typed API client and hooks",
-                        metadata={
-                            "api_contract": api_contract,
-                            "component_plan": component_plan,
-                        },
-                    ),
-                    blueprint=frontend_blueprint,
-                    file_blueprint=FileBlueprint(
-                        path="src/lib/api.ts",
-                        purpose="Base Axios/Fetch API client with auth interceptors",
-                        language="typescript",
-                        layer="lib",
-                    ),
-                )
-                api_result = await integrator.execute(api_ctx)
-                if api_result.success:
-                    await event_bus.publish(AgentEvent(
-                        type=BusEventType.TASK_COMPLETED,
-                        task_id=9000,
-                        task_type=TaskType.INTEGRATE_API.value,
-                        file_path="src/lib/api.ts",
-                        agent_name="APIIntegrationAgent",
-                    ))
-                else:
-                    errors.extend(api_result.errors)
-                    await event_bus.publish(AgentEvent(
-                        type=BusEventType.TASK_FAILED,
-                        task_id=9000,
-                        task_type=TaskType.INTEGRATE_API.value,
-                        file_path="src/lib/api.ts",
-                        agent_name="APIIntegrationAgent",
-                        data={"errors": api_result.errors},
-                    ))
-                self._complete_phase("FE: API Integration")
-            except Exception as exc:
-                logger.exception("API integration failed")
-                errors.append(f"API integration failed: {exc}")
-                self._fail_phase("FE: API Integration", str(exc))
+            # ── Phases 5-8: Parallel (API Integration, State, Docs, Deploy) ─────
+            # These four phases have no inter-dependencies — run them all
+            # concurrently to reduce wall-clock time.
+            logger.info(
+                "[FE Phases 5-8] Running API integration, state management, "
+                "documentation, and deployment in parallel..."
+            )
 
-            # ── Phase 6: State Management ─────────────────────────────────────────
-            self._phase("FE: State Management", "running")
-            logger.info("[FE Phase 6] Generating state management layer (%s)...",
-                        component_plan.state_solution)
-            try:
-                state_agent = agent_manager._create_agent(TaskType.MANAGE_STATE)
-                state_ctx = AgentContext(
-                    task=Task(
-                        task_id=9001,
-                        task_type=TaskType.MANAGE_STATE,
-                        file="src/store/index.ts",
-                        description=f"Generate {component_plan.state_solution} store layer",
-                        metadata={"component_plan": component_plan},
-                    ),
-                    blueprint=frontend_blueprint,
-                    file_blueprint=FileBlueprint(
-                        path="src/store/index.ts",
-                        purpose="State management barrel / root store",
-                        language="typescript",
-                        layer="store",
-                    ),
-                )
-                state_result = await state_agent.execute(state_ctx)
-                if state_result.success:
-                    await event_bus.publish(AgentEvent(
-                        type=BusEventType.TASK_COMPLETED,
-                        task_id=9001,
-                        task_type=TaskType.MANAGE_STATE.value,
-                        file_path="src/store/index.ts",
-                        agent_name="StateManagementAgent",
-                    ))
-                else:
-                    errors.extend(state_result.errors)
-                    await event_bus.publish(AgentEvent(
-                        type=BusEventType.TASK_FAILED,
-                        task_id=9001,
-                        task_type=TaskType.MANAGE_STATE.value,
-                        file_path="src/store/index.ts",
-                        agent_name="StateManagementAgent",
-                        data={"errors": state_result.errors},
-                    ))
-                self._complete_phase("FE: State Management")
-            except Exception as exc:
-                logger.exception("State management generation failed")
-                errors.append(f"State management failed: {exc}")
-                self._fail_phase("FE: State Management", str(exc))
+            async def _run_api_integration() -> None:
+                """Phase 5: API Integration."""
+                self._phase("FE: API Integration", "running")
+                logger.info("[FE Phase 5] Generating API client layer...")
+                try:
+                    integrator = agent_manager._create_agent(TaskType.INTEGRATE_API)
+                    api_ctx = AgentContext(
+                        task=Task(
+                            task_id=9000,
+                            task_type=TaskType.INTEGRATE_API,
+                            file="src/lib/api.ts",
+                            description="Generate typed API client and hooks",
+                            metadata={
+                                "api_contract": api_contract,
+                                "component_plan": component_plan,
+                            },
+                        ),
+                        blueprint=frontend_blueprint,
+                        file_blueprint=FileBlueprint(
+                            path="src/lib/api.ts",
+                            purpose="Base Axios/Fetch API client with auth interceptors",
+                            language="typescript",
+                            layer="lib",
+                        ),
+                    )
+                    api_result = await integrator.execute(api_ctx)
+                    if api_result.success:
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_COMPLETED,
+                            task_id=9000,
+                            task_type=TaskType.INTEGRATE_API.value,
+                            file_path="src/lib/api.ts",
+                            agent_name="APIIntegrationAgent",
+                        ))
+                    else:
+                        errors.extend(api_result.errors)
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_FAILED,
+                            task_id=9000,
+                            task_type=TaskType.INTEGRATE_API.value,
+                            file_path="src/lib/api.ts",
+                            agent_name="APIIntegrationAgent",
+                            data={"errors": api_result.errors},
+                        ))
+                    self._complete_phase("FE: API Integration")
+                except Exception as exc:
+                    logger.exception("API integration failed")
+                    errors.append(f"API integration failed: {exc}")
+                    self._fail_phase("FE: API Integration", str(exc))
+
+            async def _run_state_management() -> None:
+                """Phase 6: State Management."""
+                self._phase("FE: State Management", "running")
+                logger.info("[FE Phase 6] Generating state management layer (%s)...",
+                            component_plan.state_solution)
+                try:
+                    state_agent = agent_manager._create_agent(TaskType.MANAGE_STATE)
+                    state_ctx = AgentContext(
+                        task=Task(
+                            task_id=9001,
+                            task_type=TaskType.MANAGE_STATE,
+                            file="src/store/index.ts",
+                            description=f"Generate {component_plan.state_solution} store layer",
+                            metadata={"component_plan": component_plan},
+                        ),
+                        blueprint=frontend_blueprint,
+                        file_blueprint=FileBlueprint(
+                            path="src/store/index.ts",
+                            purpose="State management barrel / root store",
+                            language="typescript",
+                            layer="store",
+                        ),
+                    )
+                    state_result = await state_agent.execute(state_ctx)
+                    if state_result.success:
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_COMPLETED,
+                            task_id=9001,
+                            task_type=TaskType.MANAGE_STATE.value,
+                            file_path="src/store/index.ts",
+                            agent_name="StateManagementAgent",
+                        ))
+                    else:
+                        errors.extend(state_result.errors)
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_FAILED,
+                            task_id=9001,
+                            task_type=TaskType.MANAGE_STATE.value,
+                            file_path="src/store/index.ts",
+                            agent_name="StateManagementAgent",
+                            data={"errors": state_result.errors},
+                        ))
+                    self._complete_phase("FE: State Management")
+                except Exception as exc:
+                    logger.exception("State management generation failed")
+                    errors.append(f"State management failed: {exc}")
+                    self._fail_phase("FE: State Management", str(exc))
+
+            async def _run_documentation() -> None:
+                """Phase 7: Documentation (WriterAgent)."""
+                self._phase("FE: Documentation", "running")
+                logger.info("[FE Phase 7] Generating frontend documentation...")
+                try:
+                    writer_agent = agent_manager._create_agent(TaskType.GENERATE_DOCS)
+                    # Populate related_files with generated page/route components
+                    # so the WriterAgent can reference real code instead of hallucinating.
+                    related: dict[str, str] = {}
+                    for comp in ordered_components:
+                        abs_path = workspace / comp.file_path
+                        if abs_path.exists():
+                            try:
+                                content = abs_path.read_text(encoding="utf-8", errors="replace")
+                                related[comp.file_path] = content[:3000]
+                            except OSError:
+                                pass
+                    # Also include api.ts and store if they exist
+                    for extra in ("src/lib/api.ts", "src/store/index.ts"):
+                        ep = workspace / extra
+                        if ep.exists():
+                            try:
+                                related[extra] = ep.read_text(encoding="utf-8", errors="replace")[:3000]
+                            except OSError:
+                                pass
+
+                    writer_ctx = AgentContext(
+                        task=Task(
+                            task_id=9002,
+                            task_type=TaskType.GENERATE_DOCS,
+                            file="docs/README.md",
+                            description="Generate frontend documentation (README, API docs, Changelog)",
+                            metadata={
+                                "component_plan": component_plan,
+                                "api_contract": api_contract,
+                            },
+                        ),
+                        blueprint=frontend_blueprint,
+                        related_files=related,
+                    )
+                    writer_result = await writer_agent.execute(writer_ctx)
+                    if writer_result.success:
+                        logger.info("[FE Phase 7] Documentation generated: %s", writer_result.output)
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_COMPLETED,
+                            task_id=9002,
+                            task_type=TaskType.GENERATE_DOCS.value,
+                            file_path="docs/README.md",
+                            agent_name="WriterAgent",
+                        ))
+                    else:
+                        errors.extend(writer_result.errors)
+                        logger.warning("[FE Phase 7] Documentation generation had errors: %s", writer_result.errors)
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_FAILED,
+                            task_id=9002,
+                            task_type=TaskType.GENERATE_DOCS.value,
+                            file_path="docs/README.md",
+                            agent_name="WriterAgent",
+                            data={"errors": writer_result.errors},
+                        ))
+                    self._complete_phase("FE: Documentation")
+                except Exception as exc:
+                    logger.exception("Frontend documentation generation failed")
+                    errors.append(f"Documentation generation failed: {exc}")
+                    self._fail_phase("FE: Documentation", str(exc))
+
+            async def _run_deployment() -> None:
+                """Phase 8: Deployment Artifacts (DeployAgent)."""
+                self._phase("FE: Deployment", "running")
+                logger.info("[FE Phase 8] Generating deployment artifacts (Dockerfile, K8s)...")
+                try:
+                    deploy_agent = agent_manager._create_agent(TaskType.GENERATE_DEPLOY)
+                    deploy_ctx = AgentContext(
+                        task=Task(
+                            task_id=9003,
+                            task_type=TaskType.GENERATE_DEPLOY,
+                            file="deploy/Dockerfile",
+                            description="Generate frontend deployment artifacts (Dockerfile, docker-compose, K8s manifests)",
+                            metadata={
+                                "component_plan": component_plan,
+                            },
+                        ),
+                        blueprint=frontend_blueprint,
+                    )
+                    deploy_result = await deploy_agent.execute(deploy_ctx)
+                    if deploy_result.success:
+                        logger.info("[FE Phase 8] Deployment artifacts generated: %s", deploy_result.output)
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_COMPLETED,
+                            task_id=9003,
+                            task_type=TaskType.GENERATE_DEPLOY.value,
+                            file_path="deploy/Dockerfile",
+                            agent_name="DeployAgent",
+                        ))
+                    else:
+                        errors.extend(deploy_result.errors)
+                        logger.warning("[FE Phase 8] Deployment generation had errors: %s", deploy_result.errors)
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.TASK_FAILED,
+                            task_id=9003,
+                            task_type=TaskType.GENERATE_DEPLOY.value,
+                            file_path="deploy/Dockerfile",
+                            agent_name="DeployAgent",
+                            data={"errors": deploy_result.errors},
+                        ))
+                    self._complete_phase("FE: Deployment")
+                except Exception as exc:
+                    logger.exception("Frontend deployment artifact generation failed")
+                    errors.append(f"Deployment generation failed: {exc}")
+                    self._fail_phase("FE: Deployment", str(exc))
+
+            _parallel_start = time.monotonic()
+            await asyncio.gather(
+                _run_api_integration(),
+                _run_state_management(),
+                _run_documentation(),
+                _run_deployment(),
+            )
+            logger.info(
+                "[FE Phases 5-8] Parallel phases complete in %.1fs",
+                time.monotonic() - _parallel_start,
+            )
 
             # ── Finalise: persist dep graph, repo index, and embeddings ──────────
             try:
@@ -633,8 +769,22 @@ class FrontendPipeline:
         self,
         requirements: ProductRequirements,
         plan: ComponentPlan,
+        extra_components: list | None = None,
     ) -> RepositoryBlueprint:
-        """Build a RepositoryBlueprint from the ComponentPlan for RepositoryManager."""
+        """Build a RepositoryBlueprint from the ComponentPlan for RepositoryManager.
+
+        *extra_components* are additional UIComponent objects (e.g. ghost
+        dependency stubs) that should appear in the blueprint but are not
+        part of ``plan.components``.
+        """
+        all_components = list(plan.components)
+        if extra_components:
+            # Avoid duplicates — ghosts may share names with planned components
+            planned_paths = {c.file_path for c in all_components}
+            for ec in extra_components:
+                if ec.file_path not in planned_paths:
+                    all_components.append(ec)
+
         file_blueprints = [
             FileBlueprint(
                 path=comp.file_path,
@@ -644,12 +794,13 @@ class FrontendPipeline:
                 language="typescript",
                 layer=comp.layer or comp.component_type,
             )
-            for comp in plan.components
+            for comp in all_components
         ]
         fw = plan.framework
         tech_stack: dict[str, str] = {
             "language": "typescript",
             "framework": fw,
+            "build_tool": "npm",
             "state": plan.state_solution,
             "styling": requirements.tech_preferences.get("styling", "tailwind"),
         }
