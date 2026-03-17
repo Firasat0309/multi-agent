@@ -7,6 +7,7 @@ import copy
 import dataclasses
 import json as _json
 import logging
+import re
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -409,14 +410,21 @@ class FrontendPipeline:
                 ))
             self._complete_phase("FE: TypeScript Compilation")
 
-            # ── Phase 4.6: Cross-component import validation ───────────────────────
+            # ── Phase 4.6: Cross-component import validation + auto-fix ────────────
             self._phase("FE: Import Validation", "running")
             logger.info("[FE Phase 4.6] Validating cross-component imports...")
             import_errors = self._validate_component_imports(workspace, ordered_components)
             if import_errors:
+                # Attempt auto-fix: rewrite broken relative imports to correct paths
+                fixed_count = self._auto_fix_imports(workspace, ordered_components)
+                if fixed_count > 0:
+                    logger.info("[FE Phase 4.6] Auto-fixed %d import(s), re-validating...", fixed_count)
+                    import_errors = self._validate_component_imports(workspace, ordered_components)
+
+            if import_errors:
                 metrics["import_errors"] = len(import_errors)
                 errors.extend(import_errors)
-                logger.warning("[FE Phase 4.6] %d unresolved import(s)", len(import_errors))
+                logger.warning("[FE Phase 4.6] %d unresolved import(s) after auto-fix", len(import_errors))
             else:
                 logger.info("[FE Phase 4.6] All component imports resolved")
             self._complete_phase("FE: Import Validation")
@@ -688,6 +696,94 @@ class FrontendPipeline:
             for imp in broken:
                 errors.append(f"{file_path}: unresolved import '{imp}'")
         return errors
+
+    @staticmethod
+    def _auto_fix_imports(
+        workspace: Path,
+        components: list,
+    ) -> int:
+        """Attempt to fix broken relative imports by finding the correct path.
+
+        Scans each component file for relative imports that don't resolve,
+        then searches the workspace for a file whose basename matches the
+        import target and rewrites the import path accordingly.
+
+        Returns the number of imports fixed.
+        """
+        import posixpath
+
+        # Build lookup: basename (no extension) → list of workspace-relative paths
+        ts_files: dict[str, list[str]] = {}
+        for ext in ("*.ts", "*.tsx"):
+            for p in workspace.rglob(ext):
+                rel = p.relative_to(workspace).as_posix()
+                stem = p.stem  # e.g. "authStore" from "authStore.ts"
+                ts_files.setdefault(stem, []).append(rel)
+
+        imp_re = re.compile(
+            r"""(import\s+(?:type\s+)?(?:[^'"\n;]+?\s+from\s+)?['\"])([^'\"]+)(['\"])"""
+        )
+
+        # Pre-compute the set of all TS/TSX files once (avoid re-globbing per import)
+        existing: set[str] = set()
+        for ext in ("*.ts", "*.tsx"):
+            for p in workspace.rglob(ext):
+                existing.add(p.relative_to(workspace).as_posix())
+
+        fixed_total = 0
+        for comp in components:
+            file_path: str = comp.file_path
+            abs_path = workspace / file_path
+            if not abs_path.exists():
+                continue
+            try:
+                content = abs_path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+
+            file_dir = posixpath.dirname(file_path)
+            new_content = content
+            changed = False
+
+            for m in imp_re.finditer(content):
+                imp = m.group(2)
+                if not imp.startswith("."):
+                    continue
+
+                # Check if this import already resolves
+                raw = posixpath.normpath(posixpath.join(file_dir, imp)).lstrip("/")
+                candidates = [raw + e for e in (".ts", ".tsx", ".js", ".jsx",
+                                                 "/index.ts", "/index.tsx")]
+                candidates.append(raw)
+                if any(c in existing for c in candidates):
+                    continue
+
+                # Import is broken — try to find the target file by basename
+                target_name = posixpath.basename(imp)
+                matches = ts_files.get(target_name, [])
+                if len(matches) == 1:
+                    # Compute correct relative path
+                    target_rel = matches[0]
+                    # Remove extension for the import
+                    target_no_ext = re.sub(r"\.(tsx?|jsx?)$", "", target_rel)
+                    new_imp = posixpath.relpath(target_no_ext, file_dir)
+                    if not new_imp.startswith("."):
+                        new_imp = "./" + new_imp
+                    if new_imp != imp:
+                        old_full = m.group(0)
+                        new_full = m.group(1) + new_imp + m.group(3)
+                        new_content = new_content.replace(old_full, new_full, 1)
+                        changed = True
+                        fixed_total += 1
+                        logger.info(
+                            "[FE Import Fix] %s: '%s' → '%s'",
+                            file_path, imp, new_imp,
+                        )
+
+            if changed:
+                abs_path.write_text(new_content, encoding="utf-8")
+
+        return fixed_total
 
     @staticmethod
     def _infer_framework(requirements: ProductRequirements) -> str:

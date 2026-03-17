@@ -896,4 +896,7 @@ class CoderAgent(BaseAgent):
                 break
         if content.endswith("```"):
             content = content[:-3]
-        return content.strip() + "\n"
+        content = content.strip() + "\n"
+        # Remove duplicated content blocks caused by LLM continuation failures
+        content = self._deduplicate_content(content)
+        return content

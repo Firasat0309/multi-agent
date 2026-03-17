@@ -793,6 +793,17 @@ class PipelineExecutor:
 
                 fix_context = checkpoint.get_fix_context_for_file(file_path, result)
 
+                # Skip files that have no attributed errors (and this isn't
+                # an unattributed fallback).  Without this check, every tier
+                # file gets a fix dispatch with empty build_errors, producing
+                # identical-content "fixes" that waste LLM calls.
+                if not unattributed_fallback and not fix_context.get("build_errors"):
+                    logger.debug(
+                        "[Checkpoint] Skipping %s — no errors attributed to this file",
+                        file_path,
+                    )
+                    continue
+
                 # When no errors were attributed to specific files, extract
                 # just the error lines from the build output instead of
                 # sending the entire log (which can be 50K+ of noise).

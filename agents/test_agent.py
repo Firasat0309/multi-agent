@@ -543,7 +543,10 @@ class TestAgent(BaseAgent):
             code = code[3:]
         if code.endswith("```"):
             code = code[:-3]
-        return code.strip() + "\n"
+        code = code.strip() + "\n"
+        # Remove duplicated content blocks caused by LLM continuation failures
+        code = self._deduplicate_content(code)
+        return code
 
     # ── Test quality gate ────────────────────────────────────────────────
 

@@ -201,14 +201,80 @@ class DesignParserAgent(BaseAgent):
                     output=f"Design parsed: {len(spec.pages)} pages, framework={spec.framework}",
                     metrics={**self.get_metrics(), "pages": len(spec.pages)},
                 )
-            except json.JSONDecodeError as exc:
-                logger.error(f"DesignParserAgent failed to parse JSON from output: {result.output[:100]}...")
-                return TaskResult(success=False, errors=[f"Invalid JSON returned: {exc}"])
+            except json.JSONDecodeError as first_exc:
+                # LLM returned malformed JSON even after repair — retry once
+                # with an explicit "fix your JSON" prompt before giving up.
+                logger.warning(
+                    "DesignParserAgent JSON repair failed (%s) — retrying with corrective prompt",
+                    first_exc,
+                )
+                try:
+                    retry_result = await self._retry_json_parse(context, result.output, first_exc)
+                    if retry_result is not None:
+                        context.task.metadata["design_spec"] = retry_result
+                        return TaskResult(
+                            success=True,
+                            output=f"Design parsed (retry): {len(retry_result.pages)} pages, framework={retry_result.framework}",
+                            metrics={**self.get_metrics(), "pages": len(retry_result.pages), "json_retry": True},
+                        )
+                except Exception as retry_exc:
+                    logger.warning("JSON retry also failed: %s", retry_exc)
+
+                logger.error("DesignParserAgent failed to parse JSON from output: %s...", result.output[:100])
+                return TaskResult(success=False, errors=[f"Invalid JSON returned: {first_exc}"])
 
         except Exception as exc:
             logger.exception("DesignParserAgent.execute failed")
             return TaskResult(success=False, errors=[str(exc)])
             
+    async def _retry_json_parse(
+        self,
+        context: AgentContext,
+        malformed_output: str,
+        parse_error: Exception,
+    ) -> UIDesignSpec | None:
+        """Ask the LLM to fix its own malformed JSON output.
+
+        Returns a parsed UIDesignSpec on success, or None if the retry also
+        produces unparseable JSON.
+        """
+        import json
+
+        corrective_prompt = (
+            "Your previous response was not valid JSON.  The parser returned:\n"
+            f"  {parse_error}\n\n"
+            "Here is the broken output (first 2000 chars):\n"
+            f"{malformed_output[:2000]}\n\n"
+            "Please return ONLY the corrected JSON object — no explanation, "
+            "no markdown fences.  Fix the syntax error and output valid JSON."
+        )
+        retry_result = await self.llm_client.generate(
+            system_prompt=self.system_prompt,
+            user_prompt=corrective_prompt,
+            max_tokens=4096,
+        )
+        content = retry_result.content.strip()
+        if content.startswith("```"):
+            content = content.split("\n", 1)[1]
+            if content.endswith("```"):
+                content = content[:-3].rstrip()
+
+        try:
+            raw = json.loads(content)
+        except json.JSONDecodeError:
+            repaired = self._repair_json(content)
+            start = repaired.find("{")
+            end = repaired.rfind("}") + 1
+            if start != -1 and end > start:
+                repaired = repaired[start:end]
+            raw = json.loads(repaired)
+
+        requirements = context.task.metadata.get("requirements")
+        figma_url = context.task.metadata.get("figma_url", "")
+        spec = self._parse_spec(raw, requirements, figma_url)
+        logger.info("DesignParserAgent: JSON retry succeeded (%d pages)", len(spec.pages))
+        return spec
+
     # ── Figma REST API helpers ─────────────────────────────────────────────────
 
     @staticmethod

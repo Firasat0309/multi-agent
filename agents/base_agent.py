@@ -428,6 +428,9 @@ class BaseAgent(ABC):
         content = inp.get("content", "")
         if not path:
             return "Error: 'path' is required"
+        # Deduplicate content before writing — LLMs sometimes pass the
+        # full file content with the class repeated multiple times.
+        content = self._deduplicate_content(content)
         # Security: async_write_file is scoped to workspace root
         await self.repo.async_write_file(path, content)
         msg = f"Written {len(content)} bytes to {path}"
@@ -609,31 +612,118 @@ class BaseAgent(ABC):
             if continuation.endswith("```"):
                 continuation = continuation[:-3].rstrip()
 
-            # Detect overlapping tail: the LLM sometimes repeats the last
-            # few lines (or even larger sections) for context.  Find the
-            # longest suffix of `content` that matches a prefix of
-            # `continuation` and skip it.  We check up to the last 30 lines
-            # because LLMs can restart from the beginning of a class or
-            # function definition that was 10–20 lines back.
-            overlap = 0
-            max_overlap_lines = 30
-            tail_lines = content.rsplit("\n", max_overlap_lines)[-max_overlap_lines:]
-            for n in range(min(len(tail_lines), max_overlap_lines), 0, -1):
-                tail = "\n".join(tail_lines[-n:])
-                if continuation.startswith(tail):
-                    overlap = len(tail)
-                    break
-            if overlap:
-                continuation = continuation[overlap:]
-                logger.debug(f"Stripped {overlap}-char overlap at continuation boundary")
+            # ── Full-restart detection ─────────────────────────────────
+            # LLMs (especially Gemini Flash) often restart from the very
+            # beginning of the file instead of continuing.  Detect this by
+            # checking if the continuation starts with the same leading
+            # lines (package/import block) as the already-accumulated
+            # content.  When detected, keep the longer version rather than
+            # blindly appending a duplicate.
+            full_restart = False
+            if continuation.strip():
+                # Compare first non-blank line of content vs continuation
+                first_orig = ""
+                for _l in content.splitlines():
+                    if _l.strip():
+                        first_orig = _l.strip()
+                        break
+                first_cont = ""
+                for _l in continuation.splitlines():
+                    if _l.strip():
+                        first_cont = _l.strip()
+                        break
+                if (
+                    first_orig
+                    and first_cont
+                    and first_orig == first_cont
+                    and any(first_orig.startswith(kw) for kw in (
+                        "package ", "import ", "from ", "#include", "module ",
+                        "namespace ", "using ", "pub mod", "pub use", "#![",
+                    ))
+                ):
+                    full_restart = True
+                    logger.warning(
+                        "Full-restart detected in continuation (starts with %r) "
+                        "— using longer version instead of appending duplicate",
+                        first_cont[:60],
+                    )
+                    # Keep whichever version is longer (the continuation
+                    # may have made it further before being truncated again)
+                    if len(continuation) > len(content):
+                        content = continuation
+                    # else: keep existing content as-is
 
-            content = content + continuation
+            if not full_restart:
+                # Detect overlapping tail: the LLM sometimes repeats the last
+                # few lines (or even larger sections) for context.  Find the
+                # longest suffix of `content` that matches a prefix of
+                # `continuation` and skip it.  We check up to the last 30 lines
+                # because LLMs can restart from the beginning of a class or
+                # function definition that was 10–20 lines back.
+                overlap = 0
+                max_overlap_lines = 30
+                tail_lines = content.rsplit("\n", max_overlap_lines)[-max_overlap_lines:]
+                for n in range(min(len(tail_lines), max_overlap_lines), 0, -1):
+                    tail = "\n".join(tail_lines[-n:])
+                    if continuation.startswith(tail):
+                        overlap = len(tail)
+                        break
+                if overlap:
+                    continuation = continuation[overlap:]
+                    logger.debug(f"Stripped {overlap}-char overlap at continuation boundary")
+
+                content = content + continuation
 
         if continuation_count >= self._MAX_CONTINUATIONS:
             logger.warning(
                 f"Hit max continuation limit ({self._MAX_CONTINUATIONS}). "
                 f"Output may still be incomplete ({len(content)} chars total)."
             )
+
+        # Final deduplication pass: detect if the content contains the same
+        # class/file repeated multiple times (LLM continuation failure).
+        if continuation_count > 0:
+            content = self._deduplicate_content(content)
+
+        return content
+
+    @staticmethod
+    def _deduplicate_content(content: str) -> str:
+        """Detect and remove duplicated file blocks in LLM output.
+
+        When LLM continuations fail (restart from beginning), the content
+        may contain the same class/package declaration repeated 2-4 times.
+        This finds the repeating unit and keeps only the longest instance.
+        """
+        import re as _re
+
+        # Detect duplicate package/module/namespace declarations
+        # These should appear at most once in a valid source file.
+        header_patterns = [
+            _re.compile(r"^package\s+[\w.]+\s*;", _re.MULTILINE),         # Java
+            _re.compile(r"^from\s+__future__\s+import\b", _re.MULTILINE),  # Python
+            _re.compile(r"^#include\s+[<\"]", _re.MULTILINE),              # C/C++
+            _re.compile(r"^namespace\s+[\w.]+\s*\{?", _re.MULTILINE),     # C#
+            _re.compile(r"^package\s+\w+\s*$", _re.MULTILINE),            # Go/Kotlin
+        ]
+
+        for pattern in header_patterns:
+            matches = list(pattern.finditer(content))
+            if len(matches) >= 2:
+                # Found duplicate declarations — split at each occurrence
+                # and keep the longest block (most complete version).
+                positions = [m.start() for m in matches]
+                blocks: list[str] = []
+                for i, pos in enumerate(positions):
+                    end = positions[i + 1] if i + 1 < len(positions) else len(content)
+                    blocks.append(content[pos:end].rstrip())
+                longest = max(blocks, key=len)
+                logger.warning(
+                    "Deduplication: found %d repeated blocks (pattern: %s), "
+                    "keeping longest (%d chars)",
+                    len(blocks), pattern.pattern[:40], len(longest),
+                )
+                return longest.rstrip() + "\n"
 
         return content
 

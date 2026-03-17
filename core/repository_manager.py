@@ -156,9 +156,19 @@ class RepositoryManager:
         already exists.
         """
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=file_path.parent, prefix=".~", suffix=".tmp"
-        )
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=file_path.parent, prefix=".~", suffix=".tmp"
+            )
+        except FileNotFoundError:
+            # Race condition: another task may have removed the parent
+            # directory between mkdir and mkstemp, or the resolved path
+            # contains an intermediate segment that was deleted.  Retry
+            # mkdir once and try again.
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=file_path.parent, prefix=".~", suffix=".tmp"
+            )
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(content)
