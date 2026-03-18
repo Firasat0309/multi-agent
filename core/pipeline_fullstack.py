@@ -128,6 +128,7 @@ class FullstackPipeline:
             approver = ArchitectureApprover(
                 interactive=self._interactive,
                 workspace=root_workspace,
+                live=self._live,
             )
             try:
                 approved = approver.approve_product_plan(requirements)
@@ -187,6 +188,7 @@ class FullstackPipeline:
             approver = ArchitectureApprover(
                 interactive=self._interactive,
                 workspace=root_workspace,
+                live=self._live,
             )
             try:
                 approved = approver.approve_backend_architecture(backend_blueprint)

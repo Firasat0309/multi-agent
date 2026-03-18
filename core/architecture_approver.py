@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from core.live_console import LiveConsole
     from core.models import (
         ComponentPlan,
         ProductRequirements,
@@ -40,22 +41,27 @@ class ArchitectureApprover:
     - interactive=True  : Rich console display + y/n prompt (CLI usage).
     - interactive=False : Writes plan to JSON and raises
                           ``ArchitecturePendingApprovalError``.
+
+    When a ``LiveConsole`` is provided, the live display is temporarily
+    paused while waiting for user input so that the prompt is visible.
     """
 
     def __init__(
         self,
         interactive: bool = True,
         workspace: Path | None = None,
+        live: LiveConsole | None = None,
     ) -> None:
         self._interactive = interactive
         self._workspace = workspace
+        self._live = live
 
     # ── Product Requirements Approval ──────────────────────────────────────
 
     def approve_product_plan(self, requirements: ProductRequirements) -> bool:
         """Display product requirements and return True if approved."""
         if self._interactive:
-            return self._interactive_product(requirements)
+            return self._with_live_paused(self._interactive_product, requirements)
         return self._noninteractive_product(requirements)
 
     def _interactive_product(self, req: ProductRequirements) -> bool:
@@ -138,7 +144,7 @@ class ArchitectureApprover:
     def approve_backend_architecture(self, blueprint: RepositoryBlueprint) -> bool:
         """Display backend architecture and return True if approved."""
         if self._interactive:
-            return self._interactive_backend(blueprint)
+            return self._with_live_paused(self._interactive_backend, blueprint)
         return self._noninteractive_backend(blueprint)
 
     def _interactive_backend(self, bp: RepositoryBlueprint) -> bool:
@@ -218,7 +224,7 @@ class ArchitectureApprover:
     def approve_frontend_architecture(self, plan: ComponentPlan) -> bool:
         """Display frontend component plan and return True if approved."""
         if self._interactive:
-            return self._interactive_frontend(plan)
+            return self._with_live_paused(self._interactive_frontend, plan)
         return self._noninteractive_frontend(plan)
 
     def _interactive_frontend(self, plan: ComponentPlan) -> bool:
@@ -296,6 +302,16 @@ class ArchitectureApprover:
         )
 
     # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _with_live_paused(self, fn, *args):
+        """Stop the LiveConsole before prompting, restart it after."""
+        if self._live:
+            self._live.stop()
+        try:
+            return fn(*args)
+        finally:
+            if self._live:
+                self._live.start()
 
     def _write_pending(self, payload: dict, filename: str) -> None:
         if self._workspace:

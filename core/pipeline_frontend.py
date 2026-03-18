@@ -174,6 +174,7 @@ class FrontendPipeline:
             approver = ArchitectureApprover(
                 interactive=self._interactive,
                 workspace=workspace,
+                live=self._live,
             )
             try:
                 approved = approver.approve_frontend_architecture(component_plan)

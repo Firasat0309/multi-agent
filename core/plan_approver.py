@@ -5,8 +5,12 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from core.models import ChangePlan
+
+if TYPE_CHECKING:
+    from core.live_console import LiveConsole
 
 logger = logging.getLogger(__name__)
 
@@ -26,15 +30,20 @@ class PlanApprover:
     - interactive=True  : Rich console table + y/n prompt (CLI usage).
     - interactive=False : Writes plan to ``pending_plan.json`` and raises
                           ``PlanPendingApprovalError`` (API / programmatic usage).
+
+    When a ``LiveConsole`` is provided, the live display is temporarily
+    paused while waiting for user input so that the prompt is visible.
     """
 
     def __init__(
         self,
         interactive: bool = True,
         workspace: Path | None = None,
+        live: LiveConsole | None = None,
     ) -> None:
         self._interactive = interactive
         self._workspace = workspace
+        self._live = live
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -45,9 +54,19 @@ class PlanApprover:
             PlanPendingApprovalError: when interactive=False.
         """
         if self._interactive:
-            return self._interactive_approve(plan)
+            return self._with_live_paused(self._interactive_approve, plan)
         else:
             return self._noninteractive_approve(plan)
+
+    def _with_live_paused(self, fn, *args):
+        """Stop the LiveConsole before prompting, restart it after."""
+        if self._live:
+            self._live.stop()
+        try:
+            return fn(*args)
+        finally:
+            if self._live:
+                self._live.start()
 
     # ── Interactive (CLI) path ────────────────────────────────────────────────
 

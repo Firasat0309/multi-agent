@@ -191,6 +191,7 @@ class EnhancePipeline:
             approver = PlanApprover(
                 interactive=self._interactive,
                 workspace=self._settings.workspace_dir,
+                live=self._live,
             )
             try:
                 approved = approver.display_and_approve(change_plan)
