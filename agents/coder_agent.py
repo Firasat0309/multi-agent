@@ -297,12 +297,19 @@ class CoderAgent(BaseAgent):
         # much less likely.
         dep_signatures = self._extract_dep_signatures(context)
 
+        # ── API contract section for controller / handler / route files ──
+        # When an API contract is available and this file is a controller-layer
+        # file, embed the relevant endpoint details directly in the prompt so
+        # the model generates the exact request/response types required.
+        api_contract_section = self._extract_api_contract_section(context)
+
         return (
             f"{self._format_context(context)}\n\n"
             f"Generate the complete {profile.display_name} file for: {fb.path}\n"
             f"Purpose: {fb.purpose}\n"
             f"Layer: {fb.layer}\n"
             f"Must export: {', '.join(fb.exports) if fb.exports else 'appropriate classes/functions'}\n\n"
+            f"{api_contract_section}"
             f"{dep_signatures}"
             f"INSTRUCTIONS:\n"
             f"1. Check the Related Files section below — dependency signatures are shown as "
@@ -330,6 +337,64 @@ class CoderAgent(BaseAgent):
             f"Do NOT output code as plain text — always use the write_file tool."
             f"{syntax_reminder}"
         )
+
+    @staticmethod
+    def _extract_api_contract_section(context: AgentContext) -> str:
+        """Return an API contract block for controller / service / route files.
+
+        Only injects contract details when:
+        1. An api_contract is present on the context (fullstack mode).
+        2. The file being generated is a controller, handler, router, or route layer.
+        3. There are endpoints whose path resource matches the file name.
+
+        This avoids polluting model/repository prompts with irrelevant contract noise.
+        """
+        fb = context.file_blueprint
+        if not context.api_contract or not fb:
+            return ""
+
+        _CONTRACT_LAYERS = {"controller", "handler", "router", "route", "api", "resource"}
+        if fb.layer.lower() not in _CONTRACT_LAYERS:
+            return ""
+
+        ac = context.api_contract
+        if not ac.endpoints:
+            return ""
+
+        # Filter to endpoints relevant to this file by matching the file's path
+        # stem against endpoint path segments (e.g. "UserController.java" → "user")
+        import re as _re
+        file_stem = _re.sub(r"(controller|handler|router|route|resource|api)", "", Path(fb.path).stem, flags=_re.IGNORECASE).lower().strip("_-")
+
+        relevant = [
+            ep for ep in ac.endpoints
+            if not file_stem or file_stem in ep.path.lower() or any(
+                file_stem in tag.lower() for tag in ep.tags
+            )
+        ] or list(ac.endpoints)  # fall back to all endpoints if no match found
+
+        import json as _json
+        lines = [
+            "API CONTRACT — implement these endpoints EXACTLY as specified:",
+            f"  Base URL: {ac.base_url}",
+        ]
+        for ep in relevant:
+            auth = " [requires authentication]" if ep.auth_required else ""
+            lines.append(f"  {ep.method} {ep.path}{auth}")
+            lines.append(f"    Description: {ep.description}")
+            if ep.request_schema:
+                try:
+                    lines.append(f"    Request body: {_json.dumps(ep.request_schema)}")
+                except Exception:
+                    pass
+            if ep.response_schema:
+                try:
+                    lines.append(f"    Response body: {_json.dumps(ep.response_schema)}")
+                except Exception:
+                    pass
+        lines.append("")
+
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _extract_dep_signatures(context: AgentContext) -> str:

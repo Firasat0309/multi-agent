@@ -13,9 +13,11 @@ from core.models import (
     APIContract,
     APIEndpoint,
     ComponentPlan,
+    FileBlueprint,
     FullstackBlueprint,
     ProductRequirements,
     RepositoryBlueprint,
+    RepositoryIndex,
     Task,
     TaskType,
     UIComponent,
@@ -1650,4 +1652,445 @@ class TestFrontendPipelineImportValidation:
         comps = [self._make_component("src/App.tsx")]
         errors = FrontendPipeline._validate_component_imports(tmp_path, comps)
         assert errors == []
+
+
+# ── New pipeline_fullstack architectural-fix tests ────────────────────────────
+
+
+class TestFullstackPipelineArchitecturalFixes:
+    """Tests for the architectural improvements to the fullstack pipeline:
+
+    1. _enrich_prompt now includes user stories
+    2. _build_backend_prompt includes full endpoint schemas
+    3. _validate_contract_blueprint emits warnings for uncovered resources
+    """
+
+    def test_enrich_prompt_includes_user_stories(self):
+        from core.pipeline_fullstack import FullstackPipeline
+
+        req = ProductRequirements(
+            title="Task App",
+            description="Desc",
+            user_stories=[
+                "As a user I want to create tasks",
+                "As a user I want to view my dashboard",
+            ],
+            features=["Auth"],
+        )
+        prompt = FullstackPipeline._enrich_prompt("Build an app", req)
+        assert "As a user I want to create tasks" in prompt
+        assert "As a user I want to view my dashboard" in prompt
+
+    def test_enrich_prompt_without_user_stories(self):
+        from core.pipeline_fullstack import FullstackPipeline
+
+        req = ProductRequirements(
+            title="Task App",
+            description="Desc",
+            user_stories=[],
+            features=["Auth"],
+        )
+        prompt = FullstackPipeline._enrich_prompt("Build an app", req)
+        # Should not crash; user stories section simply absent
+        assert "Build an app" in prompt
+        assert "User Stories" not in prompt
+
+    def test_build_backend_prompt_includes_endpoint_paths(self, sample_api_contract):
+        from core.pipeline_fullstack import FullstackPipeline
+
+        prompt = FullstackPipeline._build_backend_prompt("Base prompt", sample_api_contract)
+        assert "GET /tasks" in prompt
+        assert "POST /tasks" in prompt
+        assert "GET /users/me" in prompt
+
+    def test_build_backend_prompt_includes_request_schema(self):
+        from core.pipeline_fullstack import FullstackPipeline
+
+        contract = APIContract(
+            title="API",
+            base_url="/api/v1",
+            endpoints=[
+                APIEndpoint(
+                    path="/items",
+                    method="POST",
+                    description="Create item",
+                    request_schema={"type": "object", "properties": {"name": {"type": "string"}}},
+                    response_schema={"type": "object", "properties": {"id": {"type": "integer"}}},
+                )
+            ],
+        )
+        prompt = FullstackPipeline._build_backend_prompt("Base", contract)
+        assert '"name"' in prompt
+        assert '"id"' in prompt
+
+    def test_build_backend_prompt_without_contract(self):
+        from core.pipeline_fullstack import FullstackPipeline
+
+        prompt = FullstackPipeline._build_backend_prompt("Base prompt", None)
+        assert prompt == "Base prompt"
+
+    def test_validate_contract_blueprint_no_warning_when_covered(self, caplog):
+        from core.pipeline_fullstack import FullstackPipeline
+        import logging
+
+        contract = APIContract(
+            title="API",
+            base_url="/api/v1",
+            endpoints=[
+                APIEndpoint(path="/tasks", method="GET", description="List tasks"),
+            ],
+        )
+        blueprint = RepositoryBlueprint(
+            name="backend",
+            description="Backend",
+            architecture_style="REST",
+            file_blueprints=[
+                FileBlueprint(
+                    path="src/controllers/TaskController.java",
+                    purpose="Handles task endpoints",
+                    layer="controller",
+                )
+            ],
+        )
+        with caplog.at_level(logging.WARNING):
+            FullstackPipeline._validate_contract_blueprint(contract, blueprint)
+        # "task" is present in controller name → no gap warning
+        assert "may not have matching" not in caplog.text
+
+    def test_validate_contract_blueprint_warns_no_controllers(self, caplog):
+        from core.pipeline_fullstack import FullstackPipeline
+        import logging
+
+        contract = APIContract(
+            title="API",
+            base_url="/api/v1",
+            endpoints=[
+                APIEndpoint(path="/orders", method="GET", description="List orders"),
+            ],
+        )
+        blueprint = RepositoryBlueprint(
+            name="backend",
+            description="Backend",
+            architecture_style="REST",
+            file_blueprints=[
+                FileBlueprint(path="src/models/Order.java", purpose="Order model", layer="model")
+            ],
+        )
+        with caplog.at_level(logging.WARNING):
+            FullstackPipeline._validate_contract_blueprint(contract, blueprint)
+        assert "no controller" in caplog.text.lower() or "controller/handler" in caplog.text
+
+
+# ── AgentContext api_contract field tests ─────────────────────────────────────
+
+
+class TestAgentContextApiContract:
+    """Verify that the api_contract field is present and propagates correctly."""
+
+    def test_agent_context_has_api_contract_field(self, sample_api_contract):
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file="src/controller.py",
+            description="gen",
+        )
+        ctx = AgentContext(task=task, blueprint=blueprint, api_contract=sample_api_contract)
+        assert ctx.api_contract is sample_api_contract
+
+    def test_agent_context_api_contract_defaults_none(self):
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file="src/model.py",
+            description="gen",
+        )
+        ctx = AgentContext(task=task, blueprint=blueprint)
+        assert ctx.api_contract is None
+
+
+# ── ContextBuilder api_contract propagation tests ────────────────────────────
+
+
+class TestContextBuilderApiContract:
+    """Verify ContextBuilder threads api_contract to AgentContext."""
+
+    def test_context_builder_propagates_api_contract(self, sample_api_contract, tmp_path):
+        from core.context_builder import ContextBuilder
+
+        blueprint = RepositoryBlueprint(
+            name="test",
+            description="test",
+            architecture_style="REST",
+            file_blueprints=[
+                FileBlueprint(path="src/controller.py", purpose="Controller", layer="controller"),
+            ],
+        )
+        repo_index = RepositoryIndex()
+
+        builder = ContextBuilder(
+            workspace_dir=tmp_path,
+            blueprint=blueprint,
+            repo_index=repo_index,
+            api_contract=sample_api_contract,
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file="src/controller.py",
+            description="Generate controller",
+        )
+        ctx = builder.build(task)
+        assert ctx.api_contract is sample_api_contract
+
+    def test_context_builder_without_api_contract(self, tmp_path):
+        from core.context_builder import ContextBuilder
+
+        blueprint = RepositoryBlueprint(
+            name="test", description="test", architecture_style="REST"
+        )
+        repo_index = RepositoryIndex()
+
+        builder = ContextBuilder(
+            workspace_dir=tmp_path,
+            blueprint=blueprint,
+            repo_index=repo_index,
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file="src/model.py",
+            description="Generate model",
+        )
+        ctx = builder.build(task)
+        assert ctx.api_contract is None
+
+
+# ── CoderAgent API contract section tests ────────────────────────────────────
+
+
+class TestCoderAgentApiContractSection:
+    """Verify CoderAgent embeds contract in prompt for controller-layer files."""
+
+    def _make_agent(self, mock_llm, mock_repo_manager):
+        from agents.coder_agent import CoderAgent
+
+        return CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+
+    def test_extract_api_contract_section_controller(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/controllers/TaskController.java",
+            purpose="Task controller",
+            layer="controller",
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file=fb.path,
+            description="gen",
+        )
+        ctx = AgentContext(
+            task=task,
+            blueprint=blueprint,
+            file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        assert "API CONTRACT" in section
+        assert "/tasks" in section
+
+    def test_extract_api_contract_section_model_layer_empty(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/models/Task.java",
+            purpose="Task model",
+            layer="model",
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file=fb.path,
+            description="gen",
+        )
+        ctx = AgentContext(
+            task=task,
+            blueprint=blueprint,
+            file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        # Model layer should NOT include the API contract
+        assert section == ""
+
+    def test_extract_api_contract_section_no_contract(
+        self, mock_llm, mock_repo_manager
+    ):
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/controllers/OrderController.py",
+            purpose="Order controller",
+            layer="controller",
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file=fb.path,
+            description="gen",
+        )
+        ctx = AgentContext(task=task, blueprint=blueprint, file_blueprint=fb)
+        section = agent._extract_api_contract_section(ctx)
+        assert section == ""
+
+
+# ── BaseAgent _format_context api_contract section tests ─────────────────────
+
+
+class TestBaseAgentFormatContextApiContract:
+    """Verify _format_context includes the API contract summary when present."""
+
+    def test_format_context_includes_api_contract_section(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        from agents.reviewer_agent import ReviewerAgent
+
+        agent = ReviewerAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.REVIEW_FILE,
+            file="src/controller.py",
+            description="review",
+        )
+        ctx = AgentContext(
+            task=task,
+            blueprint=blueprint,
+            api_contract=sample_api_contract,
+        )
+        formatted = agent._format_context(ctx)
+        assert "API Contract" in formatted
+        assert "/tasks" in formatted
+
+    def test_format_context_no_api_contract_section_when_absent(
+        self, mock_llm, mock_repo_manager
+    ):
+        from agents.reviewer_agent import ReviewerAgent
+
+        agent = ReviewerAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.REVIEW_FILE,
+            file="src/model.py",
+            description="review",
+        )
+        ctx = AgentContext(task=task, blueprint=blueprint)
+        formatted = agent._format_context(ctx)
+        assert "API Contract" not in formatted
+
+
+# ── BaseAgent tool timeout tests ──────────────────────────────────────────────
+
+
+class TestBaseAgentToolTimeout:
+    """Verify _dispatch_tool respects the _TOOL_TIMEOUT_SECONDS limit."""
+
+    @pytest.mark.anyio
+    async def test_dispatch_tool_times_out(self, mock_llm, mock_repo_manager):
+        """A tool handler that hangs should trigger TimeoutError and return an error string."""
+        import asyncio
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        # Override timeout to 0.05 s for the test
+        agent._TOOL_TIMEOUT_SECONDS = 0.05
+
+        async def _slow_read(_inp):
+            await asyncio.sleep(10)
+            return "never"
+
+        agent._tool_read_file = _slow_read
+
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file="src/foo.py",
+            description="gen",
+        )
+        ctx = AgentContext(task=task, blueprint=blueprint)
+
+        from core.llm_client import ToolCall
+
+        tc = ToolCall(tool_use_id="t1", name="read_file", input={"path": "src/foo.py"})
+        result = await agent._dispatch_tool(ctx, tc)
+
+        assert "timed out" in result.lower() or "timeout" in result.lower()
+
+    @pytest.mark.anyio
+    async def test_dispatch_tool_succeeds_within_timeout(
+        self, mock_llm, mock_repo_manager
+    ):
+        import asyncio
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        agent._TOOL_TIMEOUT_SECONDS = 5.0
+
+        async def _fast_read(_inp):
+            return "file content"
+
+        agent._tool_read_file = _fast_read
+
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file="src/bar.py",
+            description="gen",
+        )
+        ctx = AgentContext(task=task, blueprint=blueprint)
+
+        from core.llm_client import ToolCall
+
+        tc = ToolCall(tool_use_id="t2", name="read_file", input={"path": "src/bar.py"})
+        result = await agent._dispatch_tool(ctx, tc)
+        assert result == "file content"
 
