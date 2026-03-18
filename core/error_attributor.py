@@ -375,6 +375,21 @@ class CompilerErrorAttributor(BaseErrorAttributor):
 
             i += 1
 
+        # ── Structural error inference ──────────────────────────────
+        # Some build errors are project-level (no file:line), but we can
+        # infer which file should be fixed based on error keywords + known files.
+        if known_files and not result.errors_by_file and result.unattributed_errors:
+            inferred = self._infer_structural_errors(result.unattributed_errors, known_files)
+            for fp, errors in inferred.items():
+                result.errors_by_file.setdefault(fp, []).extend(errors)
+            if inferred:
+                # Remove inferred messages from unattributed so they aren't double-counted
+                inferred_msgs = {e.message for errs in inferred.values() for e in errs}
+                result.unattributed_errors = [
+                    u for u in result.unattributed_errors
+                    if u not in inferred_msgs
+                ]
+
         # Deduplicate errors per file (same line+message)
         for path in result.errors_by_file:
             result.errors_by_file[path] = self._deduplicate(result.errors_by_file[path])
@@ -390,6 +405,91 @@ class CompilerErrorAttributor(BaseErrorAttributor):
             )
 
         return result
+
+    # ── Structural error rules ────────────────────────────────────────
+    # Each rule: (error_keyword, candidate_file_patterns, error_message_template)
+    # When an unattributed error contains the keyword and a known file matches
+    # one of the patterns, we attribute a synthetic error to that file.
+    _STRUCTURAL_RULES: list[tuple[str, list[str], str]] = [
+        # Spring Boot: "Unable to find main class"
+        (
+            "unable to find main class",
+            ["Application.java", "App.java", "Main.java"],
+            "Missing @SpringBootApplication main class. Add a class with: "
+            "public static void main(String[] args) { SpringApplication.run(YourApp.class, args); }",
+        ),
+        # Maven: "package X does not exist" (not file-attributed by javac)
+        (
+            "non-resolvable parent pom",
+            ["pom.xml"],
+            "Parent POM cannot be resolved. Check the <parent> section in pom.xml.",
+        ),
+        # npm: missing start script
+        (
+            "missing script: start",
+            ["package.json"],
+            "No 'start' script in package.json. Add a start script.",
+        ),
+        # npm: missing build script
+        (
+            "missing script: build",
+            ["package.json"],
+            "No 'build' script in package.json. Add a build script.",
+        ),
+        # Go: no Go files in directory
+        (
+            "no go files in",
+            ["main.go"],
+            "No Go source files found. Ensure main.go exists with package main.",
+        ),
+    ]
+
+    @classmethod
+    def _infer_structural_errors(
+        cls,
+        unattributed: list[str],
+        known_files: set[str],
+    ) -> dict[str, list[AttributedError]]:
+        """Try to attribute structural (project-level) errors to likely files.
+
+        Returns a dict of file_path → [AttributedError] for any inferred matches.
+        """
+        inferred: dict[str, list[AttributedError]] = {}
+        combined = "\n".join(unattributed).lower()
+
+        for keyword, candidate_patterns, fix_msg in cls._STRUCTURAL_RULES:
+            if keyword not in combined:
+                continue
+
+            # Find first known file matching one of the candidate patterns
+            target: str | None = None
+            for pattern in candidate_patterns:
+                matches = [f for f in known_files if f.endswith(pattern)]
+                if len(matches) == 1:
+                    target = matches[0]
+                    break
+                elif len(matches) > 1:
+                    # Multiple matches — pick the shortest path (most likely root)
+                    target = min(matches, key=len)
+                    break
+
+            if not target:
+                # No candidate file exists yet — pick the first candidate
+                # pattern and attribute to it so the fix agent creates it.
+                target = candidate_patterns[0]
+
+            error = AttributedError(
+                file_path=target,
+                line=None,
+                message=fix_msg,
+                severity="error",
+            )
+            inferred.setdefault(target, []).append(error)
+            logger.info(
+                "Structural error inferred: '%s' → %s", keyword, target,
+            )
+
+        return inferred
 
     @staticmethod
     def _normalize_path(raw_path: str) -> str:

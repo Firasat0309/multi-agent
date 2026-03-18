@@ -408,14 +408,33 @@ class ContextBuilder:
         return primary_files[:_MAX_REVIEW_FILES]
 
     def _rank_architecture_review_files(self) -> list[FileBlueprint]:
-        """Sample files proportionally across all architectural layers."""
+        """Sample files proportionally across all architectural layers.
+
+        For fullstack projects, restrict to the primary language group first
+        so the reviewer doesn't flag BE/FE language mismatches.
+        """
+        # ── Language filtering (same logic as module review) ──────────
+        source_files = self.blueprint.file_blueprints
+        by_lang: dict[str, list[FileBlueprint]] = {}
+        for fb in source_files:
+            lang = fb.language or "unknown"
+            if lang in ("tsx", "jsx"):
+                lang = "typescript"
+            by_lang.setdefault(lang, []).append(fb)
+
+        if len(by_lang) > 1:
+            # Fullstack: pick dominant language to avoid cross-language noise
+            primary_lang = max(by_lang, key=lambda k: len(by_lang[k]))
+            source_files = by_lang[primary_lang]
+
+        # ── Layer-proportional sampling ──────────────────────────────
         by_layer: dict[str, list[FileBlueprint]] = {}
-        for fb in self.blueprint.file_blueprints:
+        for fb in source_files:
             by_layer.setdefault(fb.layer or "other", []).append(fb)
 
         n_layers = len(by_layer)
         if n_layers == 0:
-            return self.blueprint.file_blueprints[:_MAX_REVIEW_FILES]
+            return source_files[:_MAX_REVIEW_FILES]
 
         per_layer = max(1, _MAX_REVIEW_FILES // n_layers)
         result: list[FileBlueprint] = []
@@ -428,7 +447,7 @@ class ContextBuilder:
 
         # Fill remaining budget from whichever layers had extras
         if len(result) < _MAX_REVIEW_FILES:
-            for fb in self.blueprint.file_blueprints:
+            for fb in source_files:
                 if len(result) >= _MAX_REVIEW_FILES:
                     break
                 if fb.path not in seen:

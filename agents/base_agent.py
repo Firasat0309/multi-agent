@@ -29,6 +29,7 @@ class BaseAgent(ABC):
     """Base class for all agents in the system."""
 
     role: AgentRole
+    max_iterations: int = 10
 
     def __init__(
         self,
@@ -132,7 +133,7 @@ class BaseAgent(ABC):
             {"role": "user", "content": self._build_prompt(context)}
         ]
         files_written: list[str] = []
-        max_iterations = 10
+        max_iterations = self.max_iterations
         _target = (context.file_blueprint.path if context.file_blueprint else None) or "task"
         _heartbeat_interval = 15  # seconds between "still waiting" log lines
         _max_tokens = self._estimate_max_tokens(context)
@@ -198,7 +199,7 @@ class BaseAgent(ABC):
                 target_file = context.file_blueprint.path if context.file_blueprint else None
                 if (
                     target_file
-                    and target_file not in files_written
+                    and not self._path_in_written(target_file, files_written)
                     and response.content
                     and iteration < max_iterations - 1
                 ):
@@ -304,13 +305,26 @@ class BaseAgent(ABC):
             # the model sees the warning and can rewrite with complete content.
             has_truncation = any("TRUNCATED CODE DETECTED" in r.get("content", "") for r in tool_results)
             target_file = context.file_blueprint.path if context.file_blueprint else None
-            if target_file and target_file in files_written and not has_truncation:
+            if target_file and self._path_in_written(target_file, files_written) and not has_truncation:
                 return self._parse_agentic_result(context, response.content, files_written)
 
         raise RuntimeError(
             f"{self.__class__.__name__} exceeded max_iterations ({max_iterations}) "
             "without completing the agentic loop"
         )
+
+    @staticmethod
+    def _normalize_path(p: str) -> str:
+        """Normalize a file path for comparison (strip './', collapse separators)."""
+        import posixpath
+        return posixpath.normpath(p)
+
+    @staticmethod
+    def _path_in_written(target: str, written: list[str]) -> bool:
+        """Check whether *target* appears in *written* using normalized comparison."""
+        import posixpath
+        norm_target = posixpath.normpath(target)
+        return any(posixpath.normpath(w) == norm_target for w in written)
 
     def _parse_agentic_result(
         self,

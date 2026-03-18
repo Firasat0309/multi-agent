@@ -290,12 +290,20 @@ class CoderAgent(BaseAgent):
                 f"these {profile.display_name} syntax rules:{lang_rules}"
             )
 
+        # ── Extract dependency method signatures for inline embedding ────
+        # LLMs (especially smaller ones) may skim Related Files and guess
+        # method names / return types.  Extracting the key signatures and
+        # placing them directly in the instruction block makes mismatches
+        # much less likely.
+        dep_signatures = self._extract_dep_signatures(context)
+
         return (
             f"{self._format_context(context)}\n\n"
             f"Generate the complete {profile.display_name} file for: {fb.path}\n"
             f"Purpose: {fb.purpose}\n"
             f"Layer: {fb.layer}\n"
             f"Must export: {', '.join(fb.exports) if fb.exports else 'appropriate classes/functions'}\n\n"
+            f"{dep_signatures}"
             f"INSTRUCTIONS:\n"
             f"1. Check the Related Files section below — dependency signatures are shown as "
             f"AST stubs with EXACT method names, parameter types, and return types\n"
@@ -321,6 +329,127 @@ class CoderAgent(BaseAgent):
             f"Call write_file with path='{fb.path}' and the complete code. "
             f"Do NOT output code as plain text — always use the write_file tool."
             f"{syntax_reminder}"
+        )
+
+    @staticmethod
+    def _extract_dep_signatures(context: AgentContext) -> str:
+        """Pull method signatures AND type definitions from dependency AST stubs.
+
+        Instead of relying on the LLM to find and read signatures buried deep
+        in Related Files, this extracts method/function lines AND class/type
+        definitions and places them prominently in the prompt.  This prevents
+        type-mismatch errors (e.g. User vs String) because the LLM can see
+        both the method return types AND the type structures.
+        """
+        if not context.related_files or not context.file_blueprint:
+            return ""
+
+        dep_paths = set(context.file_blueprint.depends_on)
+        if not dep_paths:
+            return ""
+
+        import re as _re
+
+        # Patterns that look like method/function signatures across languages
+        _SIG_PATTERNS = _re.compile(
+            r"^\s*(?:"
+            # Java/Kotlin/C#: public ReturnType methodName(...)
+            r"(?:public|protected|private|static|abstract|override|async|suspend|fun)\s+.*\(.*\)"
+            r"|"
+            # TypeScript/JS: export function/const name(...) / async function name(...)
+            r"(?:export\s+)?(?:async\s+)?(?:function|const|let)\s+\w+.*[\(=]"
+            r"|"
+            # Go: func (r *Receiver) MethodName(...)  or  func FuncName(...)
+            r"func\s+(?:\([^)]*\)\s+)?\w+\("
+            r"|"
+            # Python: def method_name(self, ...)
+            r"def\s+\w+\("
+            r"|"
+            # Rust: pub fn method_name(...)
+            r"pub(?:\s+async)?\s+fn\s+\w+\("
+            r"|"
+            # Interface/type members: methodName(params): ReturnType
+            r"\w+\(.*\)\s*:\s*\S+"
+            r")"
+        )
+
+        # Patterns for type/class/record/interface/enum definitions and fields
+        _TYPE_DEF_PATTERNS = _re.compile(
+            r"^\s*(?:"
+            # Java/C#: public class/interface/enum/record Name ...
+            r"(?:public|private|protected)?\s*(?:static\s+)?(?:abstract\s+)?(?:class|interface|enum|record)\s+\w+"
+            r"|"
+            # TypeScript: export interface/type/class/enum Name
+            r"(?:export\s+)?(?:interface|type|class|enum)\s+\w+"
+            r"|"
+            # Go: type Name struct/interface
+            r"type\s+\w+\s+(?:struct|interface)"
+            r"|"
+            # Python: class Name / @dataclass
+            r"class\s+\w+"
+            r"|"
+            # Rust: pub struct/enum/trait Name
+            r"(?:pub\s+)?(?:struct|enum|trait)\s+\w+"
+            r")"
+        )
+
+        # Field patterns — capture type info for model/DTO/entity classes
+        _FIELD_PATTERNS = _re.compile(
+            r"^\s*(?:"
+            # Java: private String name; / private Long id;
+            r"(?:private|protected|public)?\s*(?:static\s+)?(?:final\s+)?\w[\w<>,\s?]*\s+\w+\s*[;=]"
+            r"|"
+            # TypeScript: name: string; / readonly id: number;
+            r"(?:readonly\s+)?\w+\??\s*:\s*\S+"
+            r"|"
+            # Go struct field: Name string `json:\"name\"`
+            r"\w+\s+\S+\s*`"
+            r")"
+        )
+
+        sections: list[str] = []
+        for dep_path in dep_paths:
+            content = context.related_files.get(dep_path, "")
+            if not content:
+                continue
+            sigs: list[str] = []
+            types: list[str] = []
+            for line in content.splitlines():
+                stripped = line.strip()
+                if not stripped or stripped in ("{", "}", "};"):
+                    continue
+                if stripped.startswith("//") or stripped.startswith("#"):
+                    continue
+                if _TYPE_DEF_PATTERNS.match(stripped):
+                    typedef = stripped.rstrip("{").rstrip().strip()
+                    types.append(f"  {typedef}")
+                elif _SIG_PATTERNS.match(stripped):
+                    sig = stripped.rstrip("{").rstrip().rstrip(";").strip()
+                    sigs.append(f"    {sig}")
+                elif _FIELD_PATTERNS.match(stripped):
+                    field = stripped.rstrip(";").strip()
+                    types.append(f"    {field}")
+
+            parts: list[str] = []
+            if types or sigs:
+                parts.append(f"  {dep_path}:")
+            if types:
+                parts.extend(types)
+            if sigs:
+                if types:
+                    parts.append("    Methods:")
+                parts.extend(sigs)
+
+            if parts:
+                sections.append("\n".join(parts))
+
+        if not sections:
+            return ""
+
+        return (
+            "DEPENDENCY SIGNATURES (use these EXACT names, types, and return types):\n"
+            + "\n".join(sections)
+            + "\n\n"
         )
 
     def _parse_agentic_result(
@@ -571,6 +700,7 @@ class CoderAgent(BaseAgent):
 
         # ── Slim context: fix tasks don't need the full dependency tree ───────
         fix_context_header = self._format_fix_context(context)
+        dep_sigs = self._extract_dep_signatures(context)
 
         line_count = len(current_content.splitlines())
 
@@ -590,6 +720,7 @@ class CoderAgent(BaseAgent):
         # ── Small files or diff fallback: full-file rewrite ──────────────────
         prompt = (
             f"{fix_context_header}\n\n"
+            f"{dep_sigs}"
             f"FIX TASK for: {file_path}\n\n"
             f"Current content:\n```{profile.code_fence_name}\n{current_content}\n```\n\n"
             f"Issues to fix ({fix_trigger}):\n{issues_text}\n\n"
@@ -600,7 +731,13 @@ class CoderAgent(BaseAgent):
             "4. Do NOT add new functionality beyond what is needed to fix the issues\n"
             "5. Preserve all existing imports, fields, and logic that are not related to the fix\n"
             "6. Output the COMPLETE corrected file — every line, from first import to last closing brace\n"
-            "7. Output ONLY the code — no markdown fences, no explanations"
+            "7. Output ONLY the code — no markdown fences, no explanations\n\n"
+            "TYPE MISMATCH FIX GUIDE (for 'incompatible types' errors):\n"
+            "- Check DEPENDENCY SIGNATURES above to see the exact return type of the method\n"
+            "- If a method returns a model object (e.g. User), do NOT pass it where String is expected\n"
+            "- To extract a String from a model, call the appropriate getter (e.g. user.getUsername())\n"
+            "- If the error says 'X cannot be converted to Y', find the variable assignment and\n"
+            "  ensure the right-hand side type matches the left-hand side"
             f"{syntax_note}"
         )
 
@@ -646,10 +783,15 @@ class CoderAgent(BaseAgent):
 
         # Include dependency files so the fix agent can see actual method
         # signatures when fixing "cannot find symbol" or wrong-name errors.
+        # Build-triggered fixes get a larger budget because type-mismatch errors
+        # (e.g. User vs String) require seeing full type definitions.
+        fix_trigger = context.task.metadata.get("fix_trigger", "") if context.task else ""
+        is_build_fix = fix_trigger in ("build", "build_unattributed")
         if context.related_files:
             dep_sections: list[str] = []
             total_chars = 0
-            max_dep_chars = 4000  # budget for dependency context
+            max_dep_chars = 8000 if is_build_fix else 4000
+            per_dep_chars = 3000 if is_build_fix else 1500
 
             for dep_path, dep_content in context.related_files.items():
                 # Skip the target file itself — it's already in the prompt
@@ -658,7 +800,7 @@ class CoderAgent(BaseAgent):
                 if not dep_content:
                     continue
                 # Truncate each dependency to keep within budget
-                chunk = dep_content[:1500]
+                chunk = dep_content[:per_dep_chars]
                 dep_sections.append(f"--- {dep_path} ---\n{chunk}")
                 total_chars += len(chunk)
                 if total_chars >= max_dep_chars:

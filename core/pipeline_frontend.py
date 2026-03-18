@@ -1142,6 +1142,12 @@ class FrontendPipeline:
                 matches = ts_files.get(lower_first, [])
                 if matches:
                     return matches
+            # Add 'use' prefix: authStore → useAuthStore
+            if not name.startswith("use"):
+                use_name = "use" + name[0].upper() + name[1:]
+                matches = ts_files.get(use_name, [])
+                if matches:
+                    return matches
             # Case-insensitive fallback
             matches = ts_files_lower.get(name.lower(), [])
             if matches:
@@ -1230,7 +1236,7 @@ class FrontendPipeline:
 
                 # Import is broken — try to find the target file by basename
                 target_name = posixpath.basename(imp)
-                matches = ts_files.get(target_name, [])
+                matches = _find_target(target_name)
                 if len(matches) == 1:
                     # Compute correct relative path
                     target_rel = matches[0]

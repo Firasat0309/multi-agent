@@ -68,6 +68,7 @@ class ComponentGeneratorAgent(BaseAgent):
     """
 
     role = AgentRole.COMPONENT_GENERATOR
+    max_iterations: int = 20
 
     @property
     def tools(self) -> list[ToolDefinition]:
@@ -109,12 +110,24 @@ class ComponentGeneratorAgent(BaseAgent):
             "IMPORT RULES:\n"
             "- Use RELATIVE imports (e.g. '../ui/Button') for importing from other components\n"
             "  within the same src/ tree. Do NOT use @/ path aliases.\n"
-            "- For store imports: FIRST use list_files with directory='src/store' to see\n"
-            "  which store files actually exist, then import from the EXACT file name found.\n"
-            "  If no store files exist yet, use the naming pattern from state_needs\n"
-            "  (e.g. state_needs=['auth'] → '../../store/authStore').\n"
             "- For API client imports, use relative paths (e.g. '../../lib/api').\n"
-            "- This ensures all imports resolve correctly without tsconfig path aliases."
+            "- This ensures all imports resolve correctly without tsconfig path aliases.\n\n"
+
+            "STORE / LIB FILE IMPORTS — MANDATORY STEPS (DO NOT SKIP):\n"
+            "If the component has state_needs or api_calls, you MUST do the following\n"
+            "BEFORE calling write_file:\n"
+            "1. Call list_files on the relevant directories (e.g. 'src/store', 'src/lib',\n"
+            "   'src/hooks') to discover the EXACT file names that exist on disk.\n"
+            "2. Call read_file on each discovered store/hook/lib file to see its ACTUAL\n"
+            "   exported types, functions, and properties.\n"
+            "3. In your generated code, import ONLY the exact module path found in step 1\n"
+            "   (e.g. if the file is 'useAuthStore.ts', import from '../../store/useAuthStore'\n"
+            "    — NOT '../../store/authStore').\n"
+            "4. Use ONLY the property/method names that actually exist in the file's exports\n"
+            "   as found in step 2.  NEVER invent or guess property names like 'checkAuth'\n"
+            "   or 'isLoggedIn' — if the store exports 'isAuthenticated', use that exact name.\n"
+            "5. If no store files exist yet, create a minimal inline implementation or skip\n"
+            "   the store import entirely — do NOT guess file names."
         )
 
     def _build_prompt(self, context: AgentContext) -> str:
@@ -193,9 +206,44 @@ class ComponentGeneratorAgent(BaseAgent):
                 "   export CardHeader/CardTitle/CardContent unless you verify it does)\n\n"
             )
 
+        # Force store/lib discovery when the component uses shared state or APIs
+        store_discovery = ""
+        if component and (component.state_needs or component.api_calls):
+            # Check if store/lib files were pre-loaded into related_files
+            preloaded = [
+                p for p in (context.related_files or {})
+                if any(seg in p for seg in ("store", "lib", "hooks"))
+            ]
+            if preloaded:
+                store_discovery = (
+                    "\n⚠️  IMPORTANT — The following store/lib/hook files have been pre-loaded\n"
+                    "into the Related Files section below. You MUST:\n"
+                    "1. Check the EXACT file names and export names from these files.\n"
+                    "2. Use the EXACT file name in your import path (e.g. if the file is\n"
+                    "   'src/store/useAuthStore.ts', import from '../../store/useAuthStore').\n"
+                    "3. Use ONLY properties/methods that actually exist in the exports.\n"
+                    "   NEVER invent property names.\n"
+                    f"Pre-loaded files: {', '.join(preloaded)}\n\n"
+                )
+            else:
+                dirs_to_scan = []
+                if component.state_needs:
+                    dirs_to_scan.append("src/store")
+                if component.api_calls:
+                    dirs_to_scan.extend(["src/lib", "src/hooks"])
+                store_discovery = (
+                    "\n⚠️  MANDATORY — Do these steps FIRST, before writing any code:\n"
+                    f"1. Call list_files for each directory: {', '.join(dirs_to_scan)}\n"
+                    "2. Call read_file on every store/hook/lib file found to learn the\n"
+                    "   exact export names and types.\n"
+                    "3. Use ONLY the real file names and export names in your imports.\n"
+                    "   Do NOT guess — if a store file is named useAuthStore.ts, import\n"
+                    "   from '../../store/useAuthStore', not '../../store/authStore'.\n\n"
+                )
+
         return (
             f"{req_text}{comp_text}\n{plan_text}\n{design_text}\n{contract_text}\n"
-            f"{dep_instructions}"
+            f"{store_discovery}{dep_instructions}"
             "If a Figma Node ID is provided, use your tools to fetch the structural code skeleton FIRST. "
             "Hydrate the skeleton with the described API and state handlers, then generate "
             "the complete component source code and write it to disk using write_file."
@@ -224,6 +272,10 @@ class ComponentGeneratorAgent(BaseAgent):
                 dependency_info=context.dependency_info,
             )
 
+        # Pre-read store/lib/hook files so the LLM has real exports in the
+        # prompt, preventing it from guessing wrong file names or properties.
+        context = await self._inject_store_context(context, component)
+
         try:
             result = await self.execute_agentic(context)
             if result.success:
@@ -232,3 +284,59 @@ class ComponentGeneratorAgent(BaseAgent):
         except Exception as exc:
             logger.exception("ComponentGeneratorAgent.execute failed for %s", component.name)
             return TaskResult(success=False, errors=[str(exc)])
+
+    async def _inject_store_context(
+        self, context: AgentContext, component: UIComponent
+    ) -> AgentContext:
+        """Pre-read store/lib/hook files into ``related_files`` so the LLM
+        can see actual exports without needing extra tool-call iterations."""
+        dirs_to_scan: list[str] = []
+        if component.state_needs:
+            dirs_to_scan.append("store")
+        if component.api_calls:
+            dirs_to_scan.extend(["lib", "hooks"])
+        if not dirs_to_scan:
+            return context
+
+        from pathlib import Path as _Path
+
+        extra_files: dict[str, str] = {}
+        workspace = self.repo.workspace.resolve()
+
+        for sub in dirs_to_scan:
+            # Try common frontend source layouts: src/<sub> and <sub>
+            for prefix in ("src", ""):
+                scan_dir = workspace / prefix / sub if prefix else workspace / sub
+                if not scan_dir.is_dir():
+                    continue
+                for ext in (".ts", ".tsx", ".js", ".jsx"):
+                    for fpath in scan_dir.rglob(f"*{ext}"):
+                        if not fpath.is_file():
+                            continue
+                        rel = str(fpath.relative_to(workspace)).replace("\\", "/")
+                        if rel in extra_files:
+                            continue
+                        try:
+                            content = await self.repo.async_read_file(rel)
+                            if content is not None:
+                                extra_files[rel] = content
+                        except Exception:
+                            pass  # non-critical — LLM still has tool fallback
+
+        if not extra_files:
+            return context
+
+        merged = dict(context.related_files) if context.related_files else {}
+        merged.update(extra_files)
+        logger.info(
+            "ComponentGeneratorAgent: pre-loaded %d store/lib/hook file(s) for %s",
+            len(extra_files), component.name,
+        )
+        return AgentContext(
+            task=context.task,
+            blueprint=context.blueprint,
+            file_blueprint=context.file_blueprint,
+            related_files=merged,
+            architecture_summary=context.architecture_summary,
+            dependency_info=context.dependency_info,
+        )
