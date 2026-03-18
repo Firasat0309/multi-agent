@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -86,6 +87,33 @@ class ProductPlannerAgent(BaseAgent):
         raw = await self._call_llm_json(
             f"User request:\n{user_prompt}\n\n"
             "Produce the product requirements JSON document now."
+        )
+        self._metrics["llm_calls"] += 1
+        return self._parse_requirements(raw)
+
+    async def revise_product(
+        self,
+        user_prompt: str,
+        current: ProductRequirements,
+        feedback: str,
+    ) -> ProductRequirements:
+        """Revise an existing product plan based on user feedback."""
+        logger.info("ProductPlannerAgent: revising product plan with user feedback")
+        current_json = json.dumps({
+            "title": current.title,
+            "description": current.description,
+            "user_stories": current.user_stories,
+            "features": current.features,
+            "tech_preferences": current.tech_preferences,
+            "has_frontend": current.has_frontend,
+            "has_backend": current.has_backend,
+        }, indent=2)
+        raw = await self._call_llm_json(
+            f"Original user request:\n{user_prompt}\n\n"
+            f"Current product plan:\n{current_json}\n\n"
+            f"User feedback — apply these changes:\n{feedback}\n\n"
+            "Produce the REVISED product requirements JSON document now. "
+            "Keep everything the user did not mention, only change what they asked for."
         )
         self._metrics["llm_calls"] += 1
         return self._parse_requirements(raw)

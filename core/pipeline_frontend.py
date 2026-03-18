@@ -176,25 +176,47 @@ class FrontendPipeline:
                 workspace=workspace,
                 live=self._live,
             )
-            try:
-                approved = approver.approve_frontend_architecture(component_plan)
-            except ArchitecturePendingApprovalError as e:
-                logger.info("Frontend architecture pending human approval: %s", e)
-                return PipelineResult(
-                    success=False,
-                    workspace_path=workspace,
-                    errors=[str(e)],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
-            if not approved:
-                logger.info("Frontend architecture rejected by user")
-                return PipelineResult(
-                    success=False,
-                    workspace_path=workspace,
-                    errors=["Frontend architecture rejected by user"],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
-            logger.info("Frontend architecture approved by user")
+            while True:
+                try:
+                    result = approver.approve_frontend_architecture(component_plan)
+                except ArchitecturePendingApprovalError as e:
+                    logger.info("Frontend architecture pending human approval: %s", e)
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=workspace,
+                        errors=[str(e)],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+                if result is True:
+                    logger.info("Frontend architecture approved by user")
+                    break
+                if result is False:
+                    logger.info("Frontend architecture rejected by user")
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=workspace,
+                        errors=["Frontend architecture rejected by user"],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+                # result is a str — user feedback for revision
+                logger.info("User requested frontend architecture revision: %s", result)
+                try:
+                    component_plan = await planner.revise_components(
+                        component_plan, result,
+                    )
+                    logger.info(
+                        "ComponentPlan revised: %d components",
+                        len(component_plan.components),
+                    )
+                except Exception as exc:
+                    logger.exception("Frontend architecture revision failed")
+                    errors.append(f"Frontend architecture revision failed: {exc}")
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=workspace,
+                        errors=errors,
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
 
         # Initialize RepositoryManager with a synthetic frontend blueprint
         frontend_blueprint = self._make_frontend_blueprint(requirements, component_plan)

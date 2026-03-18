@@ -28,7 +28,8 @@ class LiveConsole:
         self._max_log_lines = 12
 
     def start(self) -> None:
-        self._start_time = time.monotonic()
+        if not self._start_time:
+            self._start_time = time.monotonic()
         self._live = Live(self._render(), console=console, refresh_per_second=4)
         self._live.start()
 

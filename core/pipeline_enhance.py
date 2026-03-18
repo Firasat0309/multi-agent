@@ -193,26 +193,50 @@ class EnhancePipeline:
                 workspace=self._settings.workspace_dir,
                 live=self._live,
             )
-            try:
-                approved = approver.display_and_approve(change_plan)
-            except PlanPendingApprovalError as e:
-                logger.info("Plan pending human approval: %s", e)
-                return PipelineResult(
-                    success=False,
-                    workspace_path=self._settings.workspace_dir,
-                    repo_analysis=repo_analysis,
-                    errors=[str(e)],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
-            if not approved:
-                logger.info("Change plan rejected by user")
-                return PipelineResult(
-                    success=False,
-                    workspace_path=self._settings.workspace_dir,
-                    repo_analysis=repo_analysis,
-                    errors=["Change plan rejected by user"],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
+            while True:
+                try:
+                    result = approver.display_and_approve(change_plan)
+                except PlanPendingApprovalError as e:
+                    logger.info("Plan pending human approval: %s", e)
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=self._settings.workspace_dir,
+                        repo_analysis=repo_analysis,
+                        errors=[str(e)],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+                if result is True:
+                    logger.info("Change plan approved by user")
+                    break
+                if result is False:
+                    logger.info("Change plan rejected by user")
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=self._settings.workspace_dir,
+                        repo_analysis=repo_analysis,
+                        errors=["Change plan rejected by user"],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+                # result is a str — user feedback for revision
+                logger.info("User requested change plan revision: %s", result)
+                try:
+                    change_plan = await planner.revise_changes(
+                        user_prompt, repo_analysis, change_plan, result,
+                    )
+                    logger.info(
+                        "Change plan revised: %s | %d modifications, %d new files",
+                        change_plan.summary, len(change_plan.changes),
+                        len(change_plan.new_files),
+                    )
+                except Exception as exc:
+                    logger.exception("Change plan revision failed")
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=self._settings.workspace_dir,
+                        repo_analysis=repo_analysis,
+                        errors=[f"Change plan revision failed: {exc}"],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
 
         # ── Reconcile new_files against workspace ────────────────────────────
         # The LLM sometimes mis-classifies existing files as new (e.g. pom.xml,

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 from core.models import ChangePlan
 
@@ -27,7 +27,7 @@ class PlanApprover:
     """Presents the change plan to the user and waits for approval.
 
     Two modes:
-    - interactive=True  : Rich console table + y/n prompt (CLI usage).
+    - interactive=True  : Rich console table + y/n/e prompt (CLI usage).
     - interactive=False : Writes plan to ``pending_plan.json`` and raises
                           ``PlanPendingApprovalError`` (API / programmatic usage).
 
@@ -47,8 +47,8 @@ class PlanApprover:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def display_and_approve(self, plan: ChangePlan) -> bool:
-        """Display *plan* and return True if approved, False if rejected.
+    def display_and_approve(self, plan: ChangePlan) -> bool | str:
+        """Display *plan* and return True/False/feedback-str.
 
         Raises:
             PlanPendingApprovalError: when interactive=False.
@@ -70,19 +70,37 @@ class PlanApprover:
 
     # ── Interactive (CLI) path ────────────────────────────────────────────────
 
-    def _interactive_approve(self, plan: ChangePlan) -> bool:
+    def _interactive_approve(self, plan: ChangePlan) -> bool | str:
         try:
             from rich.console import Console
             from rich.panel import Panel
             from rich.table import Table
-            from rich.prompt import Confirm
 
             console = Console()
             self._display_plan_rich(plan, console, Table, Panel)
-            return Confirm.ask("\n[bold]Proceed with these changes?[/bold]", default=True)
+            return self._ask_approve_edit(console, "Proceed with these changes?")
         except ImportError:
             # Rich not installed — fall back to plain text
             return self._display_plan_plain(plan)
+
+    @staticmethod
+    def _ask_approve_edit(console, question: str) -> bool | str:
+        console.print(
+            f"\n[bold]{question}[/bold] "
+            "[dim]\\[y] approve / [n] reject / [e] edit[/dim] ",
+            end="",
+        )
+        answer = input("").strip().lower()
+        if answer in ("", "y", "yes"):
+            return True
+        if answer in ("e", "edit"):
+            console.print(
+                "[bold yellow]Enter your changes "
+                "(what should be different):[/bold yellow]"
+            )
+            feedback = input("> ").strip()
+            return feedback if feedback else True
+        return False
 
     def _display_plan_rich(
         self,
@@ -130,7 +148,7 @@ class PlanApprover:
                 )
             )
 
-    def _display_plan_plain(self, plan: ChangePlan) -> bool:
+    def _display_plan_plain(self, plan: ChangePlan) -> bool | str:
         """Fallback plain-text display when Rich is unavailable."""
         print(f"\n=== Change Plan: {plan.summary} ===\n")
 
@@ -149,12 +167,17 @@ class PlanApprover:
             for r in plan.risk_notes:
                 print(f"  ⚠  {r}")
 
-        answer = input("\nProceed with these changes? [Y/n] ").strip().lower()
-        return answer in ("", "y", "yes")
+        answer = input("\nProceed with these changes? [Y/n/e] ").strip().lower()
+        if answer in ("", "y", "yes"):
+            return True
+        if answer in ("e", "edit"):
+            feedback = input("Enter your changes: ").strip()
+            return feedback if feedback else True
+        return False
 
     # ── Non-interactive (API) path ────────────────────────────────────────────
 
-    def _noninteractive_approve(self, plan: ChangePlan) -> bool:
+    def _noninteractive_approve(self, plan: ChangePlan) -> NoReturn:
         """Write plan to disk and raise PlanPendingApprovalError."""
         payload = {
             "summary": plan.summary,

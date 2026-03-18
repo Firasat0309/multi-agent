@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -130,6 +131,37 @@ class ComponentPlannerAgent(BaseAgent):
         raw = await self._call_llm_json(
             f"{req_text}{spec_text}{api_text}\n"
             "Produce the complete ComponentPlan JSON object now."
+        )
+        self._metrics["llm_calls"] += 1
+        return self._parse_plan(raw)
+
+    async def revise_components(
+        self,
+        current: ComponentPlan,
+        feedback: str,
+    ) -> ComponentPlan:
+        """Revise a component plan based on user feedback."""
+        logger.info("ComponentPlannerAgent: revising component plan with user feedback")
+        current_json = json.dumps({
+            "framework": current.framework,
+            "state_solution": current.state_solution,
+            "routing_solution": current.routing_solution,
+            "api_base_url": current.api_base_url,
+            "components": [
+                {
+                    "name": c.name,
+                    "component_type": c.component_type,
+                    "file_path": c.file_path,
+                    "description": c.description,
+                }
+                for c in current.components
+            ],
+        }, indent=2)
+        raw = await self._call_llm_json(
+            f"Current component plan:\n{current_json}\n\n"
+            f"User feedback — apply these changes:\n{feedback}\n\n"
+            "Produce the REVISED ComponentPlan JSON object now. "
+            "Keep everything the user did not mention, only change what they asked for."
         )
         self._metrics["llm_calls"] += 1
         return self._parse_plan(raw)

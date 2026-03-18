@@ -179,6 +179,45 @@ class ChangePlannerAgent(BaseAgent):
             )
         return self._parse_change_plan(data)
 
+    async def revise_changes(
+        self,
+        user_request: str,
+        repo_analysis: RepoAnalysis,
+        current: ChangePlan,
+        feedback: str,
+    ) -> ChangePlan:
+        """Revise a change plan based on user feedback."""
+        logger.info("Revising change plan with user feedback: %s", feedback[:100])
+        current_json = json.dumps({
+            "summary": current.summary,
+            "changes": [
+                {"type": c.type.value, "file": c.file, "description": c.description}
+                for c in current.changes
+            ],
+            "new_files": [
+                {"path": nf.path, "purpose": nf.purpose}
+                for nf in current.new_files
+            ],
+            "risk_notes": current.risk_notes,
+        }, indent=2)
+        repo_context = self._build_repo_context(repo_analysis, user_request)
+
+        prompt = (
+            f"The user wants to modify an existing codebase.\n\n"
+            f"User request:\n{user_request}\n\n"
+            f"Repository analysis:\n{repo_context}\n\n"
+            f"Current change plan:\n{current_json}\n\n"
+            f"User feedback — apply these changes to the plan:\n{feedback}\n\n"
+            f"Produce the REVISED change plan. "
+            f"Keep everything the user did not mention, only change what they asked for."
+        )
+
+        raw = await self._call_llm(prompt)
+        data = self._parse_json(raw)
+        if not data:
+            logger.error("ChangePlannerAgent revision produced empty plan")
+        return self._parse_change_plan(data)
+
     def _build_repo_context(
         self,
         analysis: RepoAnalysis,

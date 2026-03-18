@@ -130,25 +130,45 @@ class FullstackPipeline:
                 workspace=root_workspace,
                 live=self._live,
             )
-            try:
-                approved = approver.approve_product_plan(requirements)
-            except ArchitecturePendingApprovalError as e:
-                logger.info("Product plan pending human approval: %s", e)
-                return PipelineResult(
-                    success=False,
-                    workspace_path=root_workspace,
-                    errors=[str(e)],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
-            if not approved:
-                logger.info("Product plan rejected by user")
-                return PipelineResult(
-                    success=False,
-                    workspace_path=root_workspace,
-                    errors=["Product plan rejected by user"],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
-            logger.info("Product plan approved by user")
+            while True:
+                try:
+                    result = approver.approve_product_plan(requirements)
+                except ArchitecturePendingApprovalError as e:
+                    logger.info("Product plan pending human approval: %s", e)
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=root_workspace,
+                        errors=[str(e)],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+                if result is True:
+                    logger.info("Product plan approved by user")
+                    break
+                if result is False:
+                    logger.info("Product plan rejected by user")
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=root_workspace,
+                        errors=["Product plan rejected by user"],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+                # result is a str — user feedback for revision
+                logger.info("User requested product plan revision: %s", result)
+                try:
+                    requirements = await planner.revise_product(
+                        user_prompt, requirements, result,
+                    )
+                    fullstack_blueprint.product_requirements = requirements
+                    logger.info("Product plan revised: %s", requirements.title)
+                except Exception as exc:
+                    logger.exception("Product plan revision failed")
+                    errors.append(f"Product plan revision failed: {exc}")
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=root_workspace,
+                        errors=errors,
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
 
         # ── Phase 2: Backend Architecture Design ──────────────────────────────
         self._phase("Backend Architecture", "running")
@@ -190,25 +210,48 @@ class FullstackPipeline:
                 workspace=root_workspace,
                 live=self._live,
             )
-            try:
-                approved = approver.approve_backend_architecture(backend_blueprint)
-            except ArchitecturePendingApprovalError as e:
-                logger.info("Backend architecture pending human approval: %s", e)
-                return PipelineResult(
-                    success=False,
-                    workspace_path=root_workspace,
-                    errors=[str(e)],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
-            if not approved:
-                logger.info("Backend architecture rejected by user")
-                return PipelineResult(
-                    success=False,
-                    workspace_path=root_workspace,
-                    errors=["Backend architecture rejected by user"],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
-            logger.info("Backend architecture approved by user")
+            while True:
+                try:
+                    result = approver.approve_backend_architecture(backend_blueprint)
+                except ArchitecturePendingApprovalError as e:
+                    logger.info("Backend architecture pending human approval: %s", e)
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=root_workspace,
+                        errors=[str(e)],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+                if result is True:
+                    logger.info("Backend architecture approved by user")
+                    break
+                if result is False:
+                    logger.info("Backend architecture rejected by user")
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=root_workspace,
+                        errors=["Backend architecture rejected by user"],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+                # result is a str — user feedback for revision
+                logger.info("User requested architecture revision: %s", result)
+                try:
+                    backend_blueprint = await architect.revise_architecture(
+                        enriched_prompt, backend_blueprint, result,
+                    )
+                    fullstack_blueprint.backend_blueprint = backend_blueprint
+                    logger.info(
+                        "Backend blueprint revised: %s (%d files)",
+                        backend_blueprint.name, len(backend_blueprint.file_blueprints),
+                    )
+                except Exception as exc:
+                    logger.exception("Backend architecture revision failed")
+                    errors.append(f"Backend architecture revision failed: {exc}")
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=root_workspace,
+                        errors=errors,
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
 
         # ── Phase 3: API Contract Generation ─────────────────────────────────
         self._phase("API Contract Generation", "running")

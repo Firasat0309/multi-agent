@@ -5,6 +5,11 @@ Provides approval checkpoints at three stages of the fullstack pipeline:
 2. Backend architecture (tech stack, file blueprints, layers)
 3. Frontend architecture (components, framework, state solution)
 
+Each gate returns one of:
+- ``True``  — approved, continue
+- ``False`` — rejected, abort
+- ``str``   — user feedback for the LLM to revise the plan
+
 This prevents wasting tokens on generation when the plan is wrong.
 """
 
@@ -13,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 if TYPE_CHECKING:
     from core.live_console import LiveConsole
@@ -38,7 +43,7 @@ class ArchitectureApprover:
     """Displays architecture plans and waits for human approval.
 
     Two modes:
-    - interactive=True  : Rich console display + y/n prompt (CLI usage).
+    - interactive=True  : Rich console display + y/n/e prompt (CLI usage).
     - interactive=False : Writes plan to JSON and raises
                           ``ArchitecturePendingApprovalError``.
 
@@ -58,18 +63,16 @@ class ArchitectureApprover:
 
     # ── Product Requirements Approval ──────────────────────────────────────
 
-    def approve_product_plan(self, requirements: ProductRequirements) -> bool:
-        """Display product requirements and return True if approved."""
+    def approve_product_plan(self, requirements: ProductRequirements) -> bool | str:
+        """Display product requirements and return True/False/feedback-str."""
         if self._interactive:
             return self._with_live_paused(self._interactive_product, requirements)
         return self._noninteractive_product(requirements)
 
-    def _interactive_product(self, req: ProductRequirements) -> bool:
+    def _interactive_product(self, req: ProductRequirements) -> bool | str:
         try:
             from rich.console import Console
-            from rich.panel import Panel
             from rich.table import Table
-            from rich.prompt import Confirm
 
             console = Console()
             console.print("\n[bold cyan]═══ Product Plan ═══[/bold cyan]\n")
@@ -99,13 +102,11 @@ class ArchitectureApprover:
                 if len(req.user_stories) > 5:
                     console.print(f"  … and {len(req.user_stories) - 5} more")
 
-            return Confirm.ask(
-                "\n[bold]Approve this product plan?[/bold]", default=True
-            )
+            return _ask_approve_edit(console, "Approve this product plan?")
         except ImportError:
             return self._plain_product(req)
 
-    def _plain_product(self, req: ProductRequirements) -> bool:
+    def _plain_product(self, req: ProductRequirements) -> bool | str:
         print(f"\n=== Product Plan ===")
         print(f"Title: {req.title}")
         print(f"Description: {req.description}")
@@ -119,10 +120,9 @@ class ArchitectureApprover:
             print("Tech preferences:")
             for k, v in req.tech_preferences.items():
                 print(f"  {k}: {v}")
-        answer = input("\nApprove this product plan? [Y/n] ").strip().lower()
-        return answer in ("", "y", "yes")
+        return _ask_approve_edit_plain("Approve this product plan?")
 
-    def _noninteractive_product(self, req: ProductRequirements) -> bool:
+    def _noninteractive_product(self, req: ProductRequirements) -> NoReturn:
         payload = {
             "checkpoint": "product_plan",
             "title": req.title,
@@ -141,18 +141,16 @@ class ArchitectureApprover:
 
     # ── Backend Architecture Approval ──────────────────────────────────────
 
-    def approve_backend_architecture(self, blueprint: RepositoryBlueprint) -> bool:
-        """Display backend architecture and return True if approved."""
+    def approve_backend_architecture(self, blueprint: RepositoryBlueprint) -> bool | str:
+        """Display backend architecture and return True/False/feedback-str."""
         if self._interactive:
             return self._with_live_paused(self._interactive_backend, blueprint)
         return self._noninteractive_backend(blueprint)
 
-    def _interactive_backend(self, bp: RepositoryBlueprint) -> bool:
+    def _interactive_backend(self, bp: RepositoryBlueprint) -> bool | str:
         try:
             from rich.console import Console
-            from rich.panel import Panel
             from rich.table import Table
-            from rich.prompt import Confirm
 
             console = Console()
             console.print("\n[bold cyan]═══ Backend Architecture ═══[/bold cyan]\n")
@@ -179,13 +177,11 @@ class ArchitectureApprover:
                 console.print()
                 console.print(ft)
 
-            return Confirm.ask(
-                "\n[bold]Approve this backend architecture?[/bold]", default=True
-            )
+            return _ask_approve_edit(console, "Approve this backend architecture?")
         except ImportError:
             return self._plain_backend(bp)
 
-    def _plain_backend(self, bp: RepositoryBlueprint) -> bool:
+    def _plain_backend(self, bp: RepositoryBlueprint) -> bool | str:
         print(f"\n=== Backend Architecture ===")
         print(f"Project: {bp.name}")
         print(f"Description: {bp.description}")
@@ -198,10 +194,9 @@ class ArchitectureApprover:
             print(f"\nFiles ({len(bp.file_blueprints)}):")
             for fb in bp.file_blueprints:
                 print(f"  [{fb.layer or '-'}] {fb.path}: {fb.purpose}")
-        answer = input("\nApprove this backend architecture? [Y/n] ").strip().lower()
-        return answer in ("", "y", "yes")
+        return _ask_approve_edit_plain("Approve this backend architecture?")
 
-    def _noninteractive_backend(self, bp: RepositoryBlueprint) -> bool:
+    def _noninteractive_backend(self, bp: RepositoryBlueprint) -> NoReturn:
         payload = {
             "checkpoint": "backend_architecture",
             "name": bp.name,
@@ -221,17 +216,16 @@ class ArchitectureApprover:
 
     # ── Frontend Architecture Approval ─────────────────────────────────────
 
-    def approve_frontend_architecture(self, plan: ComponentPlan) -> bool:
-        """Display frontend component plan and return True if approved."""
+    def approve_frontend_architecture(self, plan: ComponentPlan) -> bool | str:
+        """Display frontend component plan and return True/False/feedback-str."""
         if self._interactive:
             return self._with_live_paused(self._interactive_frontend, plan)
         return self._noninteractive_frontend(plan)
 
-    def _interactive_frontend(self, plan: ComponentPlan) -> bool:
+    def _interactive_frontend(self, plan: ComponentPlan) -> bool | str:
         try:
             from rich.console import Console
             from rich.table import Table
-            from rich.prompt import Confirm
 
             console = Console()
             console.print("\n[bold cyan]═══ Frontend Architecture ═══[/bold cyan]\n")
@@ -259,13 +253,11 @@ class ArchitectureApprover:
                 console.print()
                 console.print(ct)
 
-            return Confirm.ask(
-                "\n[bold]Approve this frontend architecture?[/bold]", default=True
-            )
+            return _ask_approve_edit(console, "Approve this frontend architecture?")
         except ImportError:
             return self._plain_frontend(plan)
 
-    def _plain_frontend(self, plan: ComponentPlan) -> bool:
+    def _plain_frontend(self, plan: ComponentPlan) -> bool | str:
         print(f"\n=== Frontend Architecture ===")
         print(f"Framework: {plan.framework}")
         print(f"State: {plan.state_solution}")
@@ -275,10 +267,9 @@ class ArchitectureApprover:
             print(f"\nComponents ({len(plan.components)}):")
             for c in plan.components:
                 print(f"  [{c.component_type or '-'}] {c.name}: {(c.description or '')[:60]}")
-        answer = input("\nApprove this frontend architecture? [Y/n] ").strip().lower()
-        return answer in ("", "y", "yes")
+        return _ask_approve_edit_plain("Approve this frontend architecture?")
 
-    def _noninteractive_frontend(self, plan: ComponentPlan) -> bool:
+    def _noninteractive_frontend(self, plan: ComponentPlan) -> NoReturn:
         payload = {
             "checkpoint": "frontend_architecture",
             "framework": plan.framework,
@@ -320,3 +311,43 @@ class ArchitectureApprover:
                 json.dumps(payload, indent=2), encoding="utf-8"
             )
             logger.info("Pending plan written to %s", pending_path)
+
+
+# ── Shared prompt helpers ──────────────────────────────────────────────────
+
+
+def _ask_approve_edit(console, question: str) -> bool | str:
+    """Rich-based prompt: [y]es / [n]o / [e]dit.
+
+    Returns True (approved), False (rejected), or str (user feedback).
+    """
+    console.print(
+        f"\n[bold]{question}[/bold] "
+        "[dim]\\[y] approve / [n] reject / [e] edit[/dim] ",
+        end="",
+    )
+    answer = input("").strip().lower()
+    if answer in ("", "y", "yes"):
+        return True
+    if answer in ("e", "edit"):
+        console.print(
+            "[bold yellow]Enter your changes "
+            "(what should be different):[/bold yellow]"
+        )
+        feedback = input("> ").strip()
+        return feedback if feedback else True  # empty feedback = approve
+    return False
+
+
+def _ask_approve_edit_plain(question: str) -> bool | str:
+    """Plain-text prompt: [y]es / [n]o / [e]dit.
+
+    Returns True (approved), False (rejected), or str (user feedback).
+    """
+    answer = input(f"\n{question} [Y/n/e] ").strip().lower()
+    if answer in ("", "y", "yes"):
+        return True
+    if answer in ("e", "edit"):
+        feedback = input("Enter your changes: ").strip()
+        return feedback if feedback else True
+    return False

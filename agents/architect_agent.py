@@ -222,6 +222,55 @@ class ArchitectAgent(BaseAgent):
 
         return blueprint
 
+    async def revise_architecture(
+        self,
+        user_prompt: str,
+        current: RepositoryBlueprint,
+        feedback: str,
+    ) -> RepositoryBlueprint:
+        """Revise an existing architecture blueprint based on user feedback."""
+        logger.info("Revising architecture with user feedback")
+        file_list = "\n".join(
+            f"  - {fb.path} [{fb.layer}]: {fb.purpose}"
+            for fb in current.file_blueprints
+        )
+        revision_prompt = (
+            f"Original requirements:\n{user_prompt}\n\n"
+            f"Current architecture:\n"
+            f"  Name: {current.name}\n"
+            f"  Style: {current.architecture_style}\n"
+            f"  Tech stack: {json.dumps(current.tech_stack)}\n"
+            f"  Files:\n{file_list}\n\n"
+            f"User feedback — apply these changes:\n{feedback}\n\n"
+            "Produce the REVISED architecture JSON now. "
+            "Keep everything the user did not mention, only change what they asked for."
+        )
+
+        effective_prompt = revision_prompt
+        if not self._user_specified_db(user_prompt) and not self._user_specified_db(feedback):
+            effective_prompt += (
+                "\n\n[SYSTEM NOTE: The user did not specify a database. "
+                "Use H2 in-memory database (db: 'h2').]"
+            )
+
+        response = await self._llm_with_heartbeat(
+            system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
+            user_prompt=effective_prompt,
+            max_tokens=12288,
+            label="architecture revision",
+        )
+        self._metrics["llm_calls"] += 1
+        self._metrics["tokens_used"] += sum(response.usage.values())
+
+        try:
+            result = self._parse_json_response(response.content)
+        except ValueError as parse_err:
+            result = await self._retry_json_parse(response.content, parse_err)
+
+        blueprint = self._parse_blueprint(result)
+        blueprint = await self._fetch_architecture_doc(blueprint, effective_prompt)
+        return blueprint
+
     async def _fetch_architecture_doc(
         self, blueprint: RepositoryBlueprint, user_prompt: str
     ) -> RepositoryBlueprint:
