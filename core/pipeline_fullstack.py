@@ -392,8 +392,12 @@ class FullstackPipeline:
         if req.features:
             lines.append("Features: " + ", ".join(req.features))
         if req.tech_preferences:
-            prefs = "; ".join(f"{k}={v}" for k, v in req.tech_preferences.items())
-            lines.append(f"Tech preferences: {prefs}")
+            # Filter out 'none' values so downstream agents use their own defaults
+            effective_prefs = {k: v for k, v in req.tech_preferences.items()
+                              if v.lower() != "none"}
+            if effective_prefs:
+                prefs = "; ".join(f"{k}={v}" for k, v in effective_prefs.items())
+                lines.append(f"Tech preferences: {prefs}")
         return "\n".join(lines)
 
     def _phase(self, name: str, status: str) -> None:
