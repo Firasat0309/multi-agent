@@ -297,12 +297,19 @@ class CoderAgent(BaseAgent):
         # much less likely.
         dep_signatures = self._extract_dep_signatures(context)
 
+        # ── API contract section for controller / handler / route files ──
+        # When an API contract is available and this file is a controller-layer
+        # file, embed the relevant endpoint details directly in the prompt so
+        # the model generates the exact request/response types required.
+        api_contract_section = self._extract_api_contract_section(context)
+
         return (
             f"{self._format_context(context)}\n\n"
             f"Generate the complete {profile.display_name} file for: {fb.path}\n"
             f"Purpose: {fb.purpose}\n"
             f"Layer: {fb.layer}\n"
             f"Must export: {', '.join(fb.exports) if fb.exports else 'appropriate classes/functions'}\n\n"
+            f"{api_contract_section}"
             f"{dep_signatures}"
             f"INSTRUCTIONS:\n"
             f"1. Check the Related Files section below — dependency signatures are shown as "
@@ -330,6 +337,82 @@ class CoderAgent(BaseAgent):
             f"Do NOT output code as plain text — always use the write_file tool."
             f"{syntax_reminder}"
         )
+
+    @staticmethod
+    def _extract_api_contract_section(context: AgentContext) -> str:
+        """Return an API contract block for controller / service / route files.
+
+        Only injects contract details when:
+        1. An api_contract is present on the context (fullstack mode).
+        2. The file being generated is a controller, handler, router, or route layer.
+
+        This avoids polluting model/repository prompts with irrelevant contract noise.
+
+        Endpoint filtering uses a two-pass strategy so files like
+        ``UserAuthController.java`` still match ``/users`` endpoints:
+          Pass 1 — check if the file-stem word appears in the endpoint path or tags.
+          Pass 2 — fall back to all endpoints when no matches found (ensures the
+                   agent always sees the full contract for routing files).
+        """
+        fb = context.file_blueprint
+        if not context.api_contract or not fb:
+            return ""
+
+        _CONTRACT_LAYERS = {"controller", "handler", "router", "route", "api", "resource"}
+        if fb.layer.lower() not in _CONTRACT_LAYERS:
+            return ""
+
+        ac = context.api_contract
+        if not ac.endpoints:
+            return ""
+
+        # Derive candidate keywords from the file stem by removing common routing
+        # suffixes and splitting on camelCase / underscores.  E.g.:
+        #   "UserAuthController.java" → {"userauth", "user", "auth"}
+        import re as _re
+        import json as _json
+
+        raw_stem = _re.sub(
+            r"(controller|handler|router|route|resource|api)",
+            " ",
+            Path(fb.path).stem,
+            flags=_re.IGNORECASE,
+        )
+        # Split on camelCase boundaries and non-alphanumeric characters
+        words = {
+            w.lower()
+            for w in _re.split(r"(?<=[a-z])(?=[A-Z])|[^a-zA-Z0-9]+", raw_stem)
+            if len(w) > 1
+        }
+
+        def _matches(ep: "APIEndpoint") -> bool:
+            path_lower = ep.path.lower()
+            tags_lower = " ".join(ep.tags).lower()
+            return any(w in path_lower or w in tags_lower for w in words)
+
+        relevant = [ep for ep in ac.endpoints if _matches(ep)] or list(ac.endpoints)
+
+        lines = [
+            "API CONTRACT — implement these endpoints EXACTLY as specified:",
+            f"  Base URL: {ac.base_url}",
+        ]
+        for ep in relevant:
+            auth = " [requires authentication]" if ep.auth_required else ""
+            lines.append(f"  {ep.method} {ep.path}{auth}")
+            lines.append(f"    Description: {ep.description}")
+            if ep.request_schema:
+                try:
+                    lines.append(f"    Request body: {_json.dumps(ep.request_schema)}")
+                except Exception:
+                    pass
+            if ep.response_schema:
+                try:
+                    lines.append(f"    Response body: {_json.dumps(ep.response_schema)}")
+                except Exception:
+                    pass
+        lines.append("")
+
+        return "\n".join(lines) + "\n"
 
     @staticmethod
     def _extract_dep_signatures(context: AgentContext) -> str:

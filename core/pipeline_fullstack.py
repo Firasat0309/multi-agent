@@ -330,6 +330,7 @@ class FullstackPipeline:
         backend_pipeline = RunPipeline(
             backend_settings, self._llm, self._live,
             root_write_lock=self._root_write_lock,
+            api_contract=api_contract,
         )
         frontend_pipeline = FrontendPipeline(
             self._settings, self._llm, self._live,
@@ -337,16 +338,14 @@ class FullstackPipeline:
             interactive=self._interactive,
         )
 
-        # Build the enriched prompt that carries all context for the backend
-        backend_prompt = (
-            f"{enriched_prompt}\n\n"
-            f"API contract base URL: {api_contract.base_url if api_contract else '/api/v1'}\n"
-            f"Endpoints to implement: "
-            + (
-                ", ".join(f"{ep.method} {ep.path}" for ep in api_contract.endpoints)
-                if api_contract else "per architecture"
-            )
-        )
+        # Validate that the contract is consistent with the backend blueprint —
+        # emit warnings so the architect can see any coverage gaps before generation.
+        self._validate_contract_blueprint(api_contract, backend_blueprint)
+
+        # Build the enriched prompt that carries all context for the backend.
+        # Include the full endpoint schemas (not just paths) so the architect
+        # and coders can generate accurate DTOs, request bodies, and responses.
+        backend_prompt = self._build_backend_prompt(enriched_prompt, api_contract)
 
         be_task: asyncio.Task | None = None
         fe_task: asyncio.Task | None = None
@@ -432,6 +431,10 @@ class FullstackPipeline:
         lines = [user_prompt, "", "=== Product Requirements ==="]
         lines.append(f"Title: {req.title}")
         lines.append(f"Description: {req.description}")
+        if req.user_stories:
+            lines.append("User Stories:")
+            for story in req.user_stories:
+                lines.append(f"  - {story}")
         if req.features:
             lines.append("Features: " + ", ".join(req.features))
         if req.tech_preferences:
@@ -442,6 +445,121 @@ class FullstackPipeline:
                 prefs = "; ".join(f"{k}={v}" for k, v in effective_prefs.items())
                 lines.append(f"Tech preferences: {prefs}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _build_backend_prompt(enriched_prompt: str, api_contract: APIContract | None) -> str:
+        """Construct the backend generation prompt with full API contract details.
+
+        Instead of only listing endpoint paths, this embeds the full request /
+        response schemas so the ArchitectAgent designs accurate DTOs and the
+        CoderAgent generates controllers / handlers that match the contract
+        exactly — preventing type mismatches and missing fields at generation time.
+        """
+        if not api_contract:
+            return enriched_prompt
+
+        import json as _json
+
+        lines = [
+            enriched_prompt,
+            "",
+            "=== API Contract ===",
+            f"Base URL: {api_contract.base_url}",
+            f"Version: {api_contract.version}",
+            "",
+            "Endpoints to implement (implement ALL of these exactly):",
+        ]
+        for ep in api_contract.endpoints:
+            auth_note = " [auth required]" if ep.auth_required else ""
+            lines.append(f"  {ep.method} {ep.path}{auth_note} — {ep.description}")
+            if ep.request_schema:
+                try:
+                    schema_str = _json.dumps(ep.request_schema, indent=4)
+                    lines.append(f"    Request schema: {schema_str}")
+                except Exception:
+                    lines.append(f"    Request schema: {ep.request_schema}")
+            if ep.response_schema:
+                try:
+                    schema_str = _json.dumps(ep.response_schema, indent=4)
+                    lines.append(f"    Response schema: {schema_str}")
+                except Exception:
+                    lines.append(f"    Response schema: {ep.response_schema}")
+
+        if api_contract.schemas:
+            try:
+                schemas_str = _json.dumps(api_contract.schemas, indent=2)
+                lines.append("")
+                lines.append("Shared schemas (use these as your DTO / model definitions):")
+                lines.append(schemas_str)
+            except Exception:
+                pass
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _validate_contract_blueprint(
+        api_contract: APIContract,
+        blueprint: RepositoryBlueprint,
+    ) -> None:
+        """Warn when contract endpoints have no corresponding controller blueprint.
+
+        This is a best-effort check: if every endpoint tag / path prefix has at
+        least one controller-layer file blueprint, the contract is considered
+        covered.  Mismatches are logged as warnings (not errors) so the pipeline
+        proceeds — the architect may have named files differently.
+        """
+        if not api_contract or not api_contract.endpoints:
+            return
+
+        controller_files = [
+            fb for fb in blueprint.file_blueprints
+            if fb.layer in ("controller", "handler", "router", "route", "api")
+        ]
+        if not controller_files:
+            logger.warning(
+                "[FS] API contract has %d endpoints but the backend blueprint contains "
+                "no controller/handler layer files — the architect may have used a "
+                "non-standard layer name.  Verify that all endpoints are implemented.",
+                len(api_contract.endpoints),
+            )
+            return
+
+        # Collect unique top-level path segments (e.g. /api/v1/tasks → "tasks")
+        endpoint_resources: set[str] = set()
+        for ep in api_contract.endpoints:
+            parts = [p for p in ep.path.strip("/").split("/") if p and not p.startswith("{")]
+            # Skip version prefixes like "v1", "v2", "api"
+            resource_parts = [p for p in parts if not (p.startswith("v") and p[1:].isdigit()) and p != "api"]
+            if resource_parts:
+                endpoint_resources.add(resource_parts[-1].lower())
+
+        # Check each resource has at least one controller file that mentions it.
+        # Strip common English plural suffixes ("tasks" → "task", "users" → "user")
+        # so "TaskController" matches the "/tasks" resource.
+        def _stem(word: str) -> str:
+            """Return a simple singular stem by stripping trailing 's'/'es'/'ies'."""
+            if word.endswith("ies"):
+                return word[:-3] + "y"
+            if word.endswith("es") and len(word) > 3:
+                return word[:-2]
+            if word.endswith("s") and len(word) > 2:
+                return word[:-1]
+            return word
+
+        controller_names = " ".join(
+            fb.path.lower() + " " + fb.purpose.lower()
+            for fb in controller_files
+        )
+        uncovered = [
+            r for r in sorted(endpoint_resources)
+            if r not in controller_names and _stem(r) not in controller_names
+        ]
+        if uncovered:
+            logger.warning(
+                "[FS] API contract resources %s may not have matching controller files "
+                "in the backend blueprint.  Endpoint coverage may be incomplete.",
+                uncovered,
+            )
 
     def _phase(self, name: str, status: str) -> None:
         if self._live:

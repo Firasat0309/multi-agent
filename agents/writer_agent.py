@@ -108,7 +108,44 @@ class WriterAgent(BaseAgent):
     async def _generate_api_docs(
         self, blueprint: RepositoryBlueprint, context: AgentContext
     ) -> str:
-        # Collect controller/endpoint files for documentation
+        # When an API contract is available it is the authoritative source for
+        # documentation — it contains every endpoint, its auth requirements,
+        # and the exact request/response schemas.  Controller code is appended
+        # as supplementary detail (actual implementation) but the contract
+        # prevents undocumented or mismatched endpoints.
+        contract_section = ""
+        if context.api_contract:
+            import json as _json
+            ac = context.api_contract
+            lines = [
+                f"API Contract: {ac.title} v{ac.version}",
+                f"Base URL: {ac.base_url}",
+                "",
+                "Endpoints (authoritative — document ALL of these):",
+            ]
+            for ep in ac.endpoints:
+                auth = " [requires authentication]" if ep.auth_required else ""
+                lines.append(f"  {ep.method} {ep.path}{auth} — {ep.description}")
+                if ep.request_schema:
+                    try:
+                        lines.append(f"    Request:  {_json.dumps(ep.request_schema)}")
+                    except Exception:
+                        pass
+                if ep.response_schema:
+                    try:
+                        lines.append(f"    Response: {_json.dumps(ep.response_schema)}")
+                    except Exception:
+                        pass
+            if ac.schemas:
+                try:
+                    lines.append("")
+                    lines.append("Shared schemas:")
+                    lines.append(_json.dumps(ac.schemas, indent=2))
+                except Exception:
+                    pass
+            contract_section = "\n".join(lines)
+
+        # Collect controller/endpoint files for supplementary context
         controller_files = {
             path: content
             for path, content in context.related_files.items()
@@ -116,7 +153,7 @@ class WriterAgent(BaseAgent):
         }
         controllers_section = ""
         if controller_files:
-            controllers_section = "\n\nController files:\n"
+            controllers_section = "\n\nController files (implementation reference):\n"
             for path, content in controller_files.items():
                 # Detect fence language from file extension
                 fence = "python"
@@ -131,11 +168,16 @@ class WriterAgent(BaseAgent):
             f"Project: {blueprint.name}\n"
             f"Architecture: {blueprint.architecture_style}\n"
             f"Tech stack: {blueprint.tech_stack}\n"
-            f"{controllers_section}\n\n"
-            "Generate API documentation with these exact sections:\n"
+        )
+        if contract_section:
+            prompt += f"\n{contract_section}"
+        prompt += controllers_section
+        prompt += (
+            "\n\nGenerate API documentation with these exact sections:\n"
             "## Base URL — the default local URL and port\n"
             "## Authentication — how authentication works (or state if none)\n"
-            "## Endpoints — for EACH endpoint found in the controller code above:\n"
+            "## Endpoints — for EACH endpoint listed in the API Contract above"
+            " (or in the controller code if no contract):\n"
             "  - HTTP method and path\n"
             "  - Description of what it does\n"
             "  - Request body JSON example (if applicable)\n"
@@ -143,9 +185,10 @@ class WriterAgent(BaseAgent):
             "  - Error response JSON example with status code\n"
             "## Error Codes — table of status codes and their meanings\n\n"
             "RULES:\n"
-            "- Document ONLY endpoints that exist in the controller code shown above\n"
-            "- Use realistic JSON examples matching the actual model fields\n"
-            "- Do NOT invent endpoints that are not in the code"
+            "- Document EVERY endpoint from the API Contract (if provided) — "
+            "missing an endpoint is an error\n"
+            "- Use the request/response schemas from the contract as your examples\n"
+            "- Do NOT invent endpoints that are not in the contract or controller code"
         )
         return await self._call_llm(prompt)
 

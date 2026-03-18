@@ -136,6 +136,10 @@ class AgentContext:
     related_files: dict[str, str] = field(default_factory=dict)  # path -> content
     architecture_summary: str = ""
     dependency_info: dict[str, Any] = field(default_factory=dict)
+    # Optional API contract — populated in fullstack mode so backend agents
+    # (CoderAgent, ReviewerAgent) can see the exact endpoint schemas they must
+    # implement / verify rather than relying on implicit conventions.
+    api_contract: "APIContract | None" = None
 
 
 # ── Repository Knowledge Models ──────────────────────────────────────────────
