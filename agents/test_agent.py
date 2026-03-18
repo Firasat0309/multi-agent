@@ -27,8 +27,8 @@ class TestAgent(BaseAgent):
         return (
             f"You are a senior test engineer specializing in {profile.display_name}.\n\n"
 
-            "YOUR TASK: Generate a complete, compilable, runnable test file that "
-            "achieves ≥80% line coverage of the source file under test.\n\n"
+            "YOUR TASK: Generate a focused, compilable, runnable test file that "
+            "covers the CORE functionality of the source file under test.\n\n"
 
             "OUTPUT FORMAT:\n"
             f"- Output ONLY raw {profile.display_name} code — no markdown fences, "
@@ -45,18 +45,22 @@ class TestAgent(BaseAgent):
             "assertNotNull(result), or any trivial placeholder as the ONLY assertion\n"
             "4. Test REAL method signatures from the source code — parameter names, types, "
             "and return types must match the source EXACTLY\n"
-            "5. Generate ≥3 test methods per public method/function/endpoint\n"
-            "6. Total test count must be ≥ (number_of_public_methods × 3)\n\n"
+            "5. Focus on the MAIN public API — test only the most important public "
+            "methods/endpoints that define the file's core responsibility\n"
+            "6. Write 1 happy-path test per core method. Add 1 error-case test ONLY for "
+            "methods that handle user input, I/O, or critical business logic\n"
+            "7. Skip edge cases, boundary tests, and exhaustive permutations — keep it lean\n"
+            "8. Aim for 3–8 total tests per file, NOT 3 per method\n\n"
 
             "TEST STRUCTURE (follow this order):\n"
             "1. Package/module declaration (if required by language)\n"
             "2. All imports (source under test + test framework + mocking library)\n"
             "3. Test class/suite declaration with setup/teardown\n"
             f"4. Use the standard {profile.display_name} test framework\n"
-            "5. For EACH public method in the source file, write these tests:\n"
+            "5. For the CORE public methods, write:\n"
             "   a) HAPPY PATH: valid input → verify exact expected return value\n"
-            "   b) ERROR CASE: invalid/null input → verify exact exception type and message\n"
-            "   c) EDGE CASE: boundary values (0, empty, max, nil) → verify exact behavior\n\n"
+            "   b) ERROR CASE (only for critical methods): invalid input → verify "
+            "exact exception type\n\n"
 
             "MOCKING RULES:\n"
             "- Mock ONLY external dependencies (DB, HTTP, filesystem, message queues)\n"
