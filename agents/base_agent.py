@@ -343,11 +343,17 @@ class BaseAgent(ABC):
             metrics=self.get_metrics(),
         )
 
+    # Timeout in seconds for individual tool handler calls (read_file, write_file, etc.).
+    # Prevents the agentic loop from hanging indefinitely if underlying I/O stalls.
+    _TOOL_TIMEOUT_SECONDS: float = 60.0
+
     async def _dispatch_tool(self, context: AgentContext, tc: ToolCall) -> str:
         """Dispatch a tool call to the appropriate handler.
 
         Returns a string result for the LLM.  Exceptions are caught and
         returned as error strings so the model can retry or adapt.
+        Each handler is wrapped with a timeout to prevent the agentic loop
+        from hanging if underlying I/O stalls.
         """
         handlers = {
             "read_file":       self._tool_read_file,
@@ -357,20 +363,36 @@ class BaseAgent(ABC):
             "list_files":      self._tool_list_files,
             "apply_patch":     self._tool_apply_patch,
         }
-        
+
         handler = handlers.get(tc.name)
         if handler is None:
             # Not a local native handler. Check if it's an MCP tool.
             if self._mcp_client and any(t.name == tc.name for t in self._mcp_tools):
                 try:
-                    return await self._mcp_client.execute_tool(tc.name, tc.input)
+                    return await asyncio.wait_for(
+                        self._mcp_client.execute_tool(tc.name, tc.input),
+                        timeout=self._TOOL_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("MCP tool %s timed out after %.0fs", tc.name, self._TOOL_TIMEOUT_SECONDS)
+                    return f"Error: MCP tool '{tc.name}' timed out after {self._TOOL_TIMEOUT_SECONDS:.0f}s"
                 except Exception as exc:
                     logger.warning("MCP Tool %s execution raised: %s", tc.name, exc)
                     return f"Error executing MCP tool: {exc}"
             return f"Error: unknown tool '{tc.name}'"
-            
+
         try:
-            return await handler(tc.input)
+            return await asyncio.wait_for(
+                handler(tc.input),
+                timeout=self._TOOL_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Tool %s timed out after %.0fs for %s",
+                tc.name, self._TOOL_TIMEOUT_SECONDS,
+                context.file_blueprint.path if context.file_blueprint else "unknown",
+            )
+            return f"Error: tool '{tc.name}' timed out after {self._TOOL_TIMEOUT_SECONDS:.0f}s"
         except Exception as exc:
             logger.warning("Tool %s raised: %s", tc.name, exc)
             return f"Error: {exc}"
@@ -776,6 +798,31 @@ class BaseAgent(ABC):
                 f"Depends on: {', '.join(fb.depends_on) or 'none'}\n"
                 f"Exports: {', '.join(fb.exports) or 'TBD'}"
             )
+
+        # Include API contract summary when available — critical for fullstack mode
+        # so backend agents know the exact endpoint signatures they must implement.
+        if context.api_contract:
+            import json as _json
+            ac = context.api_contract
+            contract_lines = [
+                f"## API Contract ({ac.title} v{ac.version})",
+                f"Base URL: {ac.base_url}",
+                "Endpoints:",
+            ]
+            for ep in ac.endpoints:
+                auth = " [auth]" if ep.auth_required else ""
+                contract_lines.append(f"  {ep.method} {ep.path}{auth} — {ep.description}")
+                if ep.request_schema:
+                    try:
+                        contract_lines.append(f"    Request: {_json.dumps(ep.request_schema)}")
+                    except Exception:
+                        pass
+                if ep.response_schema:
+                    try:
+                        contract_lines.append(f"    Response: {_json.dumps(ep.response_schema)}")
+                    except Exception:
+                        pass
+            parts.append("\n".join(contract_lines))
 
         if context.related_files:
             parts.append("## Related Files")

@@ -58,6 +58,7 @@ from core.language import detect_language_from_blueprint
 from core.lifecycle_orchestrator import LifecycleOrchestrator
 from core.llm_client import LLMClient
 from core.models import (
+    APIContract,
     RepositoryBlueprint,
     TaskType,
 )
@@ -130,6 +131,7 @@ class AgentManager:
         embedding_store: EmbeddingStore | None = None,
         event_bus: EventBus | None = None,
         mcp_client: MCPClient | None = None,
+        api_contract: APIContract | None = None,
     ) -> None:
         self.settings = settings
         self.llm = llm_client
@@ -141,6 +143,7 @@ class AgentManager:
         self._embedding_store = embedding_store
         self._event_bus = event_bus
         self.mcp_client = mcp_client
+        self._api_contract = api_contract
 
         # Two-tier terminal tools: build (network-capable) and test (isolated).
         # TestAgent gets the test terminal; all other agents that need a
@@ -348,6 +351,7 @@ class AgentManager:
             repo_index=self.repo.get_repo_index(),
             dep_store=self._dep_store,
             embedding_store=self._embedding_store,
+            api_contract=self._api_contract,
         )
         # Run context build in a thread — embedding_store.search() loads the
         # SentenceTransformer model synchronously on first call, which makes

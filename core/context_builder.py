@@ -11,6 +11,7 @@ from core.ast_extractor import ASTExtractor
 from core.language import detect_language_from_blueprint
 from core.models import (
     AgentContext,
+    APIContract,
     FileBlueprint,
     RepositoryBlueprint,
     RepositoryIndex,
@@ -145,12 +146,14 @@ class ContextBuilder:
         repo_index: RepositoryIndex,
         dep_store: DependencyGraphStore | None = None,
         embedding_store: EmbeddingStore | None = None,
+        api_contract: APIContract | None = None,
     ) -> None:
         self.workspace = workspace_dir
         self.blueprint = blueprint
         self.repo_index = repo_index
         self._dep_store = dep_store
         self._embedding_store = embedding_store
+        self._api_contract = api_contract
 
     def build(self, task: Task) -> AgentContext:
         """Build context for a specific task using priority-ordered file collection."""
@@ -165,6 +168,7 @@ class ContextBuilder:
             related_files=related,
             architecture_summary=self.blueprint.architecture_doc,
             dependency_info=dep_info,
+            api_contract=self._api_contract,
         )
 
     def _find_blueprint(self, file_path: str) -> FileBlueprint | None:

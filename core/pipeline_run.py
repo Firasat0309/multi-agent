@@ -14,7 +14,7 @@ from core.agent_manager import AgentManager
 from core.event_bus import EventBus
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient, LLMConfigError, calculate_cost
-from core.models import TokenCost
+from core.models import APIContract, TokenCost
 from core.run_reporter import RunReporter
 from core.sandbox_orchestrator import SandboxOrchestrator, SandboxUnavailableError
 from core.pipeline_definition import GENERATE_PIPELINE
@@ -49,11 +49,13 @@ class RunPipeline:
         llm: LLMClient,
         live: LiveConsole | None,
         root_write_lock: asyncio.Lock | None = None,
+        api_contract: APIContract | None = None,
     ) -> None:
         self._settings = settings
         self._llm = llm
         self._live = live
         self._root_write_lock = root_write_lock
+        self._api_contract = api_contract
 
     async def execute(self, user_prompt: str, start_time: float, *, resume: bool = False) -> PipelineResult:
         from core.pipeline import PipelineResult
@@ -228,6 +230,7 @@ class RunPipeline:
                 embedding_store=run_embedding_store,
                 event_bus=event_bus,
                 mcp_client=mcp_client,
+                api_contract=self._api_contract,
             )
 
             # Compute dependency tiers for incremental build verification.
@@ -564,6 +567,7 @@ class RunPipeline:
                 embedding_store=run_embedding_store,
                 event_bus=event_bus,
                 mcp_client=mcp_client,
+                api_contract=self._api_contract,
             )
 
             # Recompute tiers

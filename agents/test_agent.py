@@ -166,6 +166,34 @@ class TestAgent(BaseAgent):
                 + "\n".join(dep_interfaces) + "\n\n"
             )
 
+        # When an API contract is available and this is a controller / handler file,
+        # embed the endpoint schemas so the LLM generates tests that use realistic
+        # request bodies and validates the documented response shapes.
+        if context.api_contract and fb.layer.lower() in (
+            "controller", "handler", "router", "route", "api", "resource"
+        ):
+            import json as _json
+            ac = context.api_contract
+            contract_lines = [
+                "API CONTRACT — generate tests that exercise these endpoints with "
+                "the documented request/response shapes:",
+                f"  Base URL: {ac.base_url}",
+            ]
+            for ep in ac.endpoints:
+                auth = " [auth required]" if ep.auth_required else ""
+                contract_lines.append(f"  {ep.method} {ep.path}{auth} — {ep.description}")
+                if ep.request_schema:
+                    try:
+                        contract_lines.append(f"    Request example: {_json.dumps(ep.request_schema)}")
+                    except Exception:
+                        pass
+                if ep.response_schema:
+                    try:
+                        contract_lines.append(f"    Expected response: {_json.dumps(ep.response_schema)}")
+                    except Exception:
+                        pass
+            prompt += "\n".join(contract_lines) + "\n\n"
+
         prompt += exports_section
 
         prompt += (
