@@ -34,6 +34,7 @@ from core.models import (
     UIDesignSpec,
     AgentContext,
 )
+from core.ast_extractor import ASTExtractor
 from core.pipeline_definition import FRONTEND_PIPELINE
 from core.repository_manager import RepositoryManager
 from core.sandbox_orchestrator import SandboxOrchestrator, SandboxUnavailableError
@@ -69,11 +70,13 @@ class FrontendPipeline:
         llm: LLMClient,
         live: LiveConsole | None = None,
         root_write_lock: asyncio.Lock | None = None,
+        interactive: bool = True,
     ) -> None:
         self._settings = settings
         self._llm = llm
         self._live = live
         self._root_write_lock = root_write_lock
+        self._interactive = interactive
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -84,6 +87,7 @@ class FrontendPipeline:
         start_time: float,
         figma_url: str = "",
         frontend_workspace: Path | None = None,
+        backend_blueprint: RepositoryBlueprint | None = None,
     ) -> PipelineResult:
         """Run all frontend generation phases and return a PipelineResult."""
         from core.pipeline import PipelineResult
@@ -160,6 +164,36 @@ class FrontendPipeline:
                 errors=errors,
                 elapsed_seconds=time.monotonic() - start_time,
             )
+
+        # ── Approval Gate 3: Frontend Architecture ─────────────────────────────
+        if self._settings.require_architecture_approval:
+            from core.architecture_approver import (
+                ArchitectureApprover,
+                ArchitecturePendingApprovalError,
+            )
+            approver = ArchitectureApprover(
+                interactive=self._interactive,
+                workspace=workspace,
+            )
+            try:
+                approved = approver.approve_frontend_architecture(component_plan)
+            except ArchitecturePendingApprovalError as e:
+                logger.info("Frontend architecture pending human approval: %s", e)
+                return PipelineResult(
+                    success=False,
+                    workspace_path=workspace,
+                    errors=[str(e)],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
+            if not approved:
+                logger.info("Frontend architecture rejected by user")
+                return PipelineResult(
+                    success=False,
+                    workspace_path=workspace,
+                    errors=["Frontend architecture rejected by user"],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
+            logger.info("Frontend architecture approved by user")
 
         # Initialize RepositoryManager with a synthetic frontend blueprint
         frontend_blueprint = self._make_frontend_blueprint(requirements, component_plan)
@@ -275,6 +309,8 @@ class FrontendPipeline:
                                     "component": comp,
                                     "component_plan": component_plan,
                                     "api_contract": api_contract,
+                                    "design_spec": design_spec,
+                                    "requirements": requirements,
                                 },
                             ),
                             blueprint=frontend_blueprint,
@@ -448,6 +484,11 @@ class FrontendPipeline:
                 logger.info("[FE Phase 5] Generating API client layer...")
                 try:
                     integrator = agent_manager._create_agent(TaskType.INTEGRATE_API)
+                    # Scan backend models for type reference
+                    be_models = self._scan_backend_models(
+                        workspace.parent / "backend",
+                        backend_blueprint=backend_blueprint,
+                    )
                     api_ctx = AgentContext(
                         task=Task(
                             task_id=9000,
@@ -457,6 +498,8 @@ class FrontendPipeline:
                             metadata={
                                 "api_contract": api_contract,
                                 "component_plan": component_plan,
+                                "requirements": requirements,
+                                "backend_models": be_models,
                             },
                         ),
                         blueprint=frontend_blueprint,
@@ -508,6 +551,7 @@ class FrontendPipeline:
                             metadata={
                                 "component_plan": component_plan,
                                 "api_contract": api_contract,
+                                "requirements": requirements,
                             },
                         ),
                         blueprint=frontend_blueprint,
@@ -578,6 +622,7 @@ class FrontendPipeline:
                             metadata={
                                 "component_plan": component_plan,
                                 "api_contract": api_contract,
+                                "requirements": requirements,
                             },
                         ),
                         blueprint=frontend_blueprint,
@@ -624,6 +669,8 @@ class FrontendPipeline:
                             description="Generate frontend deployment artifacts (Dockerfile, docker-compose, K8s manifests)",
                             metadata={
                                 "component_plan": component_plan,
+                                "api_contract": api_contract,
+                                "requirements": requirements,
                             },
                         ),
                         blueprint=frontend_blueprint,
@@ -676,6 +723,30 @@ class FrontendPipeline:
                 time.monotonic() - _parallel_start,
             )
 
+            # ── Phase 9: Final Build Check ─────────────────────────────────────
+            # Run npm install + tsc/next build AFTER all files are generated.
+            # Phase 4.5 only catches errors in components; this catches errors
+            # introduced by API integration, state management, and cross-file
+            # type mismatches.
+            self._phase("FE: Final Build Check", "running")
+            logger.info("[FE Phase 9] Running final build check (npm install + type check)...")
+            try:
+                final_build_ok = await self._run_final_build_check(
+                    workspace, frontend_blueprint, agent_manager, event_bus,
+                    component_plan, errors, metrics,
+                    api_contract=api_contract,
+                    requirements=requirements,
+                    ordered_components=ordered_components,
+                )
+                if final_build_ok:
+                    self._complete_phase("FE: Final Build Check")
+                else:
+                    self._fail_phase("FE: Final Build Check", "Build errors remain")
+            except Exception as exc:
+                logger.exception("Final build check failed")
+                errors.append(f"Final build check failed: {exc}")
+                self._fail_phase("FE: Final Build Check", str(exc))
+
             # ── Finalise: persist dep graph, repo index, and embeddings ──────────
             try:
                 fe_settings = copy.copy(self._settings)
@@ -689,10 +760,13 @@ class FrontendPipeline:
                 logger.warning("Frontend workspace indexing failed", exc_info=True)
 
             elapsed = time.monotonic() - start_time
-            success = not any(
+            # Pipeline fails if component planning failed OR final build has errors
+            has_critical_error = any(
                 e for e in errors
                 if "Component planning failed" in e
             )
+            has_build_errors = metrics.get("final_build_errors", 0) > 0
+            success = not has_critical_error and not has_build_errors
 
             token_cost = self._build_token_cost()
 
@@ -1016,6 +1090,340 @@ class FrontendPipeline:
                 abs_path.write_text(new_content, encoding="utf-8")
 
         return fixed_total
+
+    async def _run_final_build_check(
+        self,
+        workspace: Path,
+        blueprint: RepositoryBlueprint,
+        agent_manager: AgentManager,
+        event_bus: EventBus,
+        component_plan: ComponentPlan,
+        errors: list[str],
+        metrics: dict,
+        api_contract: "APIContract | None" = None,
+        requirements: "ProductRequirements | None" = None,
+        ordered_components: "list | None" = None,
+    ) -> bool:
+        """Run npm install + tsc after ALL generation phases are done.
+
+        This catches type errors introduced by API integration, state management,
+        and cross-file mismatches that Phase 4.5 (which runs before Phases 5-8)
+        cannot detect.
+
+        Returns True if the build passes (or tools are unavailable).
+        """
+        # Step 1: npm install (required for tsc to resolve node_modules types)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "npm", "install", "--ignore-scripts",
+                cwd=str(workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=120.0)
+            if proc.returncode != 0:
+                logger.warning(
+                    "[FE Phase 9] npm install failed (rc=%d): %s",
+                    proc.returncode, stdout_bytes.decode(errors="replace")[:500],
+                )
+                # Non-fatal — tsc may still work with partial deps
+            else:
+                logger.info("[FE Phase 9] npm install completed")
+        except FileNotFoundError:
+            logger.warning("[FE Phase 9] npm not found on PATH — skipping final build check")
+            return True
+        except asyncio.TimeoutError:
+            logger.warning("[FE Phase 9] npm install timed out after 120s")
+
+        # Step 2: tsc --noEmit (full type check)
+        tsx_compiler = TSXCompiler()
+        max_retries = self._settings.build_checkpoint_retries
+
+        compile_result = await tsx_compiler.check(workspace)
+        if not compile_result.tsc_available:
+            logger.warning("[FE Phase 9] tsc not available — skipping final type check")
+            return True
+
+        if not compile_result.errors:
+            logger.info("[FE Phase 9] Final build check passed — 0 errors")
+            await event_bus.publish(AgentEvent(
+                type=BusEventType.BUILD_PASSED,
+                data={"checkpoint": "final_build"},
+            ))
+            return True
+
+        # Step 3: Fix-retry loop
+        for retry in range(max_retries):
+            errors_by_file = compile_result.errors_by_file()
+            logger.warning(
+                "[FE Phase 9] %d error(s) in %d file(s) — fix attempt %d/%d",
+                len(compile_result.errors), len(errors_by_file),
+                retry + 1, max_retries,
+            )
+
+            fix_coros = []
+            for file_path, file_errors in errors_by_file.items():
+                fix_agent = agent_manager._create_agent(TaskType.FIX_CODE)
+                error_text = "\n".join(
+                    f"{e.file}({e.line},{e.col}): error {e.code}: {e.message}"
+                    for e in file_errors
+                )
+                # Find the component metadata for this file
+                fix_component = None
+                if ordered_components:
+                    for c in ordered_components:
+                        if c.file_path == file_path:
+                            fix_component = c
+                            break
+
+                fix_metadata: dict = {
+                    "fix_trigger": "build",
+                    "build_errors": error_text,
+                }
+                if fix_component:
+                    fix_metadata["component"] = fix_component
+                if component_plan:
+                    fix_metadata["component_plan"] = component_plan
+                if api_contract:
+                    fix_metadata["api_contract"] = api_contract
+                if requirements:
+                    fix_metadata["requirements"] = requirements
+
+                # Extract AST stubs of imported files (compact signatures,
+                # not full source) so the fixer knows the types/exports
+                # without blowing up the context window.
+                related: dict[str, str] = {}
+                broken_abs = workspace / file_path
+                if broken_abs.exists():
+                    try:
+                        content = broken_abs.read_text(encoding="utf-8", errors="replace")
+                        _ast = ASTExtractor()
+                        import posixpath as _posixpath
+                        for line in content.splitlines():
+                            if "import " in line and "from " in line:
+                                parts = line.split("from ")
+                                if len(parts) > 1:
+                                    imp_path = parts[-1].strip().strip("'\"").strip(";")
+                                    if imp_path.startswith("."):
+                                        file_dir = _posixpath.dirname(file_path)
+                                        for ext in (".ts", ".tsx", "/index.ts", "/index.tsx"):
+                                            # Normalise the relative path (collapse ..)
+                                            # using posixpath to stay platform-independent
+                                            candidate = _posixpath.normpath(
+                                                _posixpath.join(file_dir, imp_path + ext)
+                                            )
+                                            abs_candidate = workspace / candidate
+                                            if abs_candidate.exists():
+                                                try:
+                                                    raw = abs_candidate.read_text(
+                                                        encoding="utf-8", errors="replace"
+                                                    )
+                                                    stub = _ast.extract_stub(
+                                                        candidate, raw, "typescript",
+                                                    )
+                                                    related[candidate] = stub or raw[:2000]
+                                                except OSError:
+                                                    pass
+                                                break
+                    except OSError:
+                        pass
+
+                # Build file blueprint for the broken file
+                fix_fb = None
+                if fix_component:
+                    fix_fb = FileBlueprint(
+                        path=file_path,
+                        purpose=fix_component.description or fix_component.name,
+                        depends_on=fix_component.depends_on or [],
+                        language="typescript",
+                    )
+
+                fix_ctx = AgentContext(
+                    task=Task(
+                        task_id=11000 + retry * 100 + len(fix_coros),
+                        task_type=TaskType.FIX_CODE,
+                        file=file_path,
+                        description=f"Fix build errors in {file_path}",
+                        metadata=fix_metadata,
+                    ),
+                    blueprint=blueprint,
+                    file_blueprint=fix_fb,
+                    related_files=related if related else None,
+                )
+                fix_coros.append(fix_agent.execute(fix_ctx))
+
+            fix_results = await asyncio.gather(*fix_coros, return_exceptions=True)
+            for fix_res in fix_results:
+                if isinstance(fix_res, Exception):
+                    logger.error("Fix task failed: %s", fix_res)
+
+            compile_result = await tsx_compiler.check(workspace)
+            if not compile_result.errors:
+                logger.info(
+                    "[FE Phase 9] Final build passed after %d fix attempt(s)", retry + 1
+                )
+                await event_bus.publish(AgentEvent(
+                    type=BusEventType.BUILD_PASSED,
+                    data={"checkpoint": "final_build"},
+                ))
+                return True
+
+        # Exhausted retries
+        metrics["final_build_errors"] = len(compile_result.errors)
+        for err in compile_result.errors:
+            errors.append(
+                f"Final build error {err.file}:{err.line}: [{err.code}] {err.message}"
+            )
+        logger.warning(
+            "[FE Phase 9] %d error(s) remain after %d fix attempts",
+            len(compile_result.errors), max_retries,
+        )
+        await event_bus.publish(AgentEvent(
+            type=BusEventType.BUILD_FAILED,
+            data={
+                "checkpoint": "final_build",
+                "error_count": len(compile_result.errors),
+            },
+        ))
+        return False
+
+    @staticmethod
+    def _scan_backend_models(
+        backend_workspace: Path,
+        backend_blueprint: "RepositoryBlueprint | None" = None,
+    ) -> dict[str, str]:
+        """Extract backend model/entity/DTO signatures for FE type generation.
+
+        Two strategies (in order of preference):
+
+        **Strategy A — Blueprint-driven** (no filesystem scan):
+          Uses ``backend_blueprint.file_blueprints`` to find model files by
+          ``layer`` (model, entity, dto).  If the file exists on disk (BE may
+          have finished first), extracts an AST stub.  Otherwise returns the
+          blueprint metadata (path, purpose, exports) — still useful for the
+          LLM to generate matching TypeScript interfaces.
+
+        **Strategy B — Filesystem discovery** (fallback):
+          Uses ``find`` shell command to locate model directories, then reads
+          only files from those directories.  This avoids walking the entire
+          tree with ``rglob`` which is slow on deep Java/Go projects.
+        """
+        _EXT_TO_LANG = {
+            ".java": "java", ".py": "python", ".go": "go",
+            ".ts": "typescript", ".rs": "rust", ".cs": "csharp",
+            ".kt": "java",
+        }
+        _ast = ASTExtractor()
+        models: dict[str, str] = {}
+
+        # ── Strategy A: use the blueprint we already have ──────────────────
+        if backend_blueprint and backend_blueprint.file_blueprints:
+            model_layers = {"model", "entity", "dto", "domain", "schema"}
+            for fb in backend_blueprint.file_blueprints:
+                layer = (fb.layer or "").lower()
+                if layer not in model_layers:
+                    continue
+
+                # Try to read the actual generated file for AST extraction
+                abs_path = backend_workspace / fb.path
+                if abs_path.exists():
+                    try:
+                        raw = abs_path.read_text(encoding="utf-8", errors="replace")
+                        lang = _EXT_TO_LANG.get(abs_path.suffix, "")
+                        stub = _ast.extract_stub(fb.path, raw, lang) if lang else None
+                        models[fb.path] = stub if stub else raw[:1500]
+                    except OSError:
+                        # File exists but unreadable — use blueprint metadata
+                        models[fb.path] = (
+                            f"// {fb.path} (from blueprint)\n"
+                            f"// Purpose: {fb.purpose}\n"
+                            f"// Exports: {', '.join(fb.exports or [])}\n"
+                        )
+                else:
+                    # BE hasn't generated this file yet (parallel execution)
+                    # — still provide the blueprint metadata so the FE LLM
+                    # knows what entities exist and what they export
+                    models[fb.path] = (
+                        f"// {fb.path} (not yet generated — from blueprint)\n"
+                        f"// Purpose: {fb.purpose}\n"
+                        f"// Exports: {', '.join(fb.exports or [])}\n"
+                        f"// Layer: {fb.layer}\n"
+                    )
+
+                if len(models) >= 15:
+                    break
+
+            if models:
+                return models
+
+        # ── Strategy B: filesystem discovery via find ──────────────────────
+        if not backend_workspace.exists():
+            return models
+
+        # Use find to locate model directories — much faster than rglob
+        # on deep Java trees (src/main/java/com/example/...)
+        import subprocess
+        model_dir_names = ("model", "models", "entity", "entities",
+                           "dto", "dtos", "schema", "schemas", "domain")
+        # Build find command: search for directories matching model names
+        # -maxdepth 8 prevents runaway on deeply nested node_modules etc.
+        name_args: list[str] = []
+        for i, d in enumerate(model_dir_names):
+            if i > 0:
+                name_args.extend(["-o", "-iname", d])
+            else:
+                name_args.extend(["-iname", d])
+
+        find_ok = False
+        model_dirs: list[Path] = []
+        try:
+            result = subprocess.run(
+                ["find", str(backend_workspace), "-maxdepth", "8",
+                 "-type", "d", "("] + name_args + [")"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                model_dirs = [
+                    Path(d.strip()) for d in result.stdout.strip().splitlines()
+                    if d.strip()
+                ]
+                find_ok = True
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            pass
+
+        if not find_ok:
+            # find not available or failed (e.g. Windows find.exe) — fall back
+            # to checking known relative paths
+            model_dirs = [
+                backend_workspace / d
+                for d in model_dir_names
+                if (backend_workspace / d).is_dir()
+            ]
+            # Also check src/main/java/*/model etc.
+            for p in backend_workspace.glob("src/**/"):
+                if p.name.lower() in set(model_dir_names) and p.is_dir():
+                    model_dirs.append(p)
+
+        source_exts = set(_EXT_TO_LANG.keys())
+        for model_dir in model_dirs:
+            if not model_dir.is_dir():
+                continue
+            # Read only files directly in the model directory (not recursive)
+            for p in sorted(model_dir.iterdir()):
+                if not p.is_file() or p.suffix not in source_exts:
+                    continue
+                try:
+                    rel = p.relative_to(backend_workspace).as_posix()
+                    raw = p.read_text(encoding="utf-8", errors="replace")
+                    lang = _EXT_TO_LANG.get(p.suffix, "")
+                    stub = _ast.extract_stub(rel, raw, lang) if lang else None
+                    models[rel] = stub if stub else raw[:1500]
+                except (OSError, ValueError):
+                    pass
+                if len(models) >= 15:
+                    return models
+
+        return models
 
     @staticmethod
     def _infer_framework(requirements: ProductRequirements) -> str:

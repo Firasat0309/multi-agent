@@ -86,6 +86,7 @@ class APIIntegrationAgent(BaseAgent):
     def _build_prompt(self, context: AgentContext) -> str:
         contract: APIContract | None = context.task.metadata.get("api_contract")
         plan: ComponentPlan | None = context.task.metadata.get("component_plan")
+        backend_models: dict[str, str] | None = context.task.metadata.get("backend_models")
 
         contract_text = ""
         if contract:
@@ -94,12 +95,20 @@ class APIIntegrationAgent(BaseAgent):
                 f"{' [auth]' if ep.auth_required else ''}"
                 for ep in contract.endpoints
             )
-            schema_names = list(contract.schemas.keys())
             contract_text = (
                 f"API base URL: {contract.base_url}\n"
                 f"Endpoints:\n{endpoint_lines}\n"
-                f"Schemas: {schema_names}\n"
             )
+
+            # Include full schema definitions so the LLM generates accurate types
+            if contract.schemas:
+                import json as _json
+                schema_text = _json.dumps(contract.schemas, indent=2)
+                if len(schema_text) > 4000:
+                    schema_text = schema_text[:4000] + "\n... (truncated)"
+                contract_text += f"\nAPI Schema definitions (use these for TypeScript interfaces):\n{schema_text}\n"
+            else:
+                contract_text += f"Schemas: (none defined — infer from endpoint names)\n"
 
         plan_text = ""
         if plan:
@@ -108,9 +117,18 @@ class APIIntegrationAgent(BaseAgent):
                 f"State solution: {plan.state_solution}\n"
             )
 
+        # Backend model source code for accurate type matching
+        be_model_text = ""
+        if backend_models:
+            be_model_text = "\nBackend entity models (match your TypeScript interfaces to these):\n"
+            for path, content in list(backend_models.items())[:10]:
+                be_model_text += f"\n--- {path} ---\n{content}\n"
+
         return (
-            f"{contract_text}\n{plan_text}\n"
-            "Generate ALL API integration files and write each to disk using write_file."
+            f"{contract_text}\n{plan_text}\n{be_model_text}\n"
+            "Generate ALL API integration files and write each to disk using write_file.\n"
+            "IMPORTANT: Your TypeScript interfaces in src/lib/types.ts MUST match the\n"
+            "schema definitions and backend models above. Use the exact field names and types."
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:

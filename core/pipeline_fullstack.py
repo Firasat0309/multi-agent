@@ -119,6 +119,36 @@ class FullstackPipeline:
                 elapsed_seconds=time.monotonic() - start_time,
             )
 
+        # ── Approval Gate 1: Product Plan ────────────────────────────────────
+        if self._settings.require_architecture_approval:
+            from core.architecture_approver import (
+                ArchitectureApprover,
+                ArchitecturePendingApprovalError,
+            )
+            approver = ArchitectureApprover(
+                interactive=self._interactive,
+                workspace=root_workspace,
+            )
+            try:
+                approved = approver.approve_product_plan(requirements)
+            except ArchitecturePendingApprovalError as e:
+                logger.info("Product plan pending human approval: %s", e)
+                return PipelineResult(
+                    success=False,
+                    workspace_path=root_workspace,
+                    errors=[str(e)],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
+            if not approved:
+                logger.info("Product plan rejected by user")
+                return PipelineResult(
+                    success=False,
+                    workspace_path=root_workspace,
+                    errors=["Product plan rejected by user"],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
+            logger.info("Product plan approved by user")
+
         # ── Phase 2: Backend Architecture Design ──────────────────────────────
         self._phase("Backend Architecture", "running")
         logger.info("[FS Phase 2] Designing backend architecture...")
@@ -147,6 +177,36 @@ class FullstackPipeline:
                 errors=errors,
                 elapsed_seconds=time.monotonic() - start_time,
             )
+
+        # ── Approval Gate 2: Backend Architecture ────────────────────────────
+        if self._settings.require_architecture_approval:
+            from core.architecture_approver import (
+                ArchitectureApprover,
+                ArchitecturePendingApprovalError,
+            )
+            approver = ArchitectureApprover(
+                interactive=self._interactive,
+                workspace=root_workspace,
+            )
+            try:
+                approved = approver.approve_backend_architecture(backend_blueprint)
+            except ArchitecturePendingApprovalError as e:
+                logger.info("Backend architecture pending human approval: %s", e)
+                return PipelineResult(
+                    success=False,
+                    workspace_path=root_workspace,
+                    errors=[str(e)],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
+            if not approved:
+                logger.info("Backend architecture rejected by user")
+                return PipelineResult(
+                    success=False,
+                    workspace_path=root_workspace,
+                    errors=["Backend architecture rejected by user"],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
+            logger.info("Backend architecture approved by user")
 
         # ── Phase 3: API Contract Generation ─────────────────────────────────
         self._phase("API Contract Generation", "running")
@@ -229,6 +289,7 @@ class FullstackPipeline:
         frontend_pipeline = FrontendPipeline(
             self._settings, self._llm, self._live,
             root_write_lock=self._root_write_lock,
+            interactive=self._interactive,
         )
 
         # Build the enriched prompt that carries all context for the backend
@@ -262,6 +323,7 @@ class FullstackPipeline:
                     start_time,
                     figma_url=figma_url,
                     frontend_workspace=frontend_workspace,
+                    backend_blueprint=backend_blueprint,
                 )
             )
             labels.append("frontend")

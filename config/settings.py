@@ -87,6 +87,7 @@ class Settings:
     figma_token: str = field(default_factory=lambda: os.environ.get("FIGMA_TOKEN", ""))
     allow_host_execution: bool = False  # Must be True to run without Docker
     require_plan_approval: bool = False  # If True, pause for human review after change planning
+    require_architecture_approval: bool = True  # If True, pause for human review at architecture checkpoints
     # Number of build attempts per tier checkpoint (1 initial + retries).
     # Increase for flaky compilers; decrease to fail-fast during development.
     build_checkpoint_retries: int = 3

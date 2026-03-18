@@ -11,8 +11,10 @@ from core.models import (
     AgentRole,
     APIContract,
     ComponentPlan,
+    ProductRequirements,
     TaskResult,
     UIComponent,
+    UIDesignSpec,
 )
 
 logger = logging.getLogger(__name__)
@@ -104,6 +106,8 @@ class ComponentGeneratorAgent(BaseAgent):
         component: UIComponent | None = context.task.metadata.get("component")
         plan: ComponentPlan | None = context.task.metadata.get("component_plan")
         contract: APIContract | None = context.task.metadata.get("api_contract")
+        design_spec: UIDesignSpec | None = context.task.metadata.get("design_spec")
+        requirements: ProductRequirements | None = context.task.metadata.get("requirements")
 
         comp_text = ""
         if component:
@@ -129,6 +133,26 @@ class ComponentGeneratorAgent(BaseAgent):
                 f"Routing: {plan.routing_solution}\n"
             )
 
+        # Design tokens for consistent styling
+        design_text = ""
+        if design_spec:
+            if design_spec.global_styles:
+                styles = ", ".join(f"{k}: {v}" for k, v in design_spec.global_styles.items())
+                design_text += f"Global styles: {styles}\n"
+            if design_spec.design_tokens:
+                import json as _json
+                tokens_str = _json.dumps(design_spec.design_tokens, indent=2)
+                if len(tokens_str) > 1000:
+                    tokens_str = tokens_str[:1000] + "..."
+                design_text += f"Design tokens:\n{tokens_str}\n"
+
+        # Business context from product requirements
+        req_text = ""
+        if requirements:
+            req_text = f"Product: {requirements.title}\n"
+            if requirements.features:
+                req_text += f"Features: {', '.join(requirements.features[:5])}\n"
+
         contract_text = ""
         if contract and component and component.api_calls:
             relevant = [
@@ -143,7 +167,7 @@ class ComponentGeneratorAgent(BaseAgent):
                 contract_text = f"Relevant API endpoints:\n{endpoint_lines}\n"
 
         return (
-            f"{comp_text}\n{plan_text}\n{contract_text}\n"
+            f"{req_text}{comp_text}\n{plan_text}\n{design_text}\n{contract_text}\n"
             "If a Figma Node ID is provided, use your tools to fetch the structural code skeleton FIRST. "
             "Hydrate the skeleton with the described API and state handlers, then generate "
             "the complete component source code and write it to disk using write_file."
