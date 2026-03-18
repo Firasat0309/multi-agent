@@ -63,6 +63,7 @@ class TaskType(str, Enum):
     GENERATE_COMPONENT = "generate_component"
     INTEGRATE_API = "integrate_api"
     MANAGE_STATE = "manage_state"
+    FIX_COMPONENT = "fix_component"
 
 
 class TaskStatus(str, Enum):

@@ -732,12 +732,15 @@ class CoderAgent(BaseAgent):
             "5. Preserve all existing imports, fields, and logic that are not related to the fix\n"
             "6. Output the COMPLETE corrected file — every line, from first import to last closing brace\n"
             "7. Output ONLY the code — no markdown fences, no explanations\n\n"
-            "TYPE MISMATCH FIX GUIDE (for 'incompatible types' errors):\n"
+            "TYPE MISMATCH FIX GUIDE (for 'incompatible types' / 'Expected N arguments' errors):\n"
             "- Check DEPENDENCY SIGNATURES above to see the exact return type of the method\n"
             "- If a method returns a model object (e.g. User), do NOT pass it where String is expected\n"
             "- To extract a String from a model, call the appropriate getter (e.g. user.getUsername())\n"
             "- If the error says 'X cannot be converted to Y', find the variable assignment and\n"
-            "  ensure the right-hand side type matches the left-hand side"
+            "  ensure the right-hand side type matches the left-hand side\n"
+            "- If the error says 'Expected N arguments, but got M', check the DEPENDENCY SIGNATURES\n"
+            "  for the exact parameter count of that function and fix the call to match\n"
+            "- For store functions like login(token), do NOT call login(user, token) — match exactly"
             f"{syntax_note}"
         )
 

@@ -706,7 +706,7 @@ class TestFrontendE2ETSXCompilation:
 
         # Fix agent should have been called
         create_calls = mocks["agent_manager"]._create_agent.call_args_list
-        fix_calls = [c for c in create_calls if c[0][0] == TaskType.FIX_CODE]
+        fix_calls = [c for c in create_calls if c[0][0] == TaskType.FIX_COMPONENT]
         assert len(fix_calls) >= 1
 
     @pytest.mark.anyio

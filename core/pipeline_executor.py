@@ -307,6 +307,20 @@ class PipelineExecutor:
                             "Tier %d: %d files failed lifecycle: %s",
                             tier.index, len(tier_failed), tier_failed,
                         )
+                        # Cascade failures to later-tier dependents immediately
+                        # so they don't hang waiting for a FAILED dependency.
+                        all_later = {
+                            p for ft in tiers[tier_idx + 1:] for p in ft.files
+                        }
+                        cascaded = engine.cascade_failures(scope=all_later)
+                        if cascaded:
+                            logger.warning(
+                                "Tier %d failures cascade-failed %d downstream file(s): %s",
+                                tier.index, len(cascaded), cascaded,
+                            )
+
+                    # Persist lifecycle state after each tier for resume support.
+                    self._save_lifecycle_state(engine)
 
                     if ck_def:
                         # Forward-reference stubs for later-tier files so this
@@ -480,6 +494,19 @@ class PipelineExecutor:
 
     # ── Tier lifecycle execution ─────────────────────────────────────────
 
+    def _save_lifecycle_state(self, engine: LifecycleEngine) -> None:
+        """Persist lifecycle state to disk for resume support.
+
+        Called after each tier completes so a ``--resume`` run can skip
+        files that already PASSED.  Non-critical — failures are logged
+        but do not interrupt the pipeline.
+        """
+        try:
+            state_path = str(self._am.repo.workspace / ".pipeline_state.json")
+            engine.save_state(state_path)
+        except Exception:
+            logger.debug("Failed to save lifecycle state (non-critical)", exc_info=True)
+
     async def _drain_reverify_queue(self, tier_files: set[str]) -> set[str]:
         """Atomically drain and return the subset of reverify-queue entries
         that belong to *tier_files*.
@@ -566,6 +593,17 @@ class PipelineExecutor:
         deferred_phases = {FilePhase.BUILDING, FilePhase.TESTING}
 
         while True:
+            # Cascade failures: if any tier file FAILED (timeout, retries
+            # exhausted), immediately fail all PENDING dependents rather
+            # than waiting for the staleness timeout.
+            cascaded = engine.cascade_failures(scope=tier_files)
+            if cascaded:
+                _last_progress = time.monotonic()
+                logger.warning(
+                    "[Tier %d] Cascade-failed %d dependent file(s): %s",
+                    tier.index, len(cascaded), cascaded,
+                )
+
             actionable = [
                 (path, phase) for path, phase in engine.get_actionable_files()
                 if path in tier_files and path not in in_flight
@@ -582,8 +620,10 @@ class PipelineExecutor:
                 t.add_done_callback(running_tasks.discard)
 
             if not running_tasks:
-                # No tasks running and nothing actionable — check whether any
-                # tier files are stuck PENDING (dependency deadlock).
+                # No tasks running and nothing actionable — cascade failures
+                # one more time, then check for true deadlocks.
+                engine.cascade_failures(scope=tier_files)
+
                 stuck = [
                     path for path in tier_files
                     if not engine.get_lifecycle(path).is_terminal

@@ -461,6 +461,50 @@ class LifecycleEngine:
 
         return actionable
 
+    def cascade_failures(self, scope: set[str] | None = None) -> list[str]:
+        """Fail any PENDING file whose dependency has FAILED.
+
+        When a file fails (timeout, retries exhausted, etc.), all files
+        that depend on it can never proceed.  This method propagates FAILED
+        status transitively through the dependency graph so dependents don't
+        wait for the staleness timeout.
+
+        Args:
+            scope: If provided, only check files within this set (e.g. a
+                tier's file set).  If None, check all files.
+
+        Returns:
+            List of file paths that were cascade-failed.
+        """
+        cascaded: list[str] = []
+        # Iterate until no more cascades are possible (transitive closure).
+        changed = True
+        while changed:
+            changed = False
+            for path, lc in self._lifecycles.items():
+                if lc.is_terminal or lc.phase != FilePhase.PENDING:
+                    continue
+                if scope is not None and path not in scope:
+                    continue
+                deps = self._deps.get(path, [])
+                failed_deps = [
+                    d for d in deps
+                    if d in self._lifecycles
+                    and self._lifecycles[d].phase == FilePhase.FAILED
+                ]
+                if failed_deps:
+                    logger.error(
+                        "[%s] Cascade FAILED — dependency %s failed",
+                        path, failed_deps[0],
+                    )
+                    lc.process_event(EventType.RETRIES_EXHAUSTED, {
+                        "reason": "dependency_failed",
+                        "failed_deps": failed_deps,
+                    })
+                    cascaded.append(path)
+                    changed = True  # re-scan for transitive dependents
+        return cascaded
+
     def all_terminal(self) -> bool:
         """True when every file has reached PASSED or FAILED."""
         return all(lc.is_terminal for lc in self._lifecycles.values())
@@ -503,3 +547,82 @@ class LifecycleEngine:
             "degraded_files": degraded,
             "tests_degraded_files": tests_degraded,
         }
+
+    # ── Persistence (resume support) ────────────────────────────────
+
+    def save_state(self, path: str) -> None:
+        """Persist lifecycle state to a JSON file for later resume.
+
+        Saves per-file phase, fix counts, and dependency map so a resumed
+        pipeline can skip files that already PASSED.
+        """
+        import json as _json
+
+        state = {
+            "version": 1,
+            "checkpoint_mode": self._checkpoint_mode,
+            "compiled": self._compiled,
+            "deps": {k: list(v) for k, v in self._deps.items()},
+            "skip_testing": sorted(self._skip_testing),
+            "files": {},
+        }
+        for path_key, lc in self._lifecycles.items():
+            state["files"][path_key] = {
+                "phase": lc.phase.value,
+                "review_fix_count": lc.review_fix_count,
+                "test_fix_count": lc.test_fix_count,
+                "build_fix_count": lc.build_fix_count,
+                "generation_task_type": lc.generation_task_type,
+            }
+
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump(state, f, indent=2)
+        logger.info("Saved lifecycle state to %s (%d files)", path, len(state["files"]))
+
+    @classmethod
+    def load_state(cls, path: str) -> "LifecycleEngine":
+        """Load lifecycle state from a JSON file saved by ``save_state()``.
+
+        Files that were PASSED or DEGRADED keep their terminal state so the
+        executor skips them.  Files that were FAILED or in intermediate phases
+        are reset to PENDING so they can be retried.
+
+        Returns a new LifecycleEngine with restored state.
+        """
+        import json as _json
+
+        with open(path, "r", encoding="utf-8") as f:
+            state = _json.load(f)
+
+        if state.get("version", 0) != 1:
+            raise ValueError(f"Unsupported state file version: {state.get('version')}")
+
+        file_paths = list(state["files"].keys())
+        file_deps = {k: list(v) for k, v in state.get("deps", {}).items()}
+
+        engine = cls(
+            file_paths=file_paths,
+            file_deps=file_deps,
+            compiled=state.get("compiled", False),
+            checkpoint_mode=state.get("checkpoint_mode", False),
+        )
+
+        # Restore terminal states; reset non-terminal to PENDING for retry
+        _KEEP_PHASES = {FilePhase.PASSED.value, FilePhase.DEGRADED.value}
+        for file_path, file_state in state["files"].items():
+            lc = engine.get_lifecycle(file_path)
+            saved_phase = file_state["phase"]
+            if saved_phase in _KEEP_PHASES:
+                # Skip directly to the terminal state
+                lc.phase = FilePhase(saved_phase)
+                logger.info("[Resume] %s — keeping %s", file_path, saved_phase)
+            else:
+                # Reset to PENDING for retry (covers FAILED, FIXING, etc.)
+                lc.phase = FilePhase.PENDING
+                logger.info("[Resume] %s — reset to PENDING (was %s)", file_path, saved_phase)
+
+        for skip_path in state.get("skip_testing", []):
+            if engine.has_file(skip_path):
+                engine.skip_testing(skip_path)
+
+        return engine

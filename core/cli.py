@@ -55,6 +55,7 @@ def cli(verbose: bool) -> None:
 @click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent")
 @click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
 @click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
+@click.option("--resume", is_flag=True, default=False, help="Resume from last checkpoint — skip files that already PASSED")
 def generate(
     prompt: str,
     workspace: str,
@@ -68,6 +69,7 @@ def generate(
     skip_reviewer: bool,
     skip_security: bool,
     skip_integration: bool,
+    resume: bool,
 ) -> None:
     """Generate a backend project from a natural language prompt."""
     try:
@@ -113,7 +115,7 @@ def generate(
         ))
         sys.exit(1)
 
-    result = asyncio.run(pipeline.run(prompt))
+    result = asyncio.run(pipeline.run(prompt, resume=resume))
     _display_result(result)
 
     sys.exit(0 if result.success else 1)

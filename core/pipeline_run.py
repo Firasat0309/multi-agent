@@ -55,8 +55,12 @@ class RunPipeline:
         self._live = live
         self._root_write_lock = root_write_lock
 
-    async def execute(self, user_prompt: str, start_time: float) -> PipelineResult:
+    async def execute(self, user_prompt: str, start_time: float, *, resume: bool = False) -> PipelineResult:
         from core.pipeline import PipelineResult
+
+        # ── Resume fast path ──────────────────────────────────────────────────
+        if resume:
+            return await self._execute_resume(user_prompt, start_time)
 
         errors: list[str] = []
 
@@ -73,7 +77,7 @@ class RunPipeline:
                 mcp_client = MCPClient(self._settings.mcp_server_command)
                 await mcp_client.initialize()
             except Exception as e:
-                logger.error("Failed to initialize MCP client in run pipeline: %e", e)
+                logger.error("Failed to initialize MCP client in run pipeline: %s", e)
                 mcp_client = None
 
         # ── Phase 1: Architecture ─────────────────────────────────────────────
@@ -392,3 +396,281 @@ class RunPipeline:
     def _fail_phase(self, name: str, msg: str) -> None:
         if self._live:
             self._live.fail_phase(name, msg)
+
+    async def _execute_resume(self, user_prompt: str, start_time: float) -> "PipelineResult":
+        """Resume a previous run from the last checkpoint.
+
+        Loads the saved lifecycle state and blueprint, skips Architecture +
+        Planning, and re-enters the Execution phase.  Files that already
+        PASSED are kept; FAILED / intermediate files are reset to PENDING.
+        """
+        from core.pipeline import PipelineResult
+        from core.state_machine import LifecycleEngine
+        from core.models import RepositoryBlueprint, FileBlueprint
+        import json as _json
+
+        workspace = self._settings.workspace_dir
+        state_path = workspace / ".pipeline_state.json"
+        blueprint_path = workspace / "file_blueprints.json"
+
+        # ── Validate resume prerequisites ─────────────────────────────────────
+        if not state_path.exists():
+            logger.error("No .pipeline_state.json found in %s — cannot resume", workspace)
+            return PipelineResult(
+                success=False,
+                workspace_path=workspace,
+                errors=["Cannot resume: no .pipeline_state.json found. Run without --resume first."],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+
+        if not blueprint_path.exists():
+            logger.error("No file_blueprints.json found — cannot resume")
+            return PipelineResult(
+                success=False,
+                workspace_path=workspace,
+                errors=["Cannot resume: no file_blueprints.json found."],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+
+        # ── Load blueprint ────────────────────────────────────────────────────
+        self._phase("Resume: Loading State", "running")
+        logger.info("[Resume] Loading lifecycle state from %s", state_path)
+
+        repo_manager = RepositoryManager(workspace)
+        if self._root_write_lock is not None:
+            repo_manager._root_write_lock = self._root_write_lock
+
+        try:
+            bp_raw = _json.loads(blueprint_path.read_text(encoding="utf-8"))
+            arch_path = workspace / "architecture.md"
+            arch_doc = arch_path.read_text(encoding="utf-8") if arch_path.exists() else ""
+            blueprint = RepositoryBlueprint(
+                name=bp_raw.get("name", "resumed"),
+                description=bp_raw.get("description", ""),
+                architecture_style=bp_raw.get("architecture_style", ""),
+                tech_stack=bp_raw.get("tech_stack", {}),
+                folder_structure=bp_raw.get("folder_structure", []),
+                file_blueprints=[
+                    FileBlueprint(
+                        path=f["path"],
+                        purpose=f.get("purpose", ""),
+                        depends_on=f.get("depends_on", []),
+                        exports=f.get("exports", []),
+                        language=f.get("language", ""),
+                        layer=f.get("layer", ""),
+                    )
+                    for f in bp_raw.get("files", [])
+                ],
+                architecture_doc=arch_doc,
+            )
+        except Exception as e:
+            logger.error("Failed to load blueprint: %s", e)
+            return PipelineResult(
+                success=False,
+                workspace_path=workspace,
+                errors=[f"Resume failed: could not load blueprint: {e}"],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+
+        lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
+
+        # ── Load lifecycle state ──────────────────────────────────────────────
+        try:
+            lifecycle_engine = LifecycleEngine.load_state(str(state_path))
+        except Exception as e:
+            logger.error("Failed to load lifecycle state: %s", e)
+            return PipelineResult(
+                success=False,
+                workspace_path=workspace,
+                errors=[f"Resume failed: could not load pipeline state: {e}"],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+
+        summary = lifecycle_engine.get_results_summary()
+        logger.info(
+            "[Resume] Loaded state: %d total, %d passed, %d failed, %d to retry",
+            summary["total_files"], summary["passed"], summary["failed"],
+            summary["total_files"] - summary["passed"] - summary.get("degraded", 0),
+        )
+
+        if summary["passed"] + summary.get("degraded", 0) == summary["total_files"]:
+            logger.info("[Resume] All files already passed — nothing to do")
+            self._complete_phase("Resume: Loading State")
+            return PipelineResult(
+                success=True,
+                workspace_path=workspace,
+                blueprint=blueprint,
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+
+        self._complete_phase("Resume: Loading State")
+
+        # ── Setup sandbox + agent manager ─────────────────────────────────────
+        self._phase("Code Generation & Review (Resume)", "running")
+
+        mcp_client: MCPClient | None = None
+        if self._settings.mcp_server_command:
+            try:
+                mcp_client = MCPClient(self._settings.mcp_server_command)
+                await mcp_client.initialize()
+            except Exception as e:
+                logger.error("Failed to initialize MCP client: %s", e)
+                mcp_client = None
+
+        repo_manager.initialize(blueprint)
+
+        sandbox = SandboxOrchestrator(self._settings)
+        try:
+            sb = await sandbox.setup(lang_profile)
+        except SandboxUnavailableError as e:
+            self._fail_phase("Code Generation & Review (Resume)", str(e))
+            return PipelineResult(
+                success=False,
+                workspace_path=workspace,
+                blueprint=blueprint,
+                errors=[str(e)],
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+
+        try:
+            run_dep_store = DependencyGraphStore(workspace)
+            run_embedding_store = EmbeddingStore(
+                persist_dir=self._settings.memory.chroma_persist_dir,
+                embedding_model=self._settings.memory.embedding_model,
+            )
+            repo_manager._embedding_store = run_embedding_store
+            asyncio.ensure_future(asyncio.to_thread(run_embedding_store._ensure_client))
+
+            event_bus = EventBus()
+            from core.task_engine import TaskGraph
+            # Build a minimal global graph (advisory tasks still need to run)
+            planner = PlannerAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
+            try:
+                _, global_graph = await planner.create_lifecycle_plan(blueprint, max_review_fixes=2)
+            except Exception:
+                logger.warning("[Resume] Could not re-create global graph — using empty graph")
+                global_graph = TaskGraph()
+
+            agent_manager = AgentManager(
+                settings=self._settings,
+                llm_client=self._llm,
+                repo_manager=repo_manager,
+                blueprint=blueprint,
+                live_console=self._live,
+                sandbox_manager=sb.manager,
+                build_sandbox_id=sb.build_id,
+                test_sandbox_id=sb.test_id,
+                dep_store=run_dep_store,
+                embedding_store=run_embedding_store,
+                event_bus=event_bus,
+                mcp_client=mcp_client,
+            )
+
+            # Recompute tiers
+            is_compiled = bool(lang_profile.build_command)
+            tier_scheduler = TierScheduler()
+            known_paths = {fb.path for fb in blueprint.file_blueprints}
+            file_deps = {
+                fb.path: [d for d in fb.depends_on if d in known_paths]
+                for fb in blueprint.file_blueprints
+            }
+            tiers = tier_scheduler.compute_tiers(
+                file_paths=[fb.path for fb in blueprint.file_blueprints],
+                file_deps=file_deps,
+            )
+
+            if is_compiled:
+                lifecycle_engine.checkpoint_mode = True
+
+            errors: list[str] = []
+            try:
+                from core.pipeline_executor import PipelineExecutor
+
+                executor = PipelineExecutor(
+                    agent_manager=agent_manager,
+                    settings=self._settings,
+                    lang_profile=lang_profile,
+                    event_bus=event_bus,
+                )
+
+                exec_result = await executor.execute(
+                    lifecycle_engine,
+                    global_graph,
+                    tiers=tiers,
+                    pipeline_def=GENERATE_PIPELINE.with_retries(
+                        self._settings.build_checkpoint_retries,
+                    ),
+                )
+            except Exception as e:
+                logger.exception("[Resume] Task execution failed")
+                self._fail_phase("Code Generation & Review (Resume)", str(e))
+                return PipelineResult(
+                    success=False,
+                    workspace_path=workspace,
+                    blueprint=blueprint,
+                    errors=[f"Resume execution failed: {e}"],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
+
+            self._complete_phase("Code Generation & Review (Resume)")
+
+            # ── Finalise ──────────────────────────────────────────────────────
+            try:
+                index_workspace(repo_manager, self._settings)
+            except Exception as e:
+                logger.warning("Indexing failed (non-critical): %s", e)
+
+            elapsed = time.monotonic() - start_time
+            stats = exec_result.get("stats", {})
+
+            checkpoints_passed = all(
+                cr.get("passed", True)
+                for cr in exec_result.get("checkpoint_results", [])
+            )
+            code_success = (
+                stats.get("failed", 0) == 0
+                and stats.get("blocked", 0) == 0
+                and stats.get("lifecycle_failed", 0) == 0
+                and checkpoints_passed
+            )
+            success = code_success
+
+            logger.info(
+                "[Resume] Pipeline %s | stats=%s | elapsed=%.1fs",
+                "SUCCEEDED" if success else "COMPLETED WITH ISSUES",
+                stats, elapsed,
+            )
+
+            token_cost = self._build_token_cost()
+            RunReporter(workspace).write_run_report(
+                prompt=user_prompt,
+                blueprint=blueprint,
+                task_graph=global_graph,
+                stats=stats,
+                elapsed=elapsed,
+                success=success,
+                code_success=code_success,
+                tests_passed=stats.get("lifecycle_tests_degraded", 0) == 0,
+                token_cost=token_cost,
+            )
+
+            return PipelineResult(
+                success=success,
+                workspace_path=workspace,
+                blueprint=blueprint,
+                task_stats=stats,
+                metrics=exec_result.get("metrics", {}),
+                errors=errors,
+                elapsed_seconds=elapsed,
+                token_cost=token_cost,
+            )
+        except Exception as flow_err:
+            logger.error("Unhandled error in resume pipeline: %s", flow_err)
+            raise
+        finally:
+            try:
+                await sandbox.teardown()
+            except Exception:
+                logger.warning("Error during sandbox teardown", exc_info=True)
+            if mcp_client:
+                await mcp_client.close()

@@ -102,6 +102,7 @@ TASK_AGENT_MAP: dict[TaskType, type[BaseAgent]] = {
     TaskType.PLAN_COMPONENTS: ComponentPlannerAgent,
     TaskType.BUILD_COMPONENT_DAG: ComponentDAGAgent,
     TaskType.GENERATE_COMPONENT: ComponentGeneratorAgent,
+    TaskType.FIX_COMPONENT: ComponentGeneratorAgent,
     TaskType.INTEGRATE_API: APIIntegrationAgent,
     TaskType.MANAGE_STATE: StateManagementAgent,
 }

@@ -407,6 +407,13 @@ class FrontendPipeline:
             # ── Phase 4.5: TSX Compilation Check with Fix-Retry ───────────────────
             self._phase("FE: TypeScript Compilation", "running")
             logger.info("[FE Phase 4.5] Running TypeScript compilation check...")
+
+            # npm install MUST run before tsc so that node_modules/@types/*
+            # packages are available.  Without this, tsc reports "Cannot find
+            # module 'react'" for every file — hundreds of phantom errors that
+            # waste fix-retry budget and corrupt component files.
+            await self._ensure_npm_install(workspace, phase_label="Phase 4.5")
+
             tsx_compiler = TSXCompiler()
             checkpoint_def = FRONTEND_PIPELINE.phases[0].checkpoint
             max_fix_retries = checkpoint_def.max_retries if checkpoint_def else 2
@@ -436,7 +443,7 @@ class FrontendPipeline:
                     fix_coros = []
                     _ast = ASTExtractor()
                     for file_path, file_errors in errors_by_file.items():
-                        fix_agent = agent_manager._create_agent(TaskType.FIX_CODE)
+                        fix_agent = agent_manager._create_agent(TaskType.FIX_COMPONENT)
 
                         # Find the component metadata for this file
                         fix_component = None
@@ -485,16 +492,20 @@ class FrontendPipeline:
                                 language="typescript",
                             )
 
+                        fix_metadata: dict = {
+                            "fix_trigger": "build",
+                            "build_errors": "\n".join(file_errors),
+                        }
+                        if fix_component:
+                            fix_metadata["component"] = fix_component
+
                         fix_ctx = AgentContext(
                             task=Task(
                                 task_id=10000 + retry * 100 + len(fix_coros),
-                                task_type=TaskType.FIX_CODE,
+                                task_type=TaskType.FIX_COMPONENT,
                                 file=file_path,
                                 description=f"Fix TSX compilation errors in {file_path}",
-                                metadata={
-                                    "fix_trigger": "build",
-                                    "build_errors": "\n".join(file_errors),
-                                },
+                                metadata=fix_metadata,
                             ),
                             blueprint=frontend_blueprint,
                             file_blueprint=fix_fb,
@@ -1261,6 +1272,43 @@ class FrontendPipeline:
 
         return fixed_total
 
+    async def _ensure_npm_install(self, workspace: Path, phase_label: str = "") -> bool:
+        """Run ``npm install`` if node_modules is absent or stale.
+
+        Returns True if install succeeded (or was already present).
+        This is intentionally idempotent — safe to call before both
+        Phase 4.5 and Phase 9.
+        """
+        node_modules = workspace / "node_modules"
+        if node_modules.is_dir() and any(node_modules.iterdir()):
+            logger.debug("[%s] node_modules already present — skipping npm install", phase_label)
+            return True
+
+        logger.info("[%s] Running npm install to populate node_modules...", phase_label)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "npm", "install", "--ignore-scripts",
+                cwd=str(workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=120.0)
+            if proc.returncode != 0:
+                logger.warning(
+                    "[%s] npm install failed (rc=%d): %s",
+                    phase_label, proc.returncode,
+                    stdout_bytes.decode(errors="replace")[:500],
+                )
+                return False
+            logger.info("[%s] npm install completed", phase_label)
+            return True
+        except FileNotFoundError:
+            logger.warning("[%s] npm not found on PATH", phase_label)
+            return False
+        except asyncio.TimeoutError:
+            logger.warning("[%s] npm install timed out after 120s", phase_label)
+            return False
+
     async def _run_final_build_check(
         self,
         workspace: Path,
@@ -1283,27 +1331,7 @@ class FrontendPipeline:
         Returns True if the build passes (or tools are unavailable).
         """
         # Step 1: npm install (required for tsc to resolve node_modules types)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "npm", "install", "--ignore-scripts",
-                cwd=str(workspace),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=120.0)
-            if proc.returncode != 0:
-                logger.warning(
-                    "[FE Phase 9] npm install failed (rc=%d): %s",
-                    proc.returncode, stdout_bytes.decode(errors="replace")[:500],
-                )
-                # Non-fatal — tsc may still work with partial deps
-            else:
-                logger.info("[FE Phase 9] npm install completed")
-        except FileNotFoundError:
-            logger.warning("[FE Phase 9] npm not found on PATH — skipping final build check")
-            return True
-        except asyncio.TimeoutError:
-            logger.warning("[FE Phase 9] npm install timed out after 120s")
+        await self._ensure_npm_install(workspace, phase_label="FE Phase 9")
 
         # Step 2: tsc --noEmit (full type check)
         tsx_compiler = TSXCompiler()
@@ -1333,7 +1361,7 @@ class FrontendPipeline:
 
             fix_coros = []
             for file_path, file_errors in errors_by_file.items():
-                fix_agent = agent_manager._create_agent(TaskType.FIX_CODE)
+                fix_agent = agent_manager._create_agent(TaskType.FIX_COMPONENT)
                 error_text = "\n".join(
                     f"{e.file}({e.line},{e.col}): error {e.code}: {e.message}"
                     for e in file_errors
@@ -1411,7 +1439,7 @@ class FrontendPipeline:
                 fix_ctx = AgentContext(
                     task=Task(
                         task_id=11000 + retry * 100 + len(fix_coros),
-                        task_type=TaskType.FIX_CODE,
+                        task_type=TaskType.FIX_COMPONENT,
                         file=file_path,
                         description=f"Fix build errors in {file_path}",
                         metadata=fix_metadata,
@@ -1671,6 +1699,7 @@ class FrontendPipeline:
             dev_deps = pkg.setdefault("devDependencies", {})
             dev_deps.setdefault("@types/node", "^20.0.0")
             dev_deps.setdefault("@types/react", "^18.0.0")
+            dev_deps.setdefault("@types/react-dom", "^18.0.0")
             dev_deps.setdefault("typescript", "^5.0.0")
             if requirements.tech_preferences.get("styling", "").lower() == "tailwind":
                 dev_deps.setdefault("tailwindcss", "^3.4.0")
@@ -1874,6 +1903,21 @@ class FrontendPipeline:
             )
             (workspace / "next.config.js").write_text(next_config, encoding="utf-8")
             logger.info("Wrote next.config.js")
+
+            # next-env.d.ts — referenced by tsconfig.json "include".
+            # Next.js auto-generates this on `next build` but it won't exist
+            # for standalone `tsc --noEmit` checks.  Without it, tsc cannot
+            # find the JSX global types and reports "Cannot find module 'react'"
+            # and "no interface 'JSX.IntrinsicElements' exists" for every file.
+            next_env_dts = (
+                '/// <reference types="next" />\n'
+                '/// <reference types="next/image-types/global" />\n'
+                "\n"
+                "// NOTE: This file should not be edited\n"
+                "// see https://nextjs.org/docs/app/building-your-application/configuring/typescript for more information.\n"
+            )
+            (workspace / "next-env.d.ts").write_text(next_env_dts, encoding="utf-8")
+            logger.info("Wrote next-env.d.ts")
 
             # Next.js App Router requires a root layout — without it, every
             # page.tsx triggers "doesn't have a root layout" and the build fails.

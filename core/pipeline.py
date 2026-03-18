@@ -50,8 +50,12 @@ class Pipeline:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    async def run(self, user_prompt: str) -> PipelineResult:
-        """Generate a new project from *user_prompt*."""
+    async def run(self, user_prompt: str, *, resume: bool = False) -> PipelineResult:
+        """Generate a new project from *user_prompt*.
+
+        If *resume* is True, load the lifecycle state from the previous run
+        and skip files that already PASSED.
+        """
         from core.pipeline_run import RunPipeline
 
         start_time = time.monotonic()
@@ -59,7 +63,7 @@ class Pipeline:
         fh = self._start_file_logging(self.settings.workspace_dir)
         try:
             return await RunPipeline(self.settings, self.llm, self._live).execute(
-                user_prompt, start_time,
+                user_prompt, start_time, resume=resume,
             )
         finally:
             self._stop_live()
