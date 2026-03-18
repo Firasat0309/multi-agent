@@ -15,8 +15,12 @@ from core.import_validator import ImportValidator
 # ── Fix 9: Tier merging ──────────────────────────────────────────────────────
 
 class TestTierMerging:
-    def test_linear_chain_merged(self):
-        """A→B→C→D should merge from 4 single-file tiers into 1."""
+    def test_linear_chain_not_merged(self):
+        """A→B→C→D keeps 4 separate tiers to preserve dependency order.
+
+        Merging was disabled because concurrent generation within a merged
+        tier prevented files from reading their dependencies' actual code.
+        """
         scheduler = TierScheduler()
         tiers = scheduler.compute_tiers(
             file_paths=["A.java", "B.java", "C.java", "D.java"],
@@ -27,12 +31,14 @@ class TestTierMerging:
                 "D.java": ["C.java"],
             },
         )
-        # All 4 single-file tiers should merge into 1
-        assert len(tiers) == 1
-        assert len(tiers[0].files) == 4
-        assert tiers[0].index == 0
+        # Each depth level stays as its own tier — no merging
+        assert len(tiers) == 4
+        assert tiers[0].files == ["A.java"]
+        assert tiers[1].files == ["B.java"]
+        assert tiers[2].files == ["C.java"]
+        assert tiers[3].files == ["D.java"]
 
-    def test_fan_out_not_merged(self):
+    def test_fan_out_same_tier(self):
         """A→{B,C} should keep B and C in their own tier (fan-out)."""
         scheduler = TierScheduler()
         tiers = scheduler.compute_tiers(
@@ -44,13 +50,12 @@ class TestTierMerging:
             },
         )
         # Tier 0: A (1 file), Tier 1: B+C (2 files, fan-out)
-        # The single-file tier 0 stays alone, tier 1 has 2 files
         assert len(tiers) == 2
         assert len(tiers[0].files) == 1
         assert len(tiers[1].files) == 2
 
     def test_mixed_linear_and_fanout(self):
-        """A→B→{C,D}→E should produce: [A,B], [C,D], [E]."""
+        """A→B→{C,D}→E should produce: [A], [B], [C,D], [E]."""
         scheduler = TierScheduler()
         tiers = scheduler.compute_tiers(
             file_paths=["A.java", "B.java", "C.java", "D.java", "E.java"],
@@ -62,12 +67,12 @@ class TestTierMerging:
                 "E.java": ["C.java", "D.java"],
             },
         )
-        # Before merging: [A], [B], [C,D], [E]
-        # After merging: [A,B] (two consecutive single-file tiers), [C,D], [E]
-        assert len(tiers) == 3
-        assert len(tiers[0].files) == 2  # A+B merged
-        assert len(tiers[1].files) == 2  # C,D fan-out
-        assert len(tiers[2].files) == 1  # E
+        # No merging: [A], [B], [C,D], [E]
+        assert len(tiers) == 4
+        assert len(tiers[0].files) == 1  # A
+        assert len(tiers[1].files) == 1  # B
+        assert len(tiers[2].files) == 2  # C,D fan-out
+        assert len(tiers[3].files) == 1  # E
 
     def test_no_deps_all_in_one_tier(self):
         """Files with no deps should all be in tier 0 (fan-out), no merging."""
@@ -103,8 +108,8 @@ class TestTierMerging:
         for i, tier in enumerate(tiers):
             assert tier.index == i
 
-    def test_merge_linear_tiers_static(self):
-        """Test the static merge method directly."""
+    def test_merge_linear_tiers_disabled(self):
+        """Merge is now a no-op — tiers pass through unchanged."""
         tiers = [
             Tier(0, ["A"]),
             Tier(1, ["B"]),
@@ -112,11 +117,9 @@ class TestTierMerging:
             Tier(3, ["D", "E"]),
             Tier(4, ["F"]),
         ]
-        merged = TierScheduler._merge_linear_tiers(tiers)
-        assert len(merged) == 3
-        assert merged[0].files == ["A", "B", "C"]
-        assert merged[1].files == ["D", "E"]
-        assert merged[2].files == ["F"]
+        result = TierScheduler._merge_linear_tiers(tiers)
+        assert len(result) == 5
+        assert result is tiers  # no-op returns same list
 
 
 # ── Fix 10: Virtual stub overlay ─────────────────────────────────────────────

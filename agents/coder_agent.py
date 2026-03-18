@@ -234,12 +234,15 @@ class CoderAgent(BaseAgent):
             "(check class names, method signatures, package paths)\n"
             "5. Follow the file blueprint EXACTLY: implement all listed exports\n\n"
 
-            "DEPENDENCY RULES:\n"
+            "DEPENDENCY RULES (CRITICAL — violations cause build failures):\n"
             "- Only import from files listed in 'depends_on' — never invent dependencies\n"
             "- Match the exact class/function names from the dependency's 'exports' list\n"
             "- Use the correct import path based on the dependency's file path\n"
-            "- When a dependency file is shown in 'Related Files', use its actual "
-            "method signatures (parameter types, return types)\n\n"
+            "- Related Files contains AST stubs showing the REAL API surface of "
+            "dependency files — these are extracted from actual generated source code\n"
+            "- Use EXACT method names from the AST stub — do NOT rename, abbreviate, "
+            "or 'improve' method names (e.g., stub shows 'registerUser' → call "
+            "'registerUser', NOT 'register')\n\n"
 
             "CODE QUALITY RULES:\n"
             "- Use dependency injection (constructor injection preferred)\n"
@@ -294,13 +297,24 @@ class CoderAgent(BaseAgent):
             f"Layer: {fb.layer}\n"
             f"Must export: {', '.join(fb.exports) if fb.exports else 'appropriate classes/functions'}\n\n"
             f"INSTRUCTIONS:\n"
-            f"1. First, read ALL dependency files listed in 'depends_on' to understand "
-            f"their exact interfaces, method signatures, and class names\n"
-            f"2. Search for symbol definitions if any dependency interface is unclear\n"
-            f"3. Write the COMPLETE, WORKING {profile.display_name} code via write_file\n\n"
+            f"1. Check the Related Files section below — dependency signatures are shown as "
+            f"AST stubs with EXACT method names, parameter types, and return types\n"
+            f"2. If a dependency IS shown in Related Files, use its EXACT method names — "
+            f"the stub shows the real generated code's API surface\n"
+            f"3. If a dependency is NOT shown (it may not exist yet), use read_file to "
+            f"check if it exists on disk before writing code\n"
+            f"4. Write the COMPLETE, WORKING {profile.display_name} code via write_file\n\n"
+            f"CRITICAL — CROSS-FILE CONSISTENCY:\n"
+            f"- AST stubs in Related Files show the REAL method signatures from generated "
+            f"dependency code. These are NOT placeholders — they are the actual API.\n"
+            f"- When calling methods on injected services/dependencies, copy the EXACT method "
+            f"names from the stub (e.g., if stub shows 'registerUser(RegisterRequest)', "
+            f"call 'registerUser(request)', NOT 'register(request)')\n"
+            f"- Match parameter types and return types exactly as shown in the stub\n\n"
             f"COMPLETENESS CHECKLIST (verify before calling write_file):\n"
             f"- Every export listed in the blueprint is defined\n"
             f"- Every import matches a real class/function from a dependency file\n"
+            f"- Every method call matches the EXACT signature from the dependency\n"
             f"- Every method has a full implementation (no empty bodies, no TODOs)\n"
             f"- All error cases are handled (try/catch, null checks, validation)\n"
             f"- The file is syntactically valid {profile.display_name}\n\n"
@@ -497,7 +511,12 @@ class CoderAgent(BaseAgent):
         # causing the fix agent to treat symptoms rather than the cause.
         if fix_trigger in ("build", "build_unattributed") and build_errors:
             filtered = extract_error_lines(build_errors, max_chars=_MAX_ERROR_CHARS)
-            issues_text = "Compilation/build errors to fix:\n" + filtered
+            issues_text = (
+                "Compilation/build errors to fix:\n" + filtered + "\n\n"
+                "If the error is 'cannot find symbol' for a method call on a dependency, "
+                "check the Related Files section above for the dependency's actual method "
+                "signatures and use the EXACT method name shown there."
+            )
         elif fix_trigger == "security" and security_errors:
             # Security vulnerabilities — already formatted with severity,
             # type, description, and remediation guidance.
@@ -603,18 +622,14 @@ class CoderAgent(BaseAgent):
         )
 
     def _format_fix_context(self, context: AgentContext) -> str:
-        """Minimal context for fix tasks — architecture + blueprint only.
+        """Minimal context for fix tasks — architecture + blueprint + dependencies.
 
-        For build fixes, related_files are excluded: the error is within the
-        file itself.
-
-        For security and integration fixes, related_files are INCLUDED
-        (truncated) because the fix often requires knowing the interface of
-        dependent files (e.g., DTO field names for parameterized queries,
-        controller signatures for integration test fixes).
+        Dependency files (AST stubs) are included for ALL fix triggers because:
+        - Build fixes often involve wrong method names on dependencies
+          (e.g., calling register() when the service has registerUser())
+        - Review fixes may flag incorrect API usage
+        - Security/integration fixes need DTO field names and interfaces
         """
-        fix_trigger: str = context.task.metadata.get("fix_trigger", "review")
-
         parts: list[str] = []
         if context.architecture_summary:
             parts.append(f"## Architecture\n{context.architecture_summary[:1000]}")
@@ -629,13 +644,9 @@ class CoderAgent(BaseAgent):
                 f"Exports: {', '.join(fb.exports) or 'TBD'}"
             )
 
-        # Security and integration fixes benefit from seeing dependency code.
-        # A SQL injection fix needs DTO field names; an integration test
-        # source fix needs the controller + service interface.
-        _TRIGGERS_NEEDING_DEPS = (
-            "security", "integration_test", "integration_test_code",
-        )
-        if fix_trigger in _TRIGGERS_NEEDING_DEPS and context.related_files:
+        # Include dependency files so the fix agent can see actual method
+        # signatures when fixing "cannot find symbol" or wrong-name errors.
+        if context.related_files:
             dep_sections: list[str] = []
             total_chars = 0
             max_dep_chars = 4000  # budget for dependency context

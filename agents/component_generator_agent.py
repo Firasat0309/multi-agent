@@ -46,6 +46,19 @@ _READ_TOOL = ToolDefinition(
     },
 )
 
+_LIST_TOOL = ToolDefinition(
+    name="list_files",
+    description="List files in a directory to discover store/lib file names.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "directory": {"type": "string", "description": "Directory path relative to workspace"},
+            "pattern": {"type": "string", "description": "Glob pattern (default: **)"},
+        },
+        "required": [],
+    },
+)
+
 
 class ComponentGeneratorAgent(BaseAgent):
     """Generates production-quality source code for a single UI component.
@@ -58,7 +71,7 @@ class ComponentGeneratorAgent(BaseAgent):
 
     @property
     def tools(self) -> list[ToolDefinition]:
-        return [_READ_TOOL, _WRITE_TOOL]
+        return [_READ_TOOL, _WRITE_TOOL, _LIST_TOOL]
 
     @property
     def system_prompt(self) -> str:
@@ -96,8 +109,10 @@ class ComponentGeneratorAgent(BaseAgent):
             "IMPORT RULES:\n"
             "- Use RELATIVE imports (e.g. '../ui/Button') for importing from other components\n"
             "  within the same src/ tree. Do NOT use @/ path aliases.\n"
-            "- For store imports, use relative paths (e.g. '../../store/authStore' or\n"
-            "  '../../store/useAuthStore') — NOT '@/store/authStore'.\n"
+            "- For store imports: FIRST use list_files with directory='src/store' to see\n"
+            "  which store files actually exist, then import from the EXACT file name found.\n"
+            "  If no store files exist yet, use the naming pattern from state_needs\n"
+            "  (e.g. state_needs=['auth'] → '../../store/authStore').\n"
             "- For API client imports, use relative paths (e.g. '../../lib/api').\n"
             "- This ensures all imports resolve correctly without tsconfig path aliases."
         )
@@ -166,8 +181,21 @@ class ComponentGeneratorAgent(BaseAgent):
                 )
                 contract_text = f"Relevant API endpoints:\n{endpoint_lines}\n"
 
+        # Build dependency reading instructions
+        dep_instructions = ""
+        if component and component.depends_on:
+            dep_instructions = (
+                "\nBEFORE generating code:\n"
+                f"1. Use read_file to read each dependency: {', '.join(component.depends_on)}\n"
+                "2. Check what each dependency ACTUALLY exports (exact names)\n"
+                "3. Only import exports that actually exist in the file\n"
+                "4. Do NOT assume a component exports sub-components (e.g. Card does NOT\n"
+                "   export CardHeader/CardTitle/CardContent unless you verify it does)\n\n"
+            )
+
         return (
             f"{req_text}{comp_text}\n{plan_text}\n{design_text}\n{contract_text}\n"
+            f"{dep_instructions}"
             "If a Figma Node ID is provided, use your tools to fetch the structural code skeleton FIRST. "
             "Hydrate the skeleton with the described API and state handlers, then generate "
             "the complete component source code and write it to disk using write_file."

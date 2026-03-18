@@ -72,7 +72,7 @@ class TestPipelineDefinition:
         mod_phase = ENHANCE_PIPELINE.phases[0]
         assert mod_phase.checkpoint is not None
         assert mod_phase.checkpoint.name == "build_verification"
-        assert mod_phase.checkpoint.max_retries == 4
+        assert mod_phase.checkpoint.max_retries == 2
 
     def test_custom_pipeline(self):
         pipeline = PipelineDefinition(
@@ -101,11 +101,11 @@ class TestPipelineDefinition:
     def test_file_task_def_defaults(self):
         ftd = FileTaskDef(TaskType.GENERATE_FILE)
         assert not ftd.review
-        assert ftd.max_review_fixes == 3
+        assert ftd.max_review_fixes == 2
         assert ftd.max_test_fixes == 3
 
     def test_checkpoint_def_defaults(self):
         cd = CheckpointDef()
         assert cd.name == "build_verification"
-        assert cd.max_retries == 4
+        assert cd.max_retries == 2
         assert cd.timeout == 180

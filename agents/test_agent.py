@@ -122,10 +122,14 @@ class TestAgent(BaseAgent):
             for dep_path in fb.depends_on:
                 dep_content = context.related_files.get(dep_path, "")
                 if dep_content and dep_path != fb.path:
-                    # Use only first 2000 chars — enough for class/method signatures
+                    # AST stubs (from context_builder) are already compact
+                    # and contain full method signatures — use them as-is.
+                    # Only truncate non-stub content (full source fallback).
+                    is_stub = dep_content.startswith("// AST stub")
+                    cap = 4000 if is_stub else 2000
                     dep_interfaces.append(
                         f"### {dep_path} (dependency — mock this interface)\n"
-                        f"```{profile.code_fence_name}\n{dep_content[:2000]}\n```"
+                        f"```{profile.code_fence_name}\n{dep_content[:cap]}\n```"
                     )
 
         # ── Build exports checklist ───────────────────────────────────────

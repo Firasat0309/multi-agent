@@ -68,7 +68,7 @@ class CheckpointDef:
     """
 
     name: str = "build_verification"
-    max_retries: int = 4
+    max_retries: int = 2
     timeout: int = 180
 
 
@@ -94,7 +94,7 @@ class FileTaskDef:
 
     task_type: TaskType
     review: bool = False
-    max_review_fixes: int = 3
+    max_review_fixes: int = 2
     max_test_fixes: int = 3
 
 
@@ -215,12 +215,12 @@ GENERATE_PIPELINE = PipelineDefinition(
                 FileTaskDef(
                     task_type=TaskType.GENERATE_FILE,
                     review=True,
-                    max_review_fixes=3,
+                    max_review_fixes=2,
                 ),
             ],
             checkpoint=CheckpointDef(
                 name="build_verification",
-                max_retries=4,
+                max_retries=2,
             ),
         ),
         Phase(
@@ -261,7 +261,7 @@ ENHANCE_PIPELINE = PipelineDefinition(
             ],
             checkpoint=CheckpointDef(
                 name="build_verification",
-                max_retries=4,
+                max_retries=2,
             ),
         ),
         Phase(

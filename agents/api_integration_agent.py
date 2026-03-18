@@ -80,7 +80,14 @@ class APIIntegrationAgent(BaseAgent):
             "- Handle loading, error, and success states in every hook.\n"
             "- Export all types and hooks from index barrel files.\n"
             "- Do NOT inline API URLs — always import from a central config/env variable.\n"
-            "- NEXT_PUBLIC_API_URL for Next.js; VITE_API_URL for Vite/Vue."
+            "- NEXT_PUBLIC_API_URL for Next.js; VITE_API_URL for Vite/Vue.\n\n"
+            "CROSS-FILE CONSISTENCY:\n"
+            "- Component files that make API calls are shown in 'Related Files' below.\n"
+            "- READ them to see what API functions/hooks they already import.\n"
+            "- Your generated api.ts and hooks MUST export the EXACT function names\n"
+            "  that components already import (e.g. if a component imports { login } from\n"
+            "  '../lib/api', you MUST export a function named 'login').\n"
+            "- Match the exact parameter and return types components expect."
         )
 
     def _build_prompt(self, context: AgentContext) -> str:

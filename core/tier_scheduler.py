@@ -137,41 +137,23 @@ class TierScheduler:
 
     @staticmethod
     def _merge_linear_tiers(tiers: list[Tier]) -> list[Tier]:
-        """Merge consecutive single-file tiers into combined tiers.
+        """NO-OP: tier merging is disabled to preserve cross-file consistency.
 
-        Adjacent tiers where *both* contain exactly 1 file are merged together.
-        Multi-file tiers (fan-out points) are never merged — they represent
-        genuine concurrency opportunities.
+        Previously, adjacent single-file tiers were merged so that a linear
+        chain like Model → Service → Controller would become one tier and
+        generate concurrently.  This caused cross-file method name mismatches:
+        Controller couldn't read Service's actual generated code because
+        Service hadn't been written to disk yet (they were generating in
+        parallel within the same tier).
 
-        Returns a new list with renumbered tier indices.
+        Keeping each dependency depth as its own tier ensures that when file B
+        depends on file A, A is fully generated (and its AST stub shows real
+        method signatures) before B starts generating.
+
+        The tradeoff is more build checkpoints, but each is fast for small
+        tiers (incremental compile), and correctness >> speed.
         """
-        if len(tiers) <= 1:
-            return tiers
-
-        merged: list[Tier] = []
-        i = 0
-        while i < len(tiers):
-            current = tiers[i]
-            if len(current) == 1:
-                # Start a run of single-file tiers
-                combined_files = list(current.files)
-                j = i + 1
-                while j < len(tiers) and len(tiers[j]) == 1:
-                    combined_files.extend(tiers[j].files)
-                    j += 1
-                merged.append(Tier(index=len(merged), files=combined_files))
-                i = j
-            else:
-                merged.append(Tier(index=len(merged), files=list(current.files)))
-                i += 1
-
-        if len(merged) < len(tiers):
-            logger.info(
-                "Merged %d single-file tiers into %d combined tiers",
-                len(tiers) - len(merged) + len([t for t in merged if len(t) > 1]),
-                len(merged),
-            )
-        return merged
+        return tiers
 
     def should_checkpoint(
         self,

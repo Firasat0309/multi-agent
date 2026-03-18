@@ -319,6 +319,26 @@ class FrontendPipeline:
                     ordered_components if tier_idx == 0 else []
                 )
 
+                # Collect already-generated dependency files from earlier tiers
+                # so components can see exact exports of their dependencies.
+                dep_files: dict[str, str] = {}
+                for comp in tier_components:
+                    for dep_name in (comp.depends_on or []):
+                        # Find the dependency component's file path
+                        dep_comp = next(
+                            (c for c in ordered_components if c.name == dep_name),
+                            None,
+                        )
+                        if dep_comp and dep_comp.file_path:
+                            dep_abs = workspace / dep_comp.file_path
+                            if dep_abs.exists() and dep_comp.file_path not in dep_files:
+                                try:
+                                    dep_files[dep_comp.file_path] = dep_abs.read_text(
+                                        encoding="utf-8", errors="replace"
+                                    )[:6000]
+                                except OSError:
+                                    pass
+
                 # Run all components within the same tier concurrently
                 tasks_coros = [
                     generator.execute(
@@ -337,6 +357,7 @@ class FrontendPipeline:
                                 },
                             ),
                             blueprint=frontend_blueprint,
+                            related_files=dep_files,
                         )
                     )
                     for i, comp in enumerate(tier_components)
@@ -413,8 +434,57 @@ class FrontendPipeline:
 
                     # Dispatch fix tasks for each affected file
                     fix_coros = []
+                    _ast = ASTExtractor()
                     for file_path, file_errors in errors_by_file.items():
                         fix_agent = agent_manager._create_agent(TaskType.FIX_CODE)
+
+                        # Find the component metadata for this file
+                        fix_component = None
+                        for c in ordered_components:
+                            if c.file_path == file_path:
+                                fix_component = c
+                                break
+
+                        # Collect AST stubs of imported dependencies so fix
+                        # agent can see correct method signatures / exports.
+                        related: dict[str, str] = {}
+                        broken_abs = workspace / file_path
+                        if broken_abs.exists():
+                            try:
+                                import posixpath as _posixpath
+                                content = broken_abs.read_text(encoding="utf-8", errors="replace")
+                                file_dir = _posixpath.dirname(file_path)
+                                for line in content.splitlines():
+                                    if "import " in line and "from " in line:
+                                        parts = line.split("from ")
+                                        if len(parts) > 1:
+                                            imp_path = parts[-1].strip().strip("'\"").strip(";")
+                                            if imp_path.startswith("."):
+                                                for ext in (".ts", ".tsx", "/index.ts", "/index.tsx"):
+                                                    candidate = _posixpath.normpath(
+                                                        _posixpath.join(file_dir, imp_path + ext)
+                                                    )
+                                                    abs_cand = workspace / candidate
+                                                    if abs_cand.exists():
+                                                        try:
+                                                            raw = abs_cand.read_text(encoding="utf-8", errors="replace")
+                                                            stub = _ast.extract_stub(candidate, raw, "typescript")
+                                                            related[candidate] = stub or raw[:2000]
+                                                        except OSError:
+                                                            pass
+                                                        break
+                            except OSError:
+                                pass
+
+                        fix_fb = None
+                        if fix_component:
+                            fix_fb = FileBlueprint(
+                                path=file_path,
+                                purpose=fix_component.description or fix_component.name,
+                                depends_on=fix_component.depends_on or [],
+                                language="typescript",
+                            )
+
                         fix_ctx = AgentContext(
                             task=Task(
                                 task_id=10000 + retry * 100 + len(fix_coros),
@@ -427,6 +497,8 @@ class FrontendPipeline:
                                 },
                             ),
                             blueprint=frontend_blueprint,
+                            file_blueprint=fix_fb,
+                            related_files=related if related else None,
                         )
                         fix_coros.append(fix_agent.execute(fix_ctx))
 
@@ -512,6 +584,20 @@ class FrontendPipeline:
                         workspace.parent / "backend",
                         backend_blueprint=backend_blueprint,
                     )
+                    # Collect component source that makes API calls so the
+                    # API agent sees exactly what functions components expect.
+                    api_related: dict[str, str] = {}
+                    for comp in ordered_components:
+                        if comp.api_calls:
+                            abs_path = workspace / comp.file_path
+                            if abs_path.exists():
+                                try:
+                                    api_related[comp.file_path] = abs_path.read_text(
+                                        encoding="utf-8", errors="replace"
+                                    )[:4000]
+                                except OSError:
+                                    pass
+
                     api_ctx = AgentContext(
                         task=Task(
                             task_id=9000,
@@ -532,6 +618,7 @@ class FrontendPipeline:
                             language="typescript",
                             layer="lib",
                         ),
+                        related_files=api_related if api_related else None,
                     )
                     api_result = await integrator.execute(api_ctx)
                     if api_result.success:
@@ -565,6 +652,43 @@ class FrontendPipeline:
                             component_plan.state_solution)
                 try:
                     state_agent = agent_manager._create_agent(TaskType.MANAGE_STATE)
+
+                    # Collect component source code so the state agent can see
+                    # what store methods/hooks components already expect.
+                    # This prevents name mismatches like fetchUser vs fetchMe.
+                    # Include components that have state_needs OR reference
+                    # stores/hooks in their source (covers both metadata and
+                    # code-level usage patterns).
+                    store_related: dict[str, str] = {}
+                    for comp in ordered_components:
+                        has_state_needs = bool(comp.state_needs)
+                        abs_path = workspace / comp.file_path
+                        if abs_path.exists():
+                            try:
+                                src = abs_path.read_text(encoding="utf-8", errors="replace")
+                                # Include if component declares state_needs OR
+                                # source references stores/hooks/context
+                                if has_state_needs or any(
+                                    kw in src for kw in (
+                                        "Store", "store", "useAuth", "useUser",
+                                        "useApp", "useUI", "useCart", "useProduct",
+                                        "useSession", "dispatch", "useSelector",
+                                        "useContext", "Provider",
+                                    )
+                                ):
+                                    store_related[comp.file_path] = src[:4000]
+                            except OSError:
+                                pass
+                    # Also include api.ts so the store can import from it
+                    api_path = workspace / "src/lib/api.ts"
+                    if api_path.exists():
+                        try:
+                            store_related["src/lib/api.ts"] = api_path.read_text(
+                                encoding="utf-8", errors="replace"
+                            )[:4000]
+                        except OSError:
+                            pass
+
                     state_ctx = AgentContext(
                         task=Task(
                             task_id=9001,
@@ -584,6 +708,7 @@ class FrontendPipeline:
                             language="typescript",
                             layer="store",
                         ),
+                        related_files=store_related,
                     )
                     state_result = await state_agent.execute(state_ctx)
                     if state_result.success:
@@ -726,14 +851,30 @@ class FrontendPipeline:
                     self._fail_phase("FE: Deployment", str(exc))
 
             async def _run_api_then_state_then_docs() -> None:
-                """Phase 5 → 6 → 7: API → State → Documentation (sequential).
+                """Phase 5 → 6 → 6.5 → 7: API → State → Store Import Fix → Docs.
 
                 State stores import from api.ts, so api.ts must exist first.
+                After stores are created, fix component imports that reference
+                store files by wrong name (e.g. '../../store/authStore' when
+                the actual file is 'useAuthStore.ts').
                 Documentation needs generated component + api.ts + store files
                 for accurate related_files context.
                 """
                 await _run_api_integration()
                 await _run_state_management()
+
+                # Phase 6.5: Reconcile store imports in components.
+                # Components are generated before stores (Phase 4 vs Phase 6),
+                # so they guess store file names.  Now that stores exist, fix
+                # any broken store import paths.
+                logger.info("[FE Phase 6.5] Reconciling store imports in components...")
+                store_fixed = self._auto_fix_imports(workspace, ordered_components)
+                if store_fixed:
+                    logger.info(
+                        "[FE Phase 6.5] Fixed %d store import(s) in components",
+                        store_fixed,
+                    )
+
                 await _run_documentation()
 
             _parallel_start = time.monotonic()
@@ -1899,7 +2040,11 @@ class FrontendPipeline:
                     name=name,
                     file_path=file_path,
                     component_type=layer,
-                    description=f"Auto-stub for missing dependency '{name}' (required by {implied_by})",
+                    description=(
+                        f"Reusable {layer} component '{name}' "
+                        f"(imported by {implied_by}). "
+                        f"Must export '{name}' as a named export."
+                    ),
                     layer=folder,
                 )
             )

@@ -26,9 +26,12 @@ class TestTierScheduler:
                 "service.java": ["repo.java"],
             },
         )
-        # Linear chain: all single-file tiers merge into one combined tier
-        assert len(tiers) == 1
-        assert tiers[0].files == ["model.java", "repo.java", "service.java"]
+        # Linear chain: each depth level is its own tier (merge disabled
+        # to preserve cross-file consistency)
+        assert len(tiers) == 3
+        assert tiers[0].files == ["model.java"]
+        assert tiers[1].files == ["repo.java"]
+        assert tiers[2].files == ["service.java"]
 
     def test_diamond_deps(self):
         tiers = self.scheduler.compute_tiers(

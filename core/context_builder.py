@@ -210,6 +210,8 @@ class ContextBuilder:
                 ))
 
         # ── Priority 2: direct blueprint dependencies (AST stubs) ────────────
+        # AST stubs include full method signatures (name, params, return type)
+        # which is exactly what the coder agent needs to match cross-file APIs.
         if file_bp:
             for dep_path in file_bp.depends_on:
                 content = self._read_file(dep_path)
@@ -219,7 +221,7 @@ class ContextBuilder:
                 checksum = file_index.checksum if file_index else ""
                 stub = _ast_extractor.extract_stub(dep_path, content, lang.name, checksum)
                 if stub is not None:
-                    body = f"// AST stub (signatures only)\n{stub}"
+                    body = f"// AST stub — use these EXACT method names and signatures\n{stub}"
                     logger.debug(
                         "AST stub for %s (%d→%d chars, %.0f%% reduction)",
                         dep_path, len(content), len(stub),
@@ -338,7 +340,18 @@ class ContextBuilder:
         return self._rank_architecture_review_files()
 
     def _rank_module_review_files(self, target_file: str) -> list[FileBlueprint]:
-        """Rank files for REVIEW_MODULE by closeness to ``target_file``."""
+        """Rank files for REVIEW_MODULE by closeness to ``target_file``.
+
+        When ``target_file`` is ``"*"`` (whole-project review), we must avoid
+        mixing backend and frontend files into the same context window —
+        the reviewer would flag Java code as being "in a TypeScript file."
+        Instead, pick the dominant language and include only those files.
+        """
+        # Whole-project review: focus on the primary language to avoid
+        # false "language mismatch" findings between BE and FE modules.
+        if target_file == "*":
+            return self._rank_module_review_by_language()
+
         target_dir = str(Path(target_file).parent)
         target_fb = self._find_blueprint(target_file)
         target_layer = target_fb.layer if target_fb else ""
@@ -360,6 +373,39 @@ class ContextBuilder:
 
         ranked = sorted(self.blueprint.file_blueprints, key=_score, reverse=True)
         return ranked[:_MAX_REVIEW_FILES]
+
+    def _rank_module_review_by_language(self) -> list[FileBlueprint]:
+        """For whole-project module reviews, group files by language and
+        return the largest language group so the reviewer checks cross-file
+        consistency within one language, not across BE/FE boundaries.
+        """
+        by_lang: dict[str, list[FileBlueprint]] = {}
+        for fb in self.blueprint.file_blueprints:
+            lang = fb.language or "unknown"
+            # Normalise: treat typescript/tsx as one group
+            if lang in ("tsx", "jsx"):
+                lang = "typescript"
+            by_lang.setdefault(lang, []).append(fb)
+
+        if not by_lang:
+            return self.blueprint.file_blueprints[:_MAX_REVIEW_FILES]
+
+        # Pick the largest language group (primary backend language)
+        primary_lang = max(by_lang, key=lambda k: len(by_lang[k]))
+        primary_files = by_lang[primary_lang]
+
+        # Within the primary language, prioritise by dependency depth:
+        # controllers/services first (they have cross-file calls to verify).
+        _LAYER_PRIORITY = {
+            "controller": 0, "service": 1, "repository": 2,
+            "model": 3, "dto": 4, "config": 5,
+        }
+
+        def _layer_score(fb: FileBlueprint) -> int:
+            return _LAYER_PRIORITY.get(fb.layer or "", 10)
+
+        primary_files.sort(key=_layer_score)
+        return primary_files[:_MAX_REVIEW_FILES]
 
     def _rank_architecture_review_files(self) -> list[FileBlueprint]:
         """Sample files proportionally across all architectural layers."""

@@ -95,7 +95,14 @@ class StateManagementAgent(BaseAgent):
             "- Do NOT duplicate API call logic — import from src/lib/api.ts.\n"
             "  Read the api.ts file first using read_file to see what functions are exported,\n"
             "  then import those exact function names in the store.\n"
-            "- Use RELATIVE imports for api.ts (e.g. '../lib/api'), not @/ aliases."
+            "- Use RELATIVE imports for api.ts (e.g. '../lib/api'), not @/ aliases.\n\n"
+            "CRITICAL — CROSS-FILE CONSISTENCY:\n"
+            "- Component files are shown in 'Related Files' section below.\n"
+            "- READ them carefully to see what store hooks and methods they already import.\n"
+            "- You MUST use the EXACT same method/hook names that components expect.\n"
+            "  For example, if a component does `const { fetchUser } = useAuthStore()`,\n"
+            "  your store MUST export a `fetchUser` method, NOT `fetchMe` or `getUser`.\n"
+            "- Match the exact state shape (property names) that components destructure."
         )
 
     def _build_prompt(self, context: AgentContext) -> str:
