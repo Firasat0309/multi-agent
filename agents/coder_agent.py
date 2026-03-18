@@ -345,9 +345,14 @@ class CoderAgent(BaseAgent):
         Only injects contract details when:
         1. An api_contract is present on the context (fullstack mode).
         2. The file being generated is a controller, handler, router, or route layer.
-        3. There are endpoints whose path resource matches the file name.
 
         This avoids polluting model/repository prompts with irrelevant contract noise.
+
+        Endpoint filtering uses a two-pass strategy so files like
+        ``UserAuthController.java`` still match ``/users`` endpoints:
+          Pass 1 — check if the file-stem word appears in the endpoint path or tags.
+          Pass 2 — fall back to all endpoints when no matches found (ensures the
+                   agent always sees the full contract for routing files).
         """
         fb = context.file_blueprint
         if not context.api_contract or not fb:
@@ -361,19 +366,32 @@ class CoderAgent(BaseAgent):
         if not ac.endpoints:
             return ""
 
-        # Filter to endpoints relevant to this file by matching the file's path
-        # stem against endpoint path segments (e.g. "UserController.java" → "user")
+        # Derive candidate keywords from the file stem by removing common routing
+        # suffixes and splitting on camelCase / underscores.  E.g.:
+        #   "UserAuthController.java" → {"userauth", "user", "auth"}
         import re as _re
-        file_stem = _re.sub(r"(controller|handler|router|route|resource|api)", "", Path(fb.path).stem, flags=_re.IGNORECASE).lower().strip("_-")
-
-        relevant = [
-            ep for ep in ac.endpoints
-            if not file_stem or file_stem in ep.path.lower() or any(
-                file_stem in tag.lower() for tag in ep.tags
-            )
-        ] or list(ac.endpoints)  # fall back to all endpoints if no match found
-
         import json as _json
+
+        raw_stem = _re.sub(
+            r"(controller|handler|router|route|resource|api)",
+            " ",
+            Path(fb.path).stem,
+            flags=_re.IGNORECASE,
+        )
+        # Split on camelCase boundaries and non-alphanumeric characters
+        words = {
+            w.lower()
+            for w in _re.split(r"(?<=[a-z])(?=[A-Z])|[^a-zA-Z0-9]+", raw_stem)
+            if len(w) > 1
+        }
+
+        def _matches(ep: "APIEndpoint") -> bool:
+            path_lower = ep.path.lower()
+            tags_lower = " ".join(ep.tags).lower()
+            return any(w in path_lower or w in tags_lower for w in words)
+
+        relevant = [ep for ep in ac.endpoints if _matches(ep)] or list(ac.endpoints)
+
         lines = [
             "API CONTRACT — implement these endpoints EXACTLY as specified:",
             f"  Base URL: {ac.base_url}",

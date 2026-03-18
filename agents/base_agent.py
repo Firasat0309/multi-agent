@@ -802,6 +802,7 @@ class BaseAgent(ABC):
         # Include API contract summary when available — critical for fullstack mode
         # so backend agents know the exact endpoint signatures they must implement.
         if context.api_contract:
+            import json as _json
             ac = context.api_contract
             contract_lines = [
                 f"## API Contract ({ac.title} v{ac.version})",
@@ -813,13 +814,11 @@ class BaseAgent(ABC):
                 contract_lines.append(f"  {ep.method} {ep.path}{auth} — {ep.description}")
                 if ep.request_schema:
                     try:
-                        import json as _json
                         contract_lines.append(f"    Request: {_json.dumps(ep.request_schema)}")
                     except Exception:
                         pass
                 if ep.response_schema:
                     try:
-                        import json as _json
                         contract_lines.append(f"    Response: {_json.dumps(ep.response_schema)}")
                     except Exception:
                         pass

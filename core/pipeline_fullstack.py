@@ -458,6 +458,8 @@ class FullstackPipeline:
         if not api_contract:
             return enriched_prompt
 
+        import json as _json
+
         lines = [
             enriched_prompt,
             "",
@@ -471,14 +473,12 @@ class FullstackPipeline:
             auth_note = " [auth required]" if ep.auth_required else ""
             lines.append(f"  {ep.method} {ep.path}{auth_note} — {ep.description}")
             if ep.request_schema:
-                import json as _json
                 try:
                     schema_str = _json.dumps(ep.request_schema, indent=4)
                     lines.append(f"    Request schema: {schema_str}")
                 except Exception:
                     lines.append(f"    Request schema: {ep.request_schema}")
             if ep.response_schema:
-                import json as _json
                 try:
                     schema_str = _json.dumps(ep.response_schema, indent=4)
                     lines.append(f"    Response schema: {schema_str}")
@@ -486,7 +486,6 @@ class FullstackPipeline:
                     lines.append(f"    Response schema: {ep.response_schema}")
 
         if api_contract.schemas:
-            import json as _json
             try:
                 schemas_str = _json.dumps(api_contract.schemas, indent=2)
                 lines.append("")
