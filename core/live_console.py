@@ -9,7 +9,9 @@ from typing import Any
 from rich.console import Console
 from rich.live import Live
 from rich.panel import Panel
+from rich.progress_bar import ProgressBar
 from rich.table import Table
+from rich.text import Text
 
 console = Console()
 
@@ -26,6 +28,9 @@ class LiveConsole:
         self._start_time: float = 0.0
         self._blueprint_info: dict[str, Any] = {}
         self._max_log_lines = 12
+        # Track when first task completes to calculate ETA
+        self._first_completion_time: float = 0.0
+        self._completions_at_first: int = 0
 
     def start(self) -> None:
         if not self._start_time:
@@ -75,11 +80,17 @@ class LiveConsole:
     def update_task(
         self, task_id: int, description: str, status: str, agent: str = ""
     ) -> None:
+        prev = self._tasks.get(task_id)
+        was_done = prev and prev["status"] in ("completed", "failed")
         self._tasks[task_id] = {
             "description": description,
             "status": status,
             "agent": agent,
         }
+        # Record the first completion timestamp for ETA calculation
+        if not was_done and status in ("completed", "failed") and not self._first_completion_time:
+            self._first_completion_time = time.monotonic()
+            self._completions_at_first = 1
         self._refresh()
 
     def log(self, message: str) -> None:
@@ -133,6 +144,12 @@ class LiveConsole:
         if self._blueprint_info:
             parts.append(self._render_blueprint())
 
+        # Progress bar (when tasks exist)
+        if self._tasks:
+            progress_renderable = self._render_progress()
+            if progress_renderable:
+                parts.append(progress_renderable)
+
         # Task table
         if self._tasks:
             parts.append(self._render_tasks())
@@ -182,6 +199,59 @@ class LiveConsole:
             table.add_row(icon, f"Phase {num}: {label}", status)
 
         return table
+
+    def _render_progress(self) -> Any | None:
+        """Render a progress bar with file counts and ETA."""
+        if not self._tasks:
+            return None
+
+        total = len(self._tasks)
+        done = sum(
+            1 for t in self._tasks.values()
+            if t["status"] in ("completed", "failed")
+        )
+        in_progress = sum(
+            1 for t in self._tasks.values()
+            if t["status"] == "in_progress"
+        )
+
+        if total == 0:
+            return None
+
+        pct = done / total
+        bar = ProgressBar(total=total, completed=done, width=40)
+
+        # ETA calculation: based on average time per completed task
+        eta_text = ""
+        if done > 0 and done < total and self._first_completion_time and self._start_time:
+            elapsed_since_first = time.monotonic() - self._first_completion_time
+            # Use time since first completion (more accurate than total time
+            # since the first tasks include setup overhead)
+            if done > 1 and elapsed_since_first > 0:
+                avg_per_task = elapsed_since_first / (done - 1)  # -1 because first_completion already counted
+                remaining = (total - done) * avg_per_task
+            else:
+                # Fallback: use total elapsed time
+                total_elapsed = time.monotonic() - self._start_time
+                avg_per_task = total_elapsed / done
+                remaining = (total - done) * avg_per_task
+
+            if remaining < 60:
+                eta_text = f"  ~{remaining:.0f}s remaining"
+            else:
+                mins = remaining / 60
+                eta_text = f"  ~{mins:.1f}m remaining"
+
+        status_parts = [f"[bold]{done}[/bold]/{total} files done"]
+        if in_progress:
+            status_parts.append(f"[yellow]{in_progress} running[/yellow]")
+        status_parts.append(f"[cyan]{pct:.0%}[/cyan]")
+        if eta_text:
+            status_parts.append(f"[dim]{eta_text}[/dim]")
+
+        label = Text.from_markup("  ".join(status_parts))
+        from rich.console import Group
+        return Group(Text(""), bar, label)
 
     def _render_blueprint(self) -> Panel:
         info = self._blueprint_info
