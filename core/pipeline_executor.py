@@ -957,6 +957,7 @@ class PipelineExecutor:
                 repo_index=self._am.repo.get_repo_index(),
                 dep_store=self._am._dep_store,
                 embedding_store=self._am._embedding_store,
+                api_contract=self._am._api_contract,
             )
             context = await asyncio.to_thread(context_builder.build, task)
         except Exception:
@@ -1399,6 +1400,7 @@ class PipelineExecutor:
                 repo_index=self._am.repo.get_repo_index(),
                 dep_store=self._am._dep_store,
                 embedding_store=self._am._embedding_store,
+                api_contract=self._am._api_contract,
             )
             context = await asyncio.to_thread(context_builder.build, task)
         except Exception:
@@ -1609,6 +1611,7 @@ class PipelineExecutor:
                 repo_index=self._am.repo.get_repo_index(),
                 dep_store=self._am._dep_store,
                 embedding_store=self._am._embedding_store,
+                api_contract=self._am._api_contract,
             )
             context = await asyncio.to_thread(context_builder.build, task)
         except Exception:

@@ -2094,3 +2094,445 @@ class TestBaseAgentToolTimeout:
         result = await agent._dispatch_tool(ctx, tc)
         assert result == "file content"
 
+
+# ── TaskDispatcher api_contract propagation tests ────────────────────────────
+
+
+class TestTaskDispatcherApiContract:
+    """Verify the api_contract is forwarded from AgentManager to ContextBuilder
+    in the main file-level execution path (task_dispatcher.py)."""
+
+    @pytest.mark.anyio
+    async def test_context_builder_receives_api_contract(self, sample_api_contract):
+        """ContextBuilder in _execute_task must receive the api_contract from AgentManager."""
+        from core.task_dispatcher import TaskDispatcher
+        from core.task_engine import TaskGraph
+        from core.models import TaskResult
+
+        am = MagicMock()
+        am.settings.max_concurrent_agents = 4
+        am._metrics = {
+            "tasks_completed": 0, "tasks_failed": 0,
+            "total_time": 0.0, "agent_metrics": {},
+        }
+        am._live = None
+        am._event_bus = None
+        am._embedding_store = None
+        am._file_locks = MagicMock()
+        am._file_locks.lock_for.return_value = None
+        am.repo = MagicMock()
+        am.blueprint = MagicMock()
+        am.blueprint.file_blueprints = []
+        am._dep_store = None
+        am._api_contract = sample_api_contract  # ← contract set on AgentManager
+
+        result_obj = TaskResult(success=True, output="ok")
+        agent_mock = MagicMock()
+        agent_mock.role = MagicMock()
+        agent_mock.role.value = "coder"
+        agent_mock.get_metrics.return_value = {}
+        agent_mock.execute = AsyncMock(return_value=result_obj)
+        am._create_agent.return_value = agent_mock
+
+        dispatcher = TaskDispatcher(am)
+        graph = TaskGraph()
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file="src/controller.py",
+            description="gen",
+        )
+        graph.add_task(task)
+
+        captured_kwargs: dict = {}
+
+        with patch("core.task_dispatcher.ContextBuilder") as MockCB:
+            # Capture kwargs passed to ContextBuilder constructor
+            def _capture_init(*args, **kwargs):
+                captured_kwargs.update(kwargs)
+                mock_instance = MagicMock()
+                mock_instance.build.return_value = MagicMock()
+                return mock_instance
+
+            MockCB.side_effect = _capture_init
+            with patch("core.task_dispatcher.asyncio.to_thread", new=AsyncMock(
+                side_effect=lambda fn, *a, **kw: fn(*a, **kw)
+            )):
+                await dispatcher.execute_graph(graph)
+
+        assert "api_contract" in captured_kwargs, \
+            "ContextBuilder must receive api_contract= from TaskDispatcher"
+        assert captured_kwargs["api_contract"] is sample_api_contract
+
+
+# ── PipelineExecutor checkpoint api_contract propagation tests ───────────────
+
+
+class TestPipelineExecutorCheckpointApiContract:
+    """Verify the api_contract is forwarded to ContextBuilder in all checkpoint paths
+    by checking the AgentContext received by the agent has the contract set."""
+
+    def _make_executor(self, api_contract=None):
+        from core.pipeline_executor import PipelineExecutor
+        from core.language import get_language_profile
+
+        am = MagicMock()
+        am._api_contract = api_contract
+        am.repo = MagicMock()
+        am.blueprint = MagicMock()
+        am.blueprint.file_blueprints = []
+        am._dep_store = None
+        am._embedding_store = None
+        am._metrics = {
+            "tasks_completed": 0, "tasks_failed": 0,
+            "total_time": 0.0, "agent_metrics": {},
+        }
+
+        lang = get_language_profile("python")
+        event_bus = MagicMock()
+
+        settings = MagicMock()
+        settings.skip_agents = []
+        settings.build_checkpoint_retries = 1
+
+        return PipelineExecutor(
+            agent_manager=am,
+            settings=settings,
+            lang_profile=lang,
+            event_bus=event_bus,
+        )
+
+    @pytest.mark.anyio
+    async def test_dispatch_fix_passes_api_contract(self, sample_api_contract, tmp_path):
+        """_dispatch_fix must build context with api_contract and pass it to CoderAgent."""
+        from core.models import TaskResult
+        executor = self._make_executor(api_contract=sample_api_contract)
+
+        # Set up repo to return a real workspace
+        executor._am.repo.workspace = tmp_path
+        executor._am.repo.get_repo_index.return_value = MagicMock(files=[], get_file=lambda p: None)
+
+        # Capture the context passed to agent.execute
+        received_ctx = []
+        result_ok = TaskResult(success=True, output="ok", files_modified=[])
+
+        async def _fake_execute(ctx):
+            received_ctx.append(ctx)
+            return result_ok
+
+        agent_mock = MagicMock()
+        agent_mock.role = MagicMock()
+        agent_mock.role.value = "coder"
+        agent_mock.get_metrics.return_value = {}
+        agent_mock.execute = _fake_execute
+        executor._am._create_agent.return_value = agent_mock
+
+        await executor._dispatch_fix(
+            "src/controller.py",
+            {"fix_trigger": "review"},
+            label="test",
+        )
+
+        assert received_ctx, "Expected agent.execute to be called"
+        assert received_ctx[0].api_contract is sample_api_contract
+
+    @pytest.mark.anyio
+    async def test_security_scan_passes_api_contract(self, sample_api_contract, tmp_path):
+        """_run_security_scan must build context with api_contract."""
+        from core.models import TaskResult
+        executor = self._make_executor(api_contract=sample_api_contract)
+        executor._am.repo.workspace = tmp_path
+        executor._am.repo.get_repo_index.return_value = MagicMock(files=[], get_file=lambda p: None)
+
+        received_ctx = []
+
+        async def _fake_execute(ctx):
+            received_ctx.append(ctx)
+            return TaskResult(success=True, output="ok", files_modified=[])
+
+        agent_mock = MagicMock()
+        agent_mock.role = MagicMock()
+        agent_mock.role.value = "security"
+        agent_mock.get_metrics.return_value = {}
+        agent_mock.execute = _fake_execute
+        executor._am._create_agent.return_value = agent_mock
+
+        await executor._run_security_scan()
+
+        assert received_ctx, "Expected agent.execute to be called"
+        assert received_ctx[0].api_contract is sample_api_contract
+
+    @pytest.mark.anyio
+    async def test_integration_test_agent_passes_api_contract(self, sample_api_contract, tmp_path):
+        """_run_integration_test_agent must build context with api_contract."""
+        from core.models import TaskResult
+        executor = self._make_executor(api_contract=sample_api_contract)
+        executor._am.repo.workspace = tmp_path
+        executor._am.repo.get_repo_index.return_value = MagicMock(files=[], get_file=lambda p: None)
+
+        received_ctx = []
+
+        async def _fake_execute(ctx):
+            received_ctx.append(ctx)
+            return TaskResult(success=True, output="ok", files_modified=[])
+
+        agent_mock = MagicMock()
+        agent_mock.role = MagicMock()
+        agent_mock.role.value = "integration_tester"
+        agent_mock.get_metrics.return_value = {}
+        agent_mock.execute = _fake_execute
+        executor._am._create_agent.return_value = agent_mock
+
+        await executor._run_integration_test_agent()
+
+        assert received_ctx, "Expected agent.execute to be called"
+        assert received_ctx[0].api_contract is sample_api_contract
+
+
+# ── DeployAgent health check path derivation tests ───────────────────────────
+
+
+class TestDeployAgentApiContract:
+    """Verify _detect_app_settings uses api_contract for health check path."""
+
+    def test_no_contract_uses_default_java(self):
+        from agents.deploy_agent import DeployAgent
+
+        bp = RepositoryBlueprint(
+            name="svc", description="", architecture_style="REST",
+            tech_stack={"language": "java", "framework": "spring"},
+        )
+        port, path = DeployAgent._detect_app_settings(bp, None)
+        assert port == 8080
+        assert path == "/actuator/health"
+
+    def test_contract_explicit_health_endpoint_used(self, sample_api_contract):
+        from agents.deploy_agent import DeployAgent
+
+        # Add an explicit health endpoint
+        contract = APIContract(
+            title="API",
+            base_url="/api/v1",
+            endpoints=[
+                APIEndpoint(path="/health", method="GET", description="Health check"),
+                APIEndpoint(path="/tasks", method="GET", description="List tasks"),
+            ],
+        )
+        bp = RepositoryBlueprint(
+            name="svc", description="", architecture_style="REST",
+            tech_stack={"language": "python", "framework": "fastapi"},
+        )
+        port, path = DeployAgent._detect_app_settings(bp, contract)
+        assert path == "/health"
+
+    def test_contract_no_health_uses_base_url(self):
+        from agents.deploy_agent import DeployAgent
+
+        contract = APIContract(
+            title="API",
+            base_url="/api/v1",
+            endpoints=[
+                APIEndpoint(path="/tasks", method="GET", description="List tasks"),
+            ],
+        )
+        bp = RepositoryBlueprint(
+            name="svc", description="", architecture_style="REST",
+            tech_stack={"language": "python", "framework": "fastapi"},
+        )
+        port, path = DeployAgent._detect_app_settings(bp, contract)
+        assert path == "/api/v1"
+
+    def test_contract_empty_endpoints_falls_back_to_default(self):
+        from agents.deploy_agent import DeployAgent
+
+        contract = APIContract(title="API", base_url="/api/v1", endpoints=[])
+        bp = RepositoryBlueprint(
+            name="svc", description="", architecture_style="REST",
+            tech_stack={"language": "go"},
+        )
+        port, path = DeployAgent._detect_app_settings(bp, contract)
+        assert path == "/health"  # go default
+
+
+# ── WriterAgent api_contract documentation tests ─────────────────────────────
+
+
+class TestWriterAgentApiContract:
+    """Verify _generate_api_docs uses api_contract as primary source."""
+
+    @pytest.mark.anyio
+    async def test_generate_api_docs_includes_contract_endpoint(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        from agents.writer_agent import WriterAgent
+
+        agent = WriterAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        mock_llm.generate = AsyncMock(return_value="# API Docs")
+
+        bp = RepositoryBlueprint(
+            name="test", description="", architecture_style="REST",
+            tech_stack={"language": "python"},
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_DOCS,
+            file="docs/API.md",
+            description="gen docs",
+        )
+        ctx = AgentContext(task=task, blueprint=bp, api_contract=sample_api_contract)
+
+        prompt_captured = []
+        original = agent._call_llm
+        async def _capture(prompt, **kwargs):
+            prompt_captured.append(prompt)
+            return "# docs"
+        agent._call_llm = _capture
+
+        await agent._generate_api_docs(bp, ctx)
+
+        assert prompt_captured, "Expected _call_llm to be called"
+        prompt = prompt_captured[0]
+        # Contract endpoints must appear in the prompt
+        assert "GET /tasks" in prompt
+        assert "POST /tasks" in prompt
+        # "document ALL" instruction must be present
+        assert "EVERY endpoint" in prompt or "document ALL" in prompt or "ALL of these" in prompt
+
+    @pytest.mark.anyio
+    async def test_generate_api_docs_no_contract_falls_back_to_controllers(
+        self, mock_llm, mock_repo_manager
+    ):
+        from agents.writer_agent import WriterAgent
+
+        agent = WriterAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+
+        bp = RepositoryBlueprint(
+            name="test", description="", architecture_style="REST",
+            tech_stack={"language": "python"},
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_DOCS,
+            file="docs/API.md",
+            description="gen docs",
+        )
+        # No api_contract — should still work using controller files
+        related = {"src/api/tasks_router.py": "def list_tasks(): pass"}
+        ctx = AgentContext(task=task, blueprint=bp, related_files=related)
+
+        prompt_captured = []
+        async def _capture(prompt, **kwargs):
+            prompt_captured.append(prompt)
+            return "# docs"
+        agent._call_llm = _capture
+
+        await agent._generate_api_docs(bp, ctx)
+
+        assert prompt_captured
+        prompt = prompt_captured[0]
+        assert "tasks_router.py" in prompt or "list_tasks" in prompt
+
+
+# ── TestAgent api_contract in prompt tests ────────────────────────────────────
+
+
+class TestAgentApiContractInPrompt:
+    """Verify TestAgent includes API contract in prompt for controller files."""
+
+    @pytest.mark.anyio
+    async def test_controller_file_prompt_includes_contract(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        from agents.test_agent import TestAgent
+
+        agent = TestAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+
+        bp = RepositoryBlueprint(
+            name="test", description="", architecture_style="REST",
+            tech_stack={"language": "python"},
+        )
+        fb = FileBlueprint(
+            path="src/controllers/task_controller.py",
+            purpose="Task HTTP controller",
+            layer="controller",
+            language="python",
+            exports=["TaskController"],
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_TEST,
+            file=fb.path,
+            description="gen tests",
+        )
+        ctx = AgentContext(
+            task=task,
+            blueprint=bp,
+            file_blueprint=fb,
+            related_files={fb.path: "class TaskController: pass"},
+            api_contract=sample_api_contract,
+        )
+
+        prompt_captured = []
+        async def _capture(prompt, **kwargs):
+            prompt_captured.append(prompt)
+            return "import pytest\ndef test_foo(): pass"
+        agent._call_llm = _capture
+
+        agent.repo.async_write_test_file = AsyncMock()
+        agent.terminal = None  # skip run
+
+        await agent.execute(ctx)
+
+        assert prompt_captured
+        prompt = prompt_captured[0]
+        assert "API CONTRACT" in prompt
+        assert "/tasks" in prompt
+
+    @pytest.mark.anyio
+    async def test_model_file_prompt_excludes_contract(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        from agents.test_agent import TestAgent
+
+        agent = TestAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+
+        bp = RepositoryBlueprint(
+            name="test", description="", architecture_style="REST",
+            tech_stack={"language": "python"},
+        )
+        fb = FileBlueprint(
+            path="src/models/task.py",
+            purpose="Task model",
+            layer="model",
+            language="python",
+            exports=["Task"],
+        )
+        task = Task(
+            task_id=2,
+            task_type=TaskType.GENERATE_TEST,
+            file=fb.path,
+            description="gen tests",
+        )
+        ctx = AgentContext(
+            task=task,
+            blueprint=bp,
+            file_blueprint=fb,
+            related_files={fb.path: "class Task: pass"},
+            api_contract=sample_api_contract,
+        )
+
+        prompt_captured = []
+        async def _capture(prompt, **kwargs):
+            prompt_captured.append(prompt)
+            return "import pytest\ndef test_foo(): pass"
+        agent._call_llm = _capture
+
+        agent.repo.async_write_test_file = AsyncMock()
+        agent.terminal = None
+
+        await agent.execute(ctx)
+
+        assert prompt_captured
+        # Model layer must NOT include the API contract
+        assert "API CONTRACT" not in prompt_captured[0]
+

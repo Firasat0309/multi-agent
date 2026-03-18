@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from agents.base_agent import BaseAgent
-from core.models import AgentContext, AgentRole, RepositoryBlueprint, TaskResult
+from core.models import AgentContext, AgentRole, APIContract, RepositoryBlueprint, TaskResult
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +42,10 @@ class DeployAgent(BaseAgent):
         blueprint = context.blueprint
         files_written: list[str] = []
 
-        # Determine app port and health endpoint from tech stack
-        app_port, health_path = self._detect_app_settings(blueprint)
+        # Determine app port and health endpoint from tech stack.
+        # When an API contract is available, try to derive a real health-check
+        # path from the contract endpoints rather than using a static default.
+        app_port, health_path = self._detect_app_settings(blueprint, context.api_contract)
 
         # Generate Dockerfile
         dockerfile = await self._generate_dockerfile(blueprint, app_port, health_path)
@@ -69,27 +71,61 @@ class DeployAgent(BaseAgent):
         )
 
     @staticmethod
-    def _detect_app_settings(blueprint: RepositoryBlueprint) -> tuple[int, str]:
-        """Detect the application port and health endpoint from the tech stack."""
+    def _detect_app_settings(
+        blueprint: RepositoryBlueprint,
+        api_contract: "APIContract | None" = None,
+    ) -> tuple[int, str]:
+        """Detect the application port and health endpoint from the tech stack.
+
+        When an ``api_contract`` is supplied the health-check path is derived
+        from the contract endpoints instead of a hardcoded default:
+
+        1. Use an explicit ``/health`` or ``/healthz`` endpoint if one is defined.
+        2. Otherwise use the base URL prefix (e.g. ``/api/v1``) so the probe
+           hits the API root rather than a path that may not exist.
+        3. Fall back to the language-specific default if no contract is present.
+
+        This prevents liveness/readiness probe 404s when the application does
+        not expose the hardcoded default path.
+        """
         tech = blueprint.tech_stack
         lang = tech.get("language", "").lower()
         framework = tech.get("framework", "").lower()
 
         if "java" in lang or "spring" in framework:
-            return 8080, "/actuator/health"
-        if "go" in lang:
-            return 8080, "/health"
-        if "typescript" in lang or "node" in lang or "express" in framework or "next" in framework or "react" in framework or "vue" in framework or "angular" in framework:
-            return 3000, "/health"
-        if "python" in lang:
-            if "django" in framework:
-                return 8000, "/health/"
-            return 8000, "/health"
-        if "rust" in lang:
-            return 8080, "/health"
-        if "csharp" in lang or "dotnet" in framework:
-            return 5000, "/health"
-        return 8080, "/health"
+            port, default_health = 8080, "/actuator/health"
+        elif "go" in lang:
+            port, default_health = 8080, "/health"
+        elif (
+            "typescript" in lang or "node" in lang
+            or any(kw in framework for kw in ("express", "next", "react", "vue", "angular"))
+        ):
+            port, default_health = 3000, "/health"
+        elif "python" in lang:
+            port = 8000
+            default_health = "/health/" if "django" in framework else "/health"
+        elif "rust" in lang:
+            port, default_health = 8080, "/health"
+        elif "csharp" in lang or "dotnet" in framework:
+            port, default_health = 5000, "/health"
+        else:
+            port, default_health = 8080, "/health"
+
+        if api_contract is None or not api_contract.endpoints:
+            return port, default_health
+
+        # Prefer an explicit health endpoint from the contract
+        for ep in api_contract.endpoints:
+            p = ep.path.lower()
+            if p in ("/health", "/healthz", "/ping", "/ready", "/readiness", "/liveness"):
+                return port, ep.path
+
+        # Use the contract base URL prefix as the health probe root
+        base = (api_contract.base_url or "").rstrip("/")
+        if base:
+            return port, base
+
+        return port, default_health
 
     async def _generate_dockerfile(
         self, blueprint: RepositoryBlueprint, app_port: int, health_path: str,
