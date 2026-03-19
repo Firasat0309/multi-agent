@@ -186,6 +186,7 @@ class BaseAgent(ABC):
             )
             return resp
 
+        _consecutive_nudges = 0  # track how many nudges fired in a row
         for iteration in range(max_iterations):
             response = await _llm_call_with_heartbeat(iteration)
             self._metrics["llm_calls"] += 1
@@ -276,14 +277,26 @@ class BaseAgent(ABC):
             # write_file nudge *before* executing tool calls — this prevents
             # runaway read_file / list_files loops that burn all iterations.
             target_file = context.file_blueprint.path if context.file_blueprint else None
+            # Check whether this response already includes a write_file call
+            # for the target — if so, let it execute instead of nudging.
+            _has_target_write = target_file and any(
+                tc.name == "write_file"
+                and self._normalize_path(tc.input.get("path", ""))
+                == self._normalize_path(target_file)
+                for tc in response.tool_calls
+            )
             if (
                 target_file
                 and iteration >= max_iterations // 2
                 and not self._path_in_written(target_file, files_written)
+                and not _has_target_write
+                and _consecutive_nudges < 2  # cap: after 2 nudges, let tools run
             ):
+                _consecutive_nudges += 1
                 logger.warning(
-                    "%s: iteration %d/%d with no write to %s — injecting write_file nudge",
+                    "%s: iteration %d/%d with no write to %s — injecting write_file nudge (%d/2)",
                     self.__class__.__name__, iteration, max_iterations, target_file,
+                    _consecutive_nudges,
                 )
                 messages.append({"role": "assistant", "content": response.raw_content})
                 # Supply a tool_result for every tool_use block so the
@@ -306,6 +319,8 @@ class BaseAgent(ABC):
                 ]
                 messages.append({"role": "user", "content": dummy_results})
                 continue
+            else:
+                _consecutive_nudges = 0  # reset when tools actually execute
 
             # Execute all tool calls in this response concurrently.
             # asyncio.gather preserves order, so tool_results aligns with
