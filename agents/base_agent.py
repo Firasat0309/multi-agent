@@ -271,6 +271,42 @@ class BaseAgent(ABC):
                 )
                 return self._parse_agentic_result(context, response.content, files_written)
 
+            # Budget guard: if we have used more than half the iteration
+            # budget without writing the target file, inject a forceful
+            # write_file nudge *before* executing tool calls — this prevents
+            # runaway read_file / list_files loops that burn all iterations.
+            target_file = context.file_blueprint.path if context.file_blueprint else None
+            if (
+                target_file
+                and iteration >= max_iterations // 2
+                and not self._path_in_written(target_file, files_written)
+            ):
+                logger.warning(
+                    "%s: iteration %d/%d with no write to %s — injecting write_file nudge",
+                    self.__class__.__name__, iteration, max_iterations, target_file,
+                )
+                messages.append({"role": "assistant", "content": response.raw_content})
+                # Supply a tool_result for every tool_use block so the
+                # conversation stays protocol-correct (orphaned tool_use
+                # blocks without matching results can cause API errors).
+                nudge_text = (
+                    f"WARNING: You have used {iteration + 1} of {max_iterations} iterations "
+                    f"and still have not written the target file '{target_file}'. "
+                    f"You MUST call write_file with path='{target_file}' on this turn. "
+                    f"Do NOT read more files or deliberate further — write the complete "
+                    f"component now using write_file."
+                )
+                dummy_results: list[dict] = [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tc.tool_use_id,
+                        "content": f"[skipped — budget guard] {nudge_text}",
+                    }
+                    for tc in response.tool_calls
+                ]
+                messages.append({"role": "user", "content": dummy_results})
+                continue
+
             # Execute all tool calls in this response concurrently.
             # asyncio.gather preserves order, so tool_results aligns with
             # the tool_use blocks in the assistant message.
@@ -303,9 +339,13 @@ class BaseAgent(ABC):
             # If the target file was just written, return immediately — unless
             # the code was detected as truncated, in which case keep going so
             # the model sees the warning and can rewrite with complete content.
-            has_truncation = any("TRUNCATED CODE DETECTED" in r.get("content", "") for r in tool_results)
+            has_quality_issue = any(
+                "TRUNCATED CODE DETECTED" in r.get("content", "")
+                or "STUB CODE DETECTED" in r.get("content", "")
+                for r in tool_results
+            )
             target_file = context.file_blueprint.path if context.file_blueprint else None
-            if target_file and self._path_in_written(target_file, files_written) and not has_truncation:
+            if target_file and self._path_in_written(target_file, files_written) and not has_quality_issue:
                 return self._parse_agentic_result(context, response.content, files_written)
 
         raise RuntimeError(
@@ -512,6 +552,47 @@ class BaseAgent(ABC):
             )
         return None
 
+    @staticmethod
+    def _detect_stub_methods(content: str, path: str) -> str | None:
+        """Check if written code has unimplemented method bodies (compiled languages only).
+
+        Returns a warning message if stub patterns are found, None otherwise.
+        Stubs compile successfully but produce non-functional code that wastes
+        the entire review → build → test cycle.
+        """
+        import re as _re
+        ext = path.rsplit(".", 1)[-1] if "." in path else ""
+        if ext not in ("java", "cs"):
+            return None
+
+        # Count methods with trivial bodies: return null/0/false, throw UnsupportedOperationException
+        stub_re = _re.compile(
+            r"(?:public|protected|private)\s+(?!class\b|interface\b|enum\b|static\s+final\b)"
+            r"\S+\s+\w+\s*\([^)]*\)\s*(?:throws\s+\S+\s*)?\{"
+            r"[^}]{0,60}\b(?:return\s+(?:null|0|false|"
+            r'"");|throw\s+new\s+(?:UnsupportedOperationException|NotImplementedException))'
+        )
+        # Abstract-style signatures (semicolon instead of body) in non-interface context
+        abstract_re = _re.compile(
+            r"(?:public|protected|private)\s+(?!static\s+final\b)\S+\s+\w+\s*\([^)]*\)\s*;"
+        )
+
+        stubs = stub_re.findall(content)
+        abstracts = abstract_re.findall(content)
+
+        # Only flag if multiple stubs found — a single return null might be valid
+        total = len(stubs) + len(abstracts)
+        if total >= 2:
+            return (
+                f"⚠ STUB CODE DETECTED: {total} method(s) in {path} have placeholder "
+                f"implementations (return null, return 0, throw UnsupportedOperationException, "
+                f"or method signatures ending with ';' instead of a body). "
+                f"EVERY method must have a FULL, WORKING implementation. "
+                f"Please call write_file again with the complete file where every method "
+                f"has real business logic, not stubs."
+            )
+        return None
+
     async def _tool_write_file(self, inp: dict) -> str:
         path = inp.get("path", "")
         content = inp.get("content", "")
@@ -528,6 +609,11 @@ class BaseAgent(ABC):
         if trunc_warning:
             logger.warning("Truncated code detected in %s", path)
             msg += f"\n{trunc_warning}"
+        # Detect stub/skeleton methods in compiled languages
+        stub_warning = self._detect_stub_methods(content, path)
+        if stub_warning:
+            logger.warning("Stub code detected in %s", path)
+            msg += f"\n{stub_warning}"
         # Relay broken-import warnings so the LLM can correct or accept them
         broken = getattr(self.repo, "_last_broken_imports", [])
         if broken:

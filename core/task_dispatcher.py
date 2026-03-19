@@ -125,7 +125,27 @@ class TaskDispatcher:
                     if live:
                         live.update_task(task.task_id, task.description, "completed")
                     return
-                task.metadata["review_errors"] = review_task.result.errors
+                # Filter module review errors to only those relevant to this
+                # file.  Without filtering, every per-file fix task receives the
+                # full cross-file error list, causing the LLM to either ignore
+                # errors about other files (returning identical content) or
+                # blindly apply fixes meant for a different file.
+                all_errors = review_task.result.errors or []
+                file_basename = task.file.rsplit("/", 1)[-1] if task.file else ""
+                file_stem = file_basename.rsplit(".", 1)[0] if file_basename else ""
+                # Use word-boundary regex to avoid false matches like
+                # "User" matching "CustomUserDetailsService".
+                import re as _re
+                stem_re = _re.compile(r"(?<![A-Za-z])" + _re.escape(file_stem) + r"(?![A-Za-z])") if file_stem else None
+                filtered = [
+                    e for e in all_errors
+                    if task.file in e
+                    or file_basename in e
+                    or (stem_re is not None and stem_re.search(e))
+                ] if file_basename else all_errors
+                # If no errors match this file specifically, pass all errors
+                # so the fix agent still has context to work with.
+                task.metadata["review_errors"] = filtered if filtered else all_errors
                 task.metadata["review_output"] = review_task.result.output
 
         # Per-file lock guards concurrent writes/reads to the same path.

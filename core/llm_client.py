@@ -303,6 +303,14 @@ class LLMClient:
                     f"more verbose logging."
                 )
             except CircuitOpenError as e:
+                if attempt < _max_attempts - 1:
+                    wait = self._circuit.recovery_timeout + 1
+                    logger.warning(
+                        "Circuit breaker OPEN on attempt %d/%d — waiting %.0fs for recovery",
+                        attempt + 1, _max_attempts, wait,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
                 raise LLMClientError(str(e)) from e
             except LLMRetryableError as e:
                 # Explicitly retryable (e.g. Gemini blocked/invalid function call)

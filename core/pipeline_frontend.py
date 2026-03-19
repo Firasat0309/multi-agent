@@ -1350,6 +1350,26 @@ class FrontendPipeline:
             ))
             return True
 
+        # Step 2.5: Run import auto-fix before the fix-retry loop.
+        # Phases 5-8 may have created new files (stores, API client) that
+        # resolve previously broken imports.  A quick path-rewrite pass
+        # can clear TS2307 "Cannot find module" errors cheaply.
+        if ordered_components:
+            import_fixed = self._auto_fix_imports(workspace, ordered_components)
+            if import_fixed:
+                logger.info(
+                    "[FE Phase 9] Auto-fixed %d import path(s) before fix-retry",
+                    import_fixed,
+                )
+                compile_result = await tsx_compiler.check(workspace)
+                if not compile_result.errors:
+                    logger.info("[FE Phase 9] Final build passed after import auto-fix")
+                    await event_bus.publish(AgentEvent(
+                        type=BusEventType.BUILD_PASSED,
+                        data={"checkpoint": "final_build"},
+                    ))
+                    return True
+
         # Step 3: Fix-retry loop
         for retry in range(max_retries):
             errors_by_file = compile_result.errors_by_file()
@@ -2063,6 +2083,9 @@ class FrontendPipeline:
                         "progressbar", "progress", "list", "table", "tabs"}
         _LAYOUT_KEYWORDS = {"layout", "header", "footer", "sidebar", "nav",
                              "navbar", "drawer", "panel"}
+        _FEATURE_KEYWORDS = {"form", "page", "view", "dialog", "wizard",
+                              "dashboard", "profile", "settings", "detail",
+                              "editor", "picker", "selector", "search"}
 
         referenced: dict[str, str] = {}  # name -> implied_by (first referrer)
         for comp in planned_components:
@@ -2074,12 +2097,27 @@ class FrontendPipeline:
         ghosts: list = []
         for name, implied_by in referenced.items():
             lower = name.lower()
+
+            # Infer the correct folder based on the referencing component's
+            # layer — a feature component that imports a ghost likely expects
+            # it in the same feature folder, not in shared/.
+            referrer = next(
+                (c for c in planned_components if c.name == implied_by), None,
+            )
+            referrer_layer = getattr(referrer, "layer", "") or ""
+
             if any(kw in lower for kw in _LAYOUT_KEYWORDS):
                 layer = "layout"
                 folder = "components/layout"
             elif any(kw in lower for kw in _UI_KEYWORDS):
                 layer = "ui"
                 folder = "components/ui"
+            elif (
+                any(kw in lower for kw in _FEATURE_KEYWORDS)
+                or "feature" in referrer_layer
+            ):
+                layer = "feature"
+                folder = "components/feature"
             else:
                 layer = "shared"
                 folder = "components/shared"
