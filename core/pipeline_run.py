@@ -14,7 +14,7 @@ from core.agent_manager import AgentManager
 from core.event_bus import EventBus
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient, LLMConfigError, calculate_cost
-from core.models import APIContract, TokenCost
+from core.models import APIContract, RepositoryBlueprint, TokenCost
 from core.run_reporter import RunReporter
 from core.sandbox_orchestrator import SandboxOrchestrator, SandboxUnavailableError
 from core.pipeline_definition import GENERATE_PIPELINE
@@ -50,12 +50,18 @@ class RunPipeline:
         live: LiveConsole | None,
         root_write_lock: asyncio.Lock | None = None,
         api_contract: APIContract | None = None,
+        interactive: bool = True,
+        skip_approval: bool = False,
+        prebuilt_blueprint: "RepositoryBlueprint | None" = None,
     ) -> None:
         self._settings = settings
         self._llm = llm
         self._live = live
         self._root_write_lock = root_write_lock
         self._api_contract = api_contract
+        self._interactive = interactive
+        self._skip_approval = skip_approval
+        self._prebuilt_blueprint = prebuilt_blueprint
 
     async def execute(self, user_prompt: str, start_time: float, *, resume: bool = False) -> PipelineResult:
         from core.pipeline import PipelineResult
@@ -83,52 +89,64 @@ class RunPipeline:
                 mcp_client = None
 
         # ── Phase 1: Architecture ─────────────────────────────────────────────
-        self._phase("Architecture Design", "running")
-        logger.info("[Phase 1] Designing architecture...")
-
         repo_manager = RepositoryManager(self._settings.workspace_dir)
         if self._root_write_lock is not None:
             repo_manager._root_write_lock = self._root_write_lock
-        architect = ArchitectAgent(
-            llm_client=self._llm,
-            repo_manager=repo_manager,
-            mcp_client=mcp_client,
-        )
 
-        # Timeout the architecture LLM call so the pipeline never hangs
-        # indefinitely if the API endpoint stalls.
         _arch_timeout = self._settings.phase_timeout_seconds
-        try:
-            blueprint = await asyncio.wait_for(
-                architect.design_architecture(user_prompt),
-                timeout=_arch_timeout,
+        architect: ArchitectAgent | None = None
+
+        if self._prebuilt_blueprint is not None:
+            # Blueprint already designed upstream (e.g. fullstack pipeline) —
+            # skip the LLM call to avoid producing a second, inconsistent blueprint.
+            blueprint = self._prebuilt_blueprint
+            logger.info(
+                "[Phase 1] Using prebuilt blueprint: %s (%d files) — skipping architecture LLM call",
+                blueprint.name, len(blueprint.file_blueprints),
             )
-        except asyncio.TimeoutError:
-            msg = (
-                f"Architecture design timed out after {_arch_timeout}s. "
-                "The LLM provider may be overloaded — try again later."
+        else:
+            self._phase("Architecture Design", "running")
+            logger.info("[Phase 1] Designing architecture...")
+
+            architect = ArchitectAgent(
+                llm_client=self._llm,
+                repo_manager=repo_manager,
+                mcp_client=mcp_client,
             )
-            logger.error(msg)
-            self._fail_phase("Architecture Design", msg)
-            return PipelineResult(
-                success=False,
-                workspace_path=self._settings.workspace_dir,
-                errors=[msg],
-                elapsed_seconds=time.monotonic() - start_time,
-            )
-        except (LLMConfigError, Exception) as e:
-            is_config = isinstance(e, LLMConfigError)
-            if not is_config:
-                logger.exception("Architecture design failed")
-            else:
-                logger.error(str(e))
-            self._fail_phase("Architecture Design", str(e))
-            return PipelineResult(
-                success=False,
-                workspace_path=self._settings.workspace_dir,
-                errors=[f"Architecture design failed: {e}"],
-                elapsed_seconds=time.monotonic() - start_time,
-            )
+
+            # Timeout the architecture LLM call so the pipeline never hangs
+            # indefinitely if the API endpoint stalls.
+            try:
+                blueprint = await asyncio.wait_for(
+                    architect.design_architecture(user_prompt),
+                    timeout=_arch_timeout,
+                )
+            except asyncio.TimeoutError:
+                msg = (
+                    f"Architecture design timed out after {_arch_timeout}s. "
+                    "The LLM provider may be overloaded — try again later."
+                )
+                logger.error(msg)
+                self._fail_phase("Architecture Design", msg)
+                return PipelineResult(
+                    success=False,
+                    workspace_path=self._settings.workspace_dir,
+                    errors=[msg],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
+            except (LLMConfigError, Exception) as e:
+                is_config = isinstance(e, LLMConfigError)
+                if not is_config:
+                    logger.exception("Architecture design failed")
+                else:
+                    logger.error(str(e))
+                self._fail_phase("Architecture Design", str(e))
+                return PipelineResult(
+                    success=False,
+                    workspace_path=self._settings.workspace_dir,
+                    errors=[f"Architecture design failed: {e}"],
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
 
         lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
         try:
@@ -145,6 +163,79 @@ class RunPipeline:
                 )
             self._complete_phase("Architecture Design")
             repo_manager.initialize(blueprint)
+
+            # ── Approval Gate: Backend Architecture ──────────────────────────
+            if self._settings.require_architecture_approval and not self._skip_approval:
+                from core.architecture_approver import (
+                    ArchitectureApprover,
+                    ArchitecturePendingApprovalError,
+                )
+                approver = ArchitectureApprover(
+                    interactive=self._interactive,
+                    workspace=self._settings.workspace_dir,
+                    live=self._live,
+                )
+                while True:
+                    try:
+                        approval = approver.approve_backend_architecture(blueprint)
+                    except ArchitecturePendingApprovalError as e:
+                        logger.info("Architecture pending human approval: %s", e)
+                        return PipelineResult(
+                            success=False,
+                            workspace_path=self._settings.workspace_dir,
+                            errors=[str(e)],
+                            elapsed_seconds=time.monotonic() - start_time,
+                        )
+                    if approval is True:
+                        logger.info("Backend architecture approved by user")
+                        break
+                    if approval is False:
+                        logger.info("Backend architecture rejected by user")
+                        return PipelineResult(
+                            success=False,
+                            workspace_path=self._settings.workspace_dir,
+                            blueprint=blueprint,
+                            errors=["Backend architecture rejected by user"],
+                            elapsed_seconds=time.monotonic() - start_time,
+                        )
+                    # approval is a str — user feedback for revision
+                    logger.info("User requested architecture revision: %s", approval)
+                    try:
+                        if architect is None:
+                            architect = ArchitectAgent(
+                                llm_client=self._llm,
+                                repo_manager=repo_manager,
+                                mcp_client=mcp_client,
+                            )
+                        blueprint = await asyncio.wait_for(
+                            architect.revise_architecture(
+                                user_prompt, blueprint, approval,
+                            ),
+                            timeout=_arch_timeout,
+                        )
+                        logger.info(
+                            "Blueprint revised: %s (%d files)",
+                            blueprint.name, len(blueprint.file_blueprints),
+                        )
+                        lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
+                        repo_manager.initialize(blueprint)
+                        if self._live:
+                            self._live.set_blueprint(
+                                name=blueprint.name,
+                                language=lang_profile.display_name,
+                                files=len(blueprint.file_blueprints),
+                                style=blueprint.architecture_style,
+                            )
+                    except Exception as exc:
+                        logger.exception("Architecture revision failed")
+                        errors.append(f"Architecture revision failed: {exc}")
+                        return PipelineResult(
+                            success=False,
+                            workspace_path=self._settings.workspace_dir,
+                            blueprint=blueprint,
+                            errors=errors,
+                            elapsed_seconds=time.monotonic() - start_time,
+                        )
 
             # ── Phase 2: Planning ─────────────────────────────────────────────────
             self._phase("Task Planning", "running")

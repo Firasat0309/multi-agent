@@ -62,7 +62,10 @@ class Pipeline:
         self._start_live()
         fh = self._start_file_logging(self.settings.workspace_dir)
         try:
-            return await RunPipeline(self.settings, self.llm, self._live).execute(
+            return await RunPipeline(
+                self.settings, self.llm, self._live,
+                interactive=self.interactive,
+            ).execute(
                 user_prompt, start_time, resume=resume,
             )
         finally:

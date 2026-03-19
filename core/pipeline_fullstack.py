@@ -331,6 +331,9 @@ class FullstackPipeline:
             backend_settings, self._llm, self._live,
             root_write_lock=self._root_write_lock,
             api_contract=api_contract,
+            interactive=self._interactive,
+            skip_approval=True,  # fullstack handles approval before this point
+            prebuilt_blueprint=backend_blueprint,  # reuse the blueprint designed in Phase 2
         )
         frontend_pipeline = FrontendPipeline(
             self._settings, self._llm, self._live,
