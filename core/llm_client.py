@@ -1018,29 +1018,19 @@ class LLMClient:
             ) from last_exc
         text = response.content.strip()
 
-        # Try to detect a tool-call JSON envelope
-        try:
-            start = text.find("{")
-            if start != -1:
-                data = json.loads(text[start:])
-                if "tool_call" in data:
-                    tc_data = data["tool_call"]
-                    tc = ToolCall(
-                        tool_use_id=f"gemini-{tc_data['name']}-0",
-                        name=tc_data["name"],
-                        input=tc_data.get("input", {}),
-                    )
-                    normalized = [{"type": "tool_use", "id": tc.tool_use_id,
-                                   "name": tc.name, "input": tc.input}]
-                    return LLMResponseWithTools(
-                        content="",
-                        tool_calls=[tc],
-                        stop_reason="tool_use",
-                        usage=response.usage,
-                        raw_content=normalized,
-                    )
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
+        # Try to detect a tool-call JSON envelope.
+        # Gemini may wrap it in markdown fences or add trailing text.
+        tc = self._extract_gemini_tool_call(text)
+        if tc is not None:
+            normalized = [{"type": "tool_use", "id": tc.tool_use_id,
+                           "name": tc.name, "input": tc.input}]
+            return LLMResponseWithTools(
+                content="",
+                tool_calls=[tc],
+                stop_reason="tool_use",
+                usage=response.usage,
+                raw_content=normalized,
+            )
 
         # Plain text response — end_turn
         return LLMResponseWithTools(
@@ -1050,6 +1040,132 @@ class LLMClient:
             usage=response.usage,
             raw_content=[{"type": "text", "text": text}],
         )
+
+    @staticmethod
+    def _extract_gemini_tool_call(text: str) -> ToolCall | None:
+        """Parse a tool_call JSON from Gemini's free-text response.
+
+        Handles several common Gemini output patterns:
+        - Clean JSON: ``{"tool_call": ...}``
+        - Fenced JSON: ```` ```json\\n{"tool_call": ...}\\n``` ````
+        - JSON with trailing explanation text
+        - Nested JSON with unescaped newlines in string values
+        """
+        import re as _re
+
+        # Strip markdown code fences if present
+        stripped = text.strip()
+        fence_match = _re.search(
+            r"```(?:json)?\s*\n?(.*?)```", stripped, _re.DOTALL,
+        )
+        if fence_match:
+            stripped = fence_match.group(1).strip()
+
+        # Strategy 1: try parsing from the first '{' (fast path)
+        start = stripped.find("{")
+        if start == -1:
+            return None
+
+        candidates = [stripped[start:]]
+
+        # Strategy 2: find balanced braces for the outermost object
+        # (handles trailing text after the JSON)
+        depth = 0
+        in_string = False
+        escape = False
+        end_pos = -1
+        for i, ch in enumerate(stripped[start:], start):
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                if in_string:
+                    escape = True
+                continue
+            if ch == '"' and not escape:
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end_pos = i + 1
+                    break
+        if end_pos > start and stripped[start:end_pos] != candidates[0]:
+            candidates.insert(0, stripped[start:end_pos])
+
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict) and "tool_call" in data:
+                    tc_data = data["tool_call"]
+                    return ToolCall(
+                        tool_use_id=f"gemini-{tc_data['name']}-0",
+                        name=tc_data["name"],
+                        input=tc_data.get("input", {}),
+                    )
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+
+        # Strategy 3: Gemini sometimes fails to escape newlines inside
+        # the "content" string value.  Try to fix common JSON issues.
+        for candidate in candidates:
+            try:
+                # Find "content": "..." and escape raw newlines/tabs inside
+                content_pat = _re.compile(
+                    r'"content"\s*:\s*"', _re.DOTALL,
+                )
+                m = content_pat.search(candidate)
+                if not m:
+                    continue
+                val_start = m.end()
+                # Walk forward to find the unescaped closing quote
+                i = val_start
+                fixed_parts = [candidate[:val_start]]
+                while i < len(candidate):
+                    ch = candidate[i]
+                    if ch == "\\" and i + 1 < len(candidate):
+                        fixed_parts.append(candidate[i:i+2])
+                        i += 2
+                        continue
+                    if ch == '"':
+                        break
+                    if ch == "\n":
+                        fixed_parts.append("\\n")
+                    elif ch == "\t":
+                        fixed_parts.append("\\t")
+                    elif ch == "\r":
+                        fixed_parts.append("\\r")
+                    else:
+                        fixed_parts.append(ch)
+                    i += 1
+                fixed = "".join(fixed_parts) + candidate[i:]
+                if fixed != candidate:
+                    data = json.loads(fixed)
+                    if isinstance(data, dict) and "tool_call" in data:
+                        tc_data = data["tool_call"]
+                        logger.warning(
+                            "Recovered Gemini tool call after fixing "
+                            "unescaped newlines in content field"
+                        )
+                        return ToolCall(
+                            tool_use_id=f"gemini-{tc_data['name']}-0",
+                            name=tc_data["name"],
+                            input=tc_data.get("input", {}),
+                        )
+            except (json.JSONDecodeError, KeyError, TypeError):
+                continue
+
+        # Log the failure for debugging
+        if '"tool_call"' in text or '"write_file"' in text:
+            logger.warning(
+                "Gemini response looks like a tool call but failed to parse: %s",
+                text[:300],
+            )
+        return None
 
     # ── Message format translation helpers ───────────────────────────────────
 

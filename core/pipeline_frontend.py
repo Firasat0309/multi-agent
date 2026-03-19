@@ -427,6 +427,7 @@ class FrontendPipeline:
                 )
             elif compile_result.errors:
                 # Fix-retry loop: group errors by file, dispatch FIX_CODE tasks
+                _prev_tsx_errors = len(compile_result.errors)
                 for retry in range(max_fix_retries):
                     logger.warning(
                         "[FE Phase 4.5] %d TSX error(s) — fix attempt %d/%d",
@@ -523,6 +524,17 @@ class FrontendPipeline:
                     if not compile_result.errors:
                         logger.info("[FE Phase 4.5] TSX compilation passed after %d fix(es)", retry + 1)
                         break
+
+                    # Early bailout if no progress was made
+                    _cur_tsx_errors = len(compile_result.errors)
+                    if _cur_tsx_errors >= _prev_tsx_errors:
+                        logger.warning(
+                            "[FE Phase 4.5] No progress: %d error(s) before, %d after — "
+                            "stopping fix loop early (attempt %d/%d)",
+                            _prev_tsx_errors, _cur_tsx_errors, retry + 1, max_fix_retries,
+                        )
+                        break
+                    _prev_tsx_errors = _cur_tsx_errors
                 else:
                     # Exhausted retries
                     tsx_build_passed = False
@@ -1371,6 +1383,7 @@ class FrontendPipeline:
                     return True
 
         # Step 3: Fix-retry loop
+        _prev_error_count = len(compile_result.errors)
         for retry in range(max_retries):
             errors_by_file = compile_result.errors_by_file()
             logger.warning(
@@ -1485,6 +1498,17 @@ class FrontendPipeline:
                     data={"checkpoint": "final_build"},
                 ))
                 return True
+
+            # Early bailout if no progress was made
+            _cur_error_count = len(compile_result.errors)
+            if _cur_error_count >= _prev_error_count:
+                logger.warning(
+                    "[FE Phase 9] No progress: %d error(s) before, %d after — "
+                    "stopping fix loop early (attempt %d/%d)",
+                    _prev_error_count, _cur_error_count, retry + 1, max_retries,
+                )
+                break
+            _prev_error_count = _cur_error_count
 
         # Exhausted retries
         metrics["final_build_errors"] = len(compile_result.errors)

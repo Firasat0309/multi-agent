@@ -418,6 +418,22 @@ class ComponentGeneratorAgent(BaseAgent):
         fixed_code = self._strip_fences(fixed_code)
 
         # ── Validate ──────────────────────────────────────────────────────
+        # Reject empty/minimal output — the LLM may have returned only an
+        # explanation or an incomplete fragment instead of the full file.
+        _min_size = min(50, len(current_content) // 2) if current_content else 50
+        if len(fixed_code.strip()) < _min_size:
+            logger.warning(
+                "Component fix rejected for %s: output too small (%d chars, "
+                "min %d) — LLM likely returned explanation instead of code",
+                file_path, len(fixed_code.strip()), _min_size,
+            )
+            return TaskResult(
+                success=True,
+                output=f"Fix for {file_path} skipped — LLM output too small",
+                files_modified=[],
+                metrics={"rewrite_rejected": True},
+            )
+
         original_size = len(current_content)
         if original_size > 0 and len(fixed_code) > original_size * self._MAX_CONTENT_GROWTH:
             logger.warning(

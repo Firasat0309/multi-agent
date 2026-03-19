@@ -316,17 +316,53 @@ class TestBudgetGuardNudge:
 
 @pytest.mark.anyio
 class TestEndTurnRecoveryCap:
-    """Verify end_turn recovery reminders are capped."""
+    """Verify end_turn recovery reminders are capped and auto-write works."""
 
-    async def test_end_turn_recovery_capped_at_2(self):
-        """After 2 end_turn reminders, the 3rd end_turn should just return."""
+    async def test_end_turn_auto_writes_after_reminders_exhausted(self):
+        """After 2 reminders, if LLM keeps returning code as text, auto-write it."""
         agent = _StubAgent()
         agent.max_iterations = 10
         ctx = _make_context("src/Foo.java")
 
-        # Every response is end_turn with text but no write_file
+        # Every response is end_turn with a code block but no write_file call
         responses = [
-            _end_turn_response("Here is the code:\n```java\npublic class Foo {}\n```")
+            _end_turn_response(
+                "Here is the code:\n```java\npublic class Foo {\n"
+                "    private String name;\n"
+                "    public String getName() { return name; }\n"
+                "}\n```"
+            )
+            for _ in range(5)
+        ]
+
+        call_count = 0
+        async def mock_generate(**kwargs):
+            nonlocal call_count
+            r = responses[call_count]
+            call_count += 1
+            return r
+
+        agent.llm.generate_with_tools = mock_generate
+
+        # Mock _tool_write_file to succeed
+        async def mock_write(inp):
+            return f"Written {len(inp.get('content', ''))} bytes to {inp['path']}"
+        agent._tool_write_file = mock_write
+
+        result = await agent.execute_agentic(ctx)
+        # 2 reminders + 1 auto-write = 3 calls total
+        assert call_count == 3
+        assert result.success
+
+    async def test_end_turn_no_code_block_returns_after_cap(self):
+        """If LLM returns end_turn with no code block, return after cap."""
+        agent = _StubAgent()
+        agent.max_iterations = 10
+        ctx = _make_context("src/Foo.java")
+
+        # end_turn with plain text (no code block)
+        responses = [
+            _end_turn_response("I'll create the Foo class with a name field.")
             for _ in range(5)
         ]
 
@@ -340,7 +376,54 @@ class TestEndTurnRecoveryCap:
         agent.llm.generate_with_tools = mock_generate
 
         result = await agent.execute_agentic(ctx)
-        # Should return after 3 calls (2 reminders, then 3rd returns)
+        # 2 reminders, then 3rd returns (no code block to auto-write)
         assert call_count == 3
-        # The result reflects the last response content
         assert result is not None
+
+
+@pytest.mark.anyio
+class TestLLMErrorResilience:
+    """Verify transient LLM errors are retried within the iteration budget."""
+
+    async def test_transient_error_retried_then_succeeds(self):
+        """A single LLM 500 error should not crash the agent."""
+        agent = _StubAgent()
+        agent.max_iterations = 6
+        ctx = _make_context("src/Foo.java")
+
+        call_count = 0
+        async def mock_generate(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise Exception("500 Internal error encountered.")
+            if call_count == 2:
+                return _tool_response("write_file", "src/Foo.java")
+            return _end_turn_response()
+
+        agent.llm.generate_with_tools = mock_generate
+
+        async def mock_dispatch(context, tc):
+            if tc.name == "write_file":
+                return f"Written 500 bytes to {tc.input.get('path', '')}"
+            return "ok"
+        agent._dispatch_tool = mock_dispatch
+
+        result = await agent.execute_agentic(ctx)
+        assert result.success
+        # 1 error + 1 write = 2 LLM calls
+        assert call_count == 2
+
+    async def test_three_consecutive_errors_raises(self):
+        """3 consecutive LLM errors should re-raise."""
+        agent = _StubAgent()
+        agent.max_iterations = 10
+        ctx = _make_context("src/Foo.java")
+
+        async def mock_generate(**kwargs):
+            raise Exception("500 Internal error encountered.")
+
+        agent.llm.generate_with_tools = mock_generate
+
+        with pytest.raises(Exception, match="500"):
+            await agent.execute_agentic(ctx)

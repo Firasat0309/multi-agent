@@ -193,56 +193,109 @@ class BaseAgent(ABC):
 
         target_file = context.file_blueprint.path if context.file_blueprint else None
 
+        _llm_errors = 0  # track consecutive LLM API errors
+        _MAX_LLM_ERRORS = 3  # give up after this many consecutive failures
+
         for iteration in range(max_iterations):
-            response = await _llm_call_with_heartbeat(iteration)
+            try:
+                response = await _llm_call_with_heartbeat(iteration)
+            except Exception as llm_exc:
+                # Transient LLM errors (500s, rate limits, blocked responses)
+                # should consume an iteration rather than crash the agent.
+                _llm_errors += 1
+                logger.warning(
+                    "%s: LLM call failed (iter %d, error %d/%d): %s",
+                    self.__class__.__name__, iteration,
+                    _llm_errors, _MAX_LLM_ERRORS, str(llm_exc)[:150],
+                )
+                if _llm_errors >= _MAX_LLM_ERRORS:
+                    raise  # give up after repeated failures
+                continue  # retry on next iteration
+            _llm_errors = 0  # reset on success
             self._metrics["llm_calls"] += 1
             self._metrics["tokens_used"] += sum(response.usage.values())
 
             # ── end_turn: LLM stopped without tool calls ──────────────────
             if response.stop_reason == "end_turn":
-                if (
+                _file_missing = (
                     target_file
                     and not self._path_in_written(target_file, files_written)
                     and response.content
                     and iteration < max_iterations - 1
-                    and _end_turn_reminders < _MAX_END_TURN_REMINDERS
-                ):
-                    _end_turn_reminders += 1
-                    logger.warning(
-                        "%s: end_turn reached but %s not yet written — "
-                        "injecting write_file reminder (%d/%d, iter %d)",
-                        self.__class__.__name__, target_file,
-                        _end_turn_reminders, _MAX_END_TURN_REMINDERS, iteration,
-                    )
-                    # Check if the LLM's text contains a code block it
-                    # could use as write_file content.
-                    code_hint = ""
+                )
+                if _file_missing:
+                    # Extract the longest code block from the text response.
+                    # Gemini frequently outputs file content as plain text
+                    # instead of calling write_file.
+                    import re as _re
                     text = response.content or ""
+                    code_block: str | None = None
                     if "```" in text:
-                        import re as _re
-                        code_blocks = _re.findall(
+                        blocks = _re.findall(
                             r"```(?:\w+)?\n(.*?)```", text, _re.DOTALL,
                         )
-                        if code_blocks:
-                            longest = max(code_blocks, key=len)
+                        if blocks:
+                            longest = max(blocks, key=len)
                             if len(longest.strip()) > 50:
-                                code_hint = (
-                                    f"\n\nIt looks like you already wrote the code as "
-                                    f"plain text. Use exactly that code as the content "
-                                    f"argument to write_file."
-                                )
-                    messages.append({"role": "assistant", "content": response.raw_content})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"You have not called write_file yet. "
-                            f"Please call write_file with path='{target_file}' "
-                            f"and the complete file content now. "
-                            f"Do NOT respond with plain text — use the write_file tool."
-                            f"{code_hint}"
-                        ),
-                    })
-                    continue
+                                code_block = longest
+
+                    if _end_turn_reminders < _MAX_END_TURN_REMINDERS:
+                        # First attempts: ask the LLM to use write_file.
+                        _end_turn_reminders += 1
+                        logger.warning(
+                            "%s: end_turn reached but %s not yet written — "
+                            "injecting write_file reminder (%d/%d, iter %d)",
+                            self.__class__.__name__, target_file,
+                            _end_turn_reminders, _MAX_END_TURN_REMINDERS,
+                            iteration,
+                        )
+                        code_hint = ""
+                        if code_block:
+                            code_hint = (
+                                "\n\nIt looks like you already wrote the code "
+                                "as plain text. Use exactly that code as the "
+                                "content argument to write_file."
+                            )
+                        messages.append({
+                            "role": "assistant",
+                            "content": response.raw_content,
+                        })
+                        messages.append({
+                            "role": "user",
+                            "content": (
+                                f"You have not called write_file yet. "
+                                f"Please call write_file with "
+                                f"path='{target_file}' and the complete file "
+                                f"content now. Do NOT respond with plain text "
+                                f"— use the write_file tool.{code_hint}"
+                            ),
+                        })
+                        continue
+
+                    # Reminders exhausted — auto-write the code block if
+                    # one was found, rather than wasting more iterations.
+                    if code_block:
+                        logger.warning(
+                            "%s: end_turn reminders exhausted for %s — "
+                            "auto-writing extracted code (%d chars, iter %d)",
+                            self.__class__.__name__, target_file,
+                            len(code_block), iteration,
+                        )
+                        write_result = await self._tool_write_file(
+                            {"path": target_file, "content": code_block},
+                        )
+                        if not write_result.startswith("Error"):
+                            files_written.append(target_file)
+                            return self._parse_agentic_result(
+                                context, response.content, files_written,
+                            )
+                        logger.warning(
+                            "%s: auto-write failed for %s: %s",
+                            self.__class__.__name__, target_file,
+                            write_result,
+                        )
+                    # No code block or write failed — fall through
+
                 return self._parse_agentic_result(context, response.content, files_written)
 
             # ── Truncation recovery ───────────────────────────────────────

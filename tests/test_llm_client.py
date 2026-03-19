@@ -117,3 +117,57 @@ class TestLLMClientRouting:
     def test_unsupported_provider_raises(self):
         with pytest.raises(ValueError):
             raise ValueError("Unsupported provider: broken")
+
+
+class TestExtractGeminiToolCall:
+    """Tests for _extract_gemini_tool_call — robust JSON parsing from Gemini."""
+
+    def test_clean_json(self):
+        text = '{"tool_call": {"name": "write_file", "input": {"path": "Foo.java", "content": "code"}}}'
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "write_file"
+        assert tc.input["path"] == "Foo.java"
+        assert tc.input["content"] == "code"
+
+    def test_json_in_markdown_fence(self):
+        text = '```json\n{"tool_call": {"name": "write_file", "input": {"path": "a.py", "content": "x"}}}\n```'
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "write_file"
+
+    def test_json_with_trailing_text(self):
+        text = (
+            '{"tool_call": {"name": "read_file", "input": {"path": "a.py"}}}'
+            "\n\nI'll read that file to understand the interface."
+        )
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "read_file"
+
+    def test_json_with_leading_text(self):
+        text = (
+            "Here's the tool call:\n"
+            '{"tool_call": {"name": "write_file", "input": {"path": "b.java", "content": "pkg;"}}}'
+        )
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "write_file"
+
+    def test_plain_text_returns_none(self):
+        text = "Here is the User.java class:\n\npackage com.example;\npublic class User {}"
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is None
+
+    def test_no_tool_call_key_returns_none(self):
+        text = '{"name": "write_file", "input": {}}'
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is None
+
+    def test_nested_braces_in_content(self):
+        java_code = 'public class Foo {\\n    private Map<String, List<Integer>> map = new HashMap<>();\\n}'
+        text = f'{{"tool_call": {{"name": "write_file", "input": {{"path": "Foo.java", "content": "{java_code}"}}}}}}'
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "write_file"
+        assert "HashMap" in tc.input["content"]
