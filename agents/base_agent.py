@@ -186,31 +186,36 @@ class BaseAgent(ABC):
             )
             return resp
 
-        _consecutive_nudges = 0  # track how many nudges fired in a row
+        _consecutive_nudges = 0  # track how many budget-guard nudges fired in a row
+        _end_turn_reminders = 0  # track end_turn recovery attempts
+        _MAX_END_TURN_REMINDERS = 2  # cap end_turn reminders to avoid loops
+        _MAX_CONSECUTIVE_NUDGES = 2  # cap budget-guard nudges before letting tools run
+
+        target_file = context.file_blueprint.path if context.file_blueprint else None
+
         for iteration in range(max_iterations):
             response = await _llm_call_with_heartbeat(iteration)
             self._metrics["llm_calls"] += 1
             self._metrics["tokens_used"] += sum(response.usage.values())
 
+            # ── end_turn: LLM stopped without tool calls ──────────────────
             if response.stop_reason == "end_turn":
-                # If the LLM returned text but never called write_file for the
-                # target file, inject a recovery turn rather than exiting.
-                # This handles the case where the model outputs code as plain
-                # text instead of routing it through the write_file tool.
-                target_file = context.file_blueprint.path if context.file_blueprint else None
                 if (
                     target_file
                     and not self._path_in_written(target_file, files_written)
                     and response.content
                     and iteration < max_iterations - 1
+                    and _end_turn_reminders < _MAX_END_TURN_REMINDERS
                 ):
+                    _end_turn_reminders += 1
                     logger.warning(
-                        "%s: end_turn reached but %s not yet written — injecting write_file reminder (iter %d)",
-                        self.__class__.__name__, target_file, iteration,
+                        "%s: end_turn reached but %s not yet written — "
+                        "injecting write_file reminder (%d/%d, iter %d)",
+                        self.__class__.__name__, target_file,
+                        _end_turn_reminders, _MAX_END_TURN_REMINDERS, iteration,
                     )
-                    # Check if the LLM's text response contains a code block
-                    # that looks like the file content — extract it so the
-                    # reminder can reference it directly.
+                    # Check if the LLM's text contains a code block it
+                    # could use as write_file content.
                     code_hint = ""
                     text = response.content or ""
                     if "```" in text:
@@ -219,7 +224,6 @@ class BaseAgent(ABC):
                             r"```(?:\w+)?\n(.*?)```", text, _re.DOTALL,
                         )
                         if code_blocks:
-                            # Use the longest code block as the likely file content
                             longest = max(code_blocks, key=len)
                             if len(longest.strip()) > 50:
                                 code_hint = (
@@ -241,10 +245,8 @@ class BaseAgent(ABC):
                     continue
                 return self._parse_agentic_result(context, response.content, files_written)
 
-            # ── Truncation recovery ────────────────────────────────────────
-            # When the model hits max_tokens without completing a tool call,
-            # it means the output was cut off mid-generation.  Ask it to
-            # continue rather than treating the partial response as final.
+            # ── Truncation recovery ───────────────────────────────────────
+            # Output was cut off mid-generation — ask the model to continue.
             if response.stop_reason in ("max_tokens", "length", "MAX_TOKENS") and not response.tool_calls:
                 if iteration < max_iterations - 1:
                     logger.warning(
@@ -265,43 +267,36 @@ class BaseAgent(ABC):
                     continue
 
             if not response.tool_calls:
-                # Model returned a non-tool_use stop that isn't "end_turn" — treat as done
+                # Non-tool_use stop that isn't "end_turn" — treat as done
                 logger.warning(
                     "%s agentic loop: unexpected stop_reason=%r with no tool calls (iteration %d)",
                     self.__class__.__name__, response.stop_reason, iteration,
                 )
                 return self._parse_agentic_result(context, response.content, files_written)
 
-            # Budget guard: if we have used more than half the iteration
-            # budget without writing the target file, inject a forceful
-            # write_file nudge *before* executing tool calls — this prevents
-            # runaway read_file / list_files loops that burn all iterations.
-            target_file = context.file_blueprint.path if context.file_blueprint else None
-            # Check whether this response already includes a write_file call
-            # for the target — if so, let it execute instead of nudging.
-            _has_target_write = target_file and any(
-                tc.name == "write_file"
-                and self._normalize_path(tc.input.get("path", ""))
-                == self._normalize_path(target_file)
-                for tc in response.tool_calls
+            # ── Budget guard: nudge toward write_file if past halfway ─────
+            # We always execute tool calls first so the LLM receives real
+            # results.  The nudge is appended as a text block *inside* the
+            # tool_results user message (not a separate user message) to
+            # maintain strict role alternation.
+            _has_write_call = any(
+                tc.name == "write_file" for tc in response.tool_calls
             )
+            nudge_text: str | None = None
             if (
                 target_file
                 and iteration >= max_iterations // 2
                 and not self._path_in_written(target_file, files_written)
-                and not _has_target_write
-                and _consecutive_nudges < 2  # cap: after 2 nudges, let tools run
+                and not _has_write_call
+                and _consecutive_nudges < _MAX_CONSECUTIVE_NUDGES
             ):
                 _consecutive_nudges += 1
                 logger.warning(
-                    "%s: iteration %d/%d with no write to %s — injecting write_file nudge (%d/2)",
+                    "%s: iteration %d/%d with no write to %s — "
+                    "scheduling write_file nudge (%d/%d)",
                     self.__class__.__name__, iteration, max_iterations, target_file,
-                    _consecutive_nudges,
+                    _consecutive_nudges, _MAX_CONSECUTIVE_NUDGES,
                 )
-                messages.append({"role": "assistant", "content": response.raw_content})
-                # Supply a tool_result for every tool_use block so the
-                # conversation stays protocol-correct (orphaned tool_use
-                # blocks without matching results can cause API errors).
                 nudge_text = (
                     f"WARNING: You have used {iteration + 1} of {max_iterations} iterations "
                     f"and still have not written the target file '{target_file}'. "
@@ -309,22 +304,16 @@ class BaseAgent(ABC):
                     f"Do NOT read more files or deliberate further — write the complete "
                     f"component now using write_file."
                 )
-                dummy_results: list[dict] = [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": tc.tool_use_id,
-                        "content": f"[skipped — budget guard] {nudge_text}",
-                    }
-                    for tc in response.tool_calls
-                ]
-                messages.append({"role": "user", "content": dummy_results})
-                continue
-            else:
-                _consecutive_nudges = 0  # reset when tools actually execute
+            elif _has_write_call or not (
+                target_file
+                and iteration >= max_iterations // 2
+                and not self._path_in_written(target_file, files_written)
+            ):
+                # Reset only when the LLM is actively writing or the nudge
+                # condition no longer applies (before halfway, or file written).
+                _consecutive_nudges = 0
 
-            # Execute all tool calls in this response concurrently.
-            # asyncio.gather preserves order, so tool_results aligns with
-            # the tool_use blocks in the assistant message.
+            # Execute all tool calls concurrently.
             async def _run_one(tc: ToolCall) -> str:
                 return await self._dispatch_tool(context, tc)
 
@@ -347,7 +336,12 @@ class BaseAgent(ABC):
                     "content": result,
                 })
 
-            # Extend the conversation: assistant turn (with tool_use blocks) + user turn (results)
+            # Append nudge as a text block inside the same user message
+            # to maintain strict assistant/user role alternation.
+            if nudge_text:
+                tool_results.append({"type": "text", "text": nudge_text})
+
+            # Extend the conversation: assistant turn + user turn (results + optional nudge)
             messages.append({"role": "assistant", "content": response.raw_content})
             messages.append({"role": "user", "content": tool_results})
 
@@ -358,8 +352,8 @@ class BaseAgent(ABC):
                 "TRUNCATED CODE DETECTED" in r.get("content", "")
                 or "STUB CODE DETECTED" in r.get("content", "")
                 for r in tool_results
+                if "content" in r  # skip text blocks
             )
-            target_file = context.file_blueprint.path if context.file_blueprint else None
             if target_file and self._path_in_written(target_file, files_written) and not has_quality_issue:
                 return self._parse_agentic_result(context, response.content, files_written)
 
@@ -375,11 +369,30 @@ class BaseAgent(ABC):
         return posixpath.normpath(p)
 
     @staticmethod
-    def _path_in_written(target: str, written: list[str]) -> bool:
-        """Check whether *target* appears in *written* using normalized comparison."""
+    def _paths_match(a: str, b: str) -> bool:
+        """Check whether two paths refer to the same file.
+
+        Handles the common case where the LLM uses an absolute workspace path
+        (e.g. ``/home/user/project/src/Foo.java``) while the blueprint stores
+        a relative path (``src/Foo.java``).  We normalise both and, if they
+        still differ, check whether the shorter path is a suffix of the longer
+        one (separated on a ``/`` boundary so ``BarFoo.java`` does not match
+        ``Foo.java``).
+        """
         import posixpath
-        norm_target = posixpath.normpath(target)
-        return any(posixpath.normpath(w) == norm_target for w in written)
+        na = posixpath.normpath(a)
+        nb = posixpath.normpath(b)
+        if na == nb:
+            return True
+        # Suffix check: "src/Foo.java" matches "/workspace/src/Foo.java"
+        # Require a "/" boundary to avoid false positives.
+        shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+        return longer.endswith("/" + shorter)
+
+    @classmethod
+    def _path_in_written(cls, target: str, written: list[str]) -> bool:
+        """Check whether *target* appears in *written* using normalized comparison."""
+        return any(cls._paths_match(target, w) for w in written)
 
     def _parse_agentic_result(
         self,
@@ -769,11 +782,12 @@ class BaseAgent(ABC):
                 f"LLM output truncated (stop_reason={response.stop_reason!r}), "
                 f"requesting continuation {continuation_count}/{self._MAX_CONTINUATIONS}"
             )
-            # Show more trailing context so the LLM can reliably find
-            # the cut-off point and avoid re-emitting class/method headers.
-            tail_chars = min(600, len(content))
+            # Show trailing context so the LLM can find the cut-off point.
+            # We intentionally omit the full original prompt to avoid
+            # ballooning the context on each continuation — the system
+            # prompt already provides enough background.
+            tail_chars = min(800, len(content))
             continuation_prompt = (
-                f"{user_prompt}\n\n"
                 f"IMPORTANT: Your previous response was cut off mid-way. "
                 f"Here is the end of what you wrote (last {tail_chars} chars):\n"
                 f"```\n{content[-tail_chars:]}\n```\n"
