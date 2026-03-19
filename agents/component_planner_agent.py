@@ -72,7 +72,8 @@ class ComponentPlannerAgent(BaseAgent):
             "- Preserve exact `figma_node_id` strings if the spec lists them, otherwise null.\n"
             "- All components must have explicit file_path with correct extension (.tsx/.vue).\n"
             "- Use TypeScript for React/Next.js/Angular; use <script setup lang='ts'> for Vue.\n"
-            "- api_calls must be populated for any component that fetches data.\n"
+            "- api_calls must ONLY use endpoint paths from the provided API contract.\n"
+            "  Do NOT invent or guess endpoint paths. Copy them exactly as given.\n"
             "- state_needs should reference the Zustand/Redux store slice names.\n"
             "- Output ONLY the JSON object — no markdown code fences."
         )
@@ -115,9 +116,14 @@ class ComponentPlannerAgent(BaseAgent):
             )
 
         api_text = ""
-        if contract:
-            endpoints = [f"{ep.method} {ep.path}" for ep in contract.endpoints]
-            api_text = f"API endpoints: {', '.join(endpoints)}\n"
+        if contract and contract.endpoints:
+            endpoint_lines = [f"  {ep.method} {ep.path} — {ep.description}" for ep in contract.endpoints]
+            api_text = (
+                "=== API Contract (use ONLY these endpoints in api_calls) ===\n"
+                f"Base URL: {contract.base_url}\n"
+                + "\n".join(endpoint_lines) + "\n"
+                "Do NOT invent endpoint paths. Use the exact paths listed above.\n"
+            )
 
         req_text = ""
         if requirements:
@@ -195,16 +201,28 @@ class ComponentPlannerAgent(BaseAgent):
         valid_paths: set[str] = {ep.path for ep in contract.endpoints}
 
         def _closest(call_path: str) -> str | None:
-            """Return the contract endpoint path with the longest common prefix."""
+            """Return the contract endpoint path with the best match.
+
+            Scores by common prefix segments first, then falls back to
+            matching the last meaningful path segment (e.g. 'login' in
+            '/api/v1/auth/login' matches '/login' or '/auth/login').
+            """
+            call_parts = [p for p in call_path.strip("/").split("/") if p]
+            # Strip common prefixes like "api", "v1" for tail matching
+            call_tail = [p for p in call_parts
+                         if p not in ("api", "v1", "v2") and not (p.startswith("v") and p[1:].isdigit())]
+
             best: str | None = None
             best_score = 0
             for vp in valid_paths:
-                # Score by length of the longest common prefix segment
-                call_parts = call_path.strip("/").split("/")
-                vp_parts = vp.strip("/").split("/")
-                common = sum(
-                    1 for a, b in zip(call_parts, vp_parts) if a == b
-                )
+                vp_parts = [p for p in vp.strip("/").split("/") if p]
+                # Primary: common prefix segments
+                common = sum(1 for a, b in zip(call_parts, vp_parts) if a == b)
+                # Secondary: tail segment match (e.g. "login" == "login")
+                vp_tail = [p for p in vp_parts
+                           if p not in ("api", "v1", "v2") and not (p.startswith("v") and p[1:].isdigit())]
+                if vp_tail and call_tail and vp_tail[-1] == call_tail[-1]:
+                    common = max(common, 1)
                 if common > best_score:
                     best_score = common
                     best = vp
