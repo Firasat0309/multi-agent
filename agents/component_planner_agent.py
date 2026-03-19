@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agents.base_agent import BaseAgent
 from core.models import (
@@ -127,13 +127,20 @@ class ComponentPlannerAgent(BaseAgent):
                 f"State: {requirements.tech_preferences.get('state', 'zustand')}\n"
                 f"Styling: {requirements.tech_preferences.get('styling', 'tailwind')}\n"
             )
+            if requirements.user_stories:
+                req_text += "User stories (design components to fulfill these):\n"
+                for story in requirements.user_stories:
+                    req_text += f"  - {story}\n"
 
         raw = await self._call_llm_json(
             f"{req_text}{spec_text}{api_text}\n"
             "Produce the complete ComponentPlan JSON object now."
         )
         self._metrics["llm_calls"] += 1
-        return self._parse_plan(raw)
+        plan = self._parse_plan(raw)
+        if contract:
+            self._validate_api_calls(plan, contract)
+        return plan
 
     async def revise_components(
         self,
@@ -167,6 +174,70 @@ class ComponentPlannerAgent(BaseAgent):
         return self._parse_plan(raw)
 
     # ─────────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _validate_api_calls(plan: "ComponentPlan", contract: "APIContract") -> None:
+        """Warn when a component's api_calls reference endpoints not in the contract.
+
+        Generates a warning (not an error) per offending component so that the
+        pipeline continues — the architect may have intentionally planned for
+        future endpoints.  The warnings appear in the log for human review.
+
+        Also rewrites each offending call to the closest matching contract
+        endpoint (by common path prefix length) so that generated TypeScript
+        uses a valid URL rather than a hallucinated one.  The substitution is
+        best-effort and logged so it can be reviewed.
+        """
+        if not contract or not contract.endpoints:
+            return
+
+        # Build a set of valid path+method strings and a set of valid paths
+        valid_paths: set[str] = {ep.path for ep in contract.endpoints}
+
+        def _closest(call_path: str) -> str | None:
+            """Return the contract endpoint path with the longest common prefix."""
+            best: str | None = None
+            best_score = 0
+            for vp in valid_paths:
+                # Score by length of the longest common prefix segment
+                call_parts = call_path.strip("/").split("/")
+                vp_parts = vp.strip("/").split("/")
+                common = sum(
+                    1 for a, b in zip(call_parts, vp_parts) if a == b
+                )
+                if common > best_score:
+                    best_score = common
+                    best = vp
+            return best if best_score > 0 else None
+
+        for comp in plan.components:
+            if not comp.api_calls:
+                continue
+            corrected: list[str] = []
+            for call in comp.api_calls:
+                # Strip query parameters for matching
+                call_path = call.split("?")[0]
+                if call_path in valid_paths:
+                    corrected.append(call)
+                    continue
+                # Not found — try closest match
+                nearest = _closest(call_path)
+                if nearest:
+                    logger.warning(
+                        "[ComponentPlanner] Component '%s' references unknown "
+                        "endpoint '%s' — replaced with closest contract match '%s'",
+                        comp.name, call_path, nearest,
+                    )
+                    corrected.append(nearest)
+                else:
+                    logger.warning(
+                        "[ComponentPlanner] Component '%s' references unknown "
+                        "endpoint '%s' with no close match in the API contract "
+                        "(%d endpoints).  Keeping as-is — verify manually.",
+                        comp.name, call_path, len(contract.endpoints),
+                    )
+                    corrected.append(call)
+            comp.api_calls[:] = corrected
 
     def _parse_plan(self, raw: dict[str, Any]) -> ComponentPlan:
         components = [

@@ -91,6 +91,22 @@ class IntegrationTestAgent(BaseAgent):
         if arch_summary:
             prompt += f"Architecture overview:\n{arch_summary[:3000]}\n\n"
 
+        # Include the API contract so tests cover all defined endpoints —
+        # not just the ones visible in source code (which may be incomplete
+        # if controller source wasn't populated in related_files).
+        api_contract = getattr(context, "api_contract", None) or context.task.metadata.get("api_contract")
+        if api_contract and hasattr(api_contract, "endpoints") and api_contract.endpoints:
+            contract_lines = "\n".join(
+                f"  {ep.method} {ep.path} — {ep.description}"
+                + (" [auth]" if ep.auth_required else "")
+                for ep in api_contract.endpoints
+            )
+            prompt += (
+                f"API Contract (test ALL of these endpoints):\n"
+                f"  Base URL: {api_contract.base_url}\n"
+                f"{contract_lines}\n\n"
+            )
+
         # Include actual controller/endpoint code for accurate test generation
         endpoint_code = self._extract_endpoint_code(context)
         if endpoint_code:

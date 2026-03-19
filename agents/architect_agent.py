@@ -127,6 +127,38 @@ class ArchitectAgent(BaseAgent):
         lower = prompt.lower()
         return any(kw in lower for kw in cls._DB_KEYWORDS)
 
+    # Language → default in-memory DB when the user doesn't specify one.
+    _LANG_DEFAULT_DB: dict[str, str] = {
+        "java": "Use H2 in-memory database (db: 'h2').",
+        "python": "Use SQLite in-memory database (db: 'sqlite').",
+        "go": "Use SQLite in-memory database (db: 'sqlite').",
+        "typescript": "Use SQLite in-memory database (db: 'sqlite').",
+        "rust": "Use SQLite in-memory database (db: 'sqlite').",
+        "csharp": "Use SQLite in-memory database (db: 'sqlite').",
+    }
+
+    @classmethod
+    def _default_db_note(cls, prompt: str) -> str:
+        """Return a language-appropriate default DB instruction.
+
+        Detects the language from the prompt text using common framework
+        keywords, then returns the matching in-memory DB recommendation.
+        """
+        lower = prompt.lower()
+        # Check for language/framework keywords in the prompt
+        if any(kw in lower for kw in ("java", "spring boot", "spring", "maven", "gradle")):
+            return cls._LANG_DEFAULT_DB["java"]
+        if any(kw in lower for kw in ("go ", "golang", "gin", "echo", "fiber")):
+            return cls._LANG_DEFAULT_DB["go"]
+        if any(kw in lower for kw in ("typescript", "express", "nestjs", "node")):
+            return cls._LANG_DEFAULT_DB["typescript"]
+        if any(kw in lower for kw in ("rust", "actix", "axum", "rocket")):
+            return cls._LANG_DEFAULT_DB["rust"]
+        if any(kw in lower for kw in ("c#", "csharp", ".net", "asp.net", "dotnet")):
+            return cls._LANG_DEFAULT_DB["csharp"]
+        # Default: Python (the pipeline default language)
+        return cls._LANG_DEFAULT_DB["python"]
+
     async def _llm_with_heartbeat(
         self,
         system_prompt: str,
@@ -178,11 +210,11 @@ class ArchitectAgent(BaseAgent):
         # explicit instruction so the LLM cannot silently default to Postgres.
         effective_prompt = user_prompt
         if not self._user_specified_db(user_prompt):
-            logger.info("No database specified in prompt — defaulting to H2 in-memory")
+            db_note = self._default_db_note(user_prompt)
+            logger.info("No database specified in prompt — injecting: %s", db_note)
             effective_prompt = (
                 user_prompt
-                + "\n\n[SYSTEM NOTE: The user did not specify a database. "
-                "Use H2 in-memory database (db: 'h2'). "
+                + f"\n\n[SYSTEM NOTE: The user did not specify a database. {db_note} "
                 "Configure it as an embedded in-memory datasource.]"
             )
 
@@ -248,9 +280,9 @@ class ArchitectAgent(BaseAgent):
 
         effective_prompt = revision_prompt
         if not self._user_specified_db(user_prompt) and not self._user_specified_db(feedback):
+            db_note = self._default_db_note(user_prompt)
             effective_prompt += (
-                "\n\n[SYSTEM NOTE: The user did not specify a database. "
-                "Use H2 in-memory database (db: 'h2').]"
+                f"\n\n[SYSTEM NOTE: The user did not specify a database. {db_note}]"
             )
 
         response = await self._llm_with_heartbeat(

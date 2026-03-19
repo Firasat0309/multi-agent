@@ -110,7 +110,14 @@ class StateManagementAgent(BaseAgent):
         contract: APIContract | None = context.task.metadata.get("api_contract")
 
         if plan is None:
-            return "Generate state management files for the frontend application."
+            logger.warning("StateManagementAgent: no component_plan in metadata — "
+                           "generating generic stores (auth, ui)")
+            return (
+                "No component plan was provided.  Generate a minimal state management "
+                "layer with an auth store (login/logout/token) and a UI store (sidebar "
+                "toggle, theme).  Use zustand with TypeScript.  Write each file to disk "
+                "using write_file."
+            )
 
         # Collect unique state slice names needed by components
         all_slices: set[str] = set()

@@ -104,12 +104,23 @@ class APIContractAgent(BaseAgent):
                 f"Description: {requirements.description}\n"
                 f"Features: {', '.join(requirements.features)}\n"
             )
+            if requirements.user_stories:
+                req_text += "User stories:\n"
+                for story in requirements.user_stories:
+                    req_text += f"  - {story}\n"
 
+        # Include file purposes, exports, and layers so the LLM can infer
+        # accurate endpoints rather than guessing from file names alone.
+        file_details = "\n".join(
+            f"  - {fb.path} [{fb.layer}]: {fb.purpose}"
+            + (f"  exports: {', '.join(fb.exports[:6])}" if fb.exports else "")
+            for fb in blueprint.file_blueprints
+        )
         bp_text = (
             f"Backend: {blueprint.name}\n"
             f"Style: {blueprint.architecture_style}\n"
             f"Tech stack: {json.dumps(blueprint.tech_stack)}\n"
-            f"Files: {[fb.path for fb in blueprint.file_blueprints]}\n"
+            f"Files:\n{file_details}\n"
         )
 
         raw = await self._call_llm_json(

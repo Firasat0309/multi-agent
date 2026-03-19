@@ -580,12 +580,29 @@ class LifecycleEngine:
         logger.info("Saved lifecycle state to %s (%d files)", path, len(state["files"]))
 
     @classmethod
-    def load_state(cls, path: str) -> "LifecycleEngine":
+    def load_state(
+        cls,
+        path: str,
+        *,
+        skip_failed: bool = False,
+        retry_files: set[str] | None = None,
+    ) -> "LifecycleEngine":
         """Load lifecycle state from a JSON file saved by ``save_state()``.
 
         Files that were PASSED or DEGRADED keep their terminal state so the
         executor skips them.  Files that were FAILED or in intermediate phases
         are reset to PENDING so they can be retried.
+
+        Args:
+            path: Path to the state JSON file written by ``save_state()``.
+            skip_failed: When True, FAILED files are also kept as terminal
+                instead of being reset to PENDING.  Use this to resume a
+                pipeline without retrying files that are known to be broken
+                (e.g. missing dependencies that need manual intervention).
+            retry_files: Explicit set of file paths to force back to PENDING
+                regardless of their saved phase (including PASSED/DEGRADED).
+                Useful for selectively re-generating specific files after a
+                targeted code fix without re-running the full pipeline.
 
         Returns a new LifecycleEngine with restored state.
         """
@@ -607,19 +624,34 @@ class LifecycleEngine:
             checkpoint_mode=state.get("checkpoint_mode", False),
         )
 
-        # Restore terminal states; reset non-terminal to PENDING for retry
-        _KEEP_PHASES = {FilePhase.PASSED.value, FilePhase.DEGRADED.value}
+        # Build the set of phases that should be kept as-is (not retried).
+        # Always keep PASSED and DEGRADED; optionally also keep FAILED.
+        _KEEP_PHASES: set[str] = {FilePhase.PASSED.value, FilePhase.DEGRADED.value}
+        if skip_failed:
+            _KEEP_PHASES.add(FilePhase.FAILED.value)
+
+        _force_retry = retry_files or set()
+
         for file_path, file_state in state["files"].items():
             lc = engine.get_lifecycle(file_path)
             saved_phase = file_state["phase"]
-            if saved_phase in _KEEP_PHASES:
-                # Skip directly to the terminal state
+
+            if file_path in _force_retry:
+                # Explicit retry requested — reset to PENDING regardless of phase
+                lc.phase = FilePhase.PENDING
+                logger.info(
+                    "[Resume] %s — forced retry (was %s)", file_path, saved_phase
+                )
+            elif saved_phase in _KEEP_PHASES:
+                # Keep terminal state — executor will skip this file
                 lc.phase = FilePhase(saved_phase)
                 logger.info("[Resume] %s — keeping %s", file_path, saved_phase)
             else:
                 # Reset to PENDING for retry (covers FAILED, FIXING, etc.)
                 lc.phase = FilePhase.PENDING
-                logger.info("[Resume] %s — reset to PENDING (was %s)", file_path, saved_phase)
+                logger.info(
+                    "[Resume] %s — reset to PENDING (was %s)", file_path, saved_phase
+                )
 
         for skip_path in state.get("skip_testing", []):
             if engine.has_file(skip_path):

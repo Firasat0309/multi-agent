@@ -32,6 +32,16 @@ _MAX_REVIEW_FILES = 20
 _MAX_CONTEXT_CHARS = 120_000
 # Max semantic hits to include from vector search per task.
 _MAX_SEMANTIC_HITS = 3
+# Maximum direct-dependency files included regardless of project size.
+# Prevents a file with 30+ imports from flooding the context window.
+_MAX_DIRECT_DEPS = 10
+# Per-dep char budget for non-stub (full-source) fallbacks.  Reduced for
+# large projects where many deps compete for the same context budget.
+_DEP_TRUNCATE_LARGE = 4_000   # >50 blueprint files
+_DEP_TRUNCATE_SMALL = 8_000   # ≤50 blueprint files
+# Maximum files from the same architectural layer in a single context.
+# Prevents "controller soup" where 8 controllers drown out a critical model.
+_MAX_SAME_LAYER = 3
 
 # Shared extractor instance (stateless aside from cache)
 _ast_extractor = ASTExtractor()
@@ -216,8 +226,23 @@ class ContextBuilder:
         # ── Priority 2: direct blueprint dependencies (AST stubs) ────────────
         # AST stubs include full method signatures (name, params, return type)
         # which is exactly what the coder agent needs to match cross-file APIs.
+        # Budget: cap total deps and per-dep size to prevent context flooding
+        # in large projects where a single file may import 20+ modules.
         if file_bp:
-            for dep_path in file_bp.depends_on:
+            n_total_files = len(self.blueprint.file_blueprints)
+            dep_truncate = (
+                _DEP_TRUNCATE_LARGE if n_total_files > 50 else _DEP_TRUNCATE_SMALL
+            )
+            # Sort deps: prefer files that are in the same layer as the target
+            # (e.g. service depending on other services) over generic utils.
+            target_layer = file_bp.layer or ""
+            dep_paths = file_bp.depends_on[:]
+            dep_paths.sort(key=lambda d: (
+                0 if (bp := self._find_blueprint(d)) and bp.layer == target_layer
+                else 1
+            ))
+
+            for dep_path in dep_paths[:_MAX_DIRECT_DEPS]:
                 content = self._read_file(dep_path)
                 if content is None:
                     continue
@@ -236,7 +261,7 @@ class ContextBuilder:
                         priority=2, relevance_score=0.9, is_stub=True,
                     ))
                 else:
-                    trunc = _smart_truncate(content, 8_000)
+                    trunc = _smart_truncate(content, dep_truncate)
                     candidates.append(ContextFile(
                         path=dep_path, content=trunc,
                         priority=2, relevance_score=0.9, is_stub=False,
@@ -311,9 +336,20 @@ class ContextBuilder:
         # ── Sort: (priority asc, relevance_score desc) ───────────────────────
         candidates.sort(key=lambda c: (c.priority, -c.relevance_score))
 
-        # ── Fill budget ───────────────────────────────────────────────────────
+        # ── Fill budget with layer-diversity enforcement ───────────────────────
+        # Prevent any single architectural layer from dominating the context.
+        # Priority-1 (the target file itself) is always included regardless.
+        # For lower-priority candidates, apply a per-layer cap so the context
+        # stays balanced across models, services, controllers, and utilities.
         result: dict[str, str] = {}
         total = 0
+        layer_counts: dict[str, int] = {}
+
+        def _layer_of(path: str) -> str:
+            """Return the architectural layer of a file, defaulting to 'other'."""
+            bp = self._find_blueprint(path)
+            return (bp.layer or "other") if bp else "other"
+
         for cf in candidates:
             if cf.path in result:
                 continue  # already included (e.g. target file appears as dep too)
@@ -323,6 +359,17 @@ class ContextBuilder:
                     total, cf.path, cf.priority,
                 )
                 continue
+            # Apply layer cap for non-target files (priority > 1) to prevent
+            # one layer from flooding the context window.
+            if cf.priority > 1:
+                layer = _layer_of(cf.path)
+                if layer_counts.get(layer, 0) >= _MAX_SAME_LAYER:
+                    logger.debug(
+                        "Layer cap reached for '%s' (%d files), skipping %s",
+                        layer, _MAX_SAME_LAYER, cf.path,
+                    )
+                    continue
+                layer_counts[layer] = layer_counts.get(layer, 0) + 1
             result[cf.path] = cf.content
             total += len(cf.content)
 

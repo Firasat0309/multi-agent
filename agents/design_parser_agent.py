@@ -68,7 +68,8 @@ class DesignParserAgent(BaseAgent):
     def _build_prompt(self, context: AgentContext) -> str:
         requirements: ProductRequirements | None = context.task.metadata.get("requirements")
         figma_url: str = context.task.metadata.get("figma_url", "")
-        
+        api_contract = context.task.metadata.get("api_contract")
+
         req_text = ""
         if requirements:
             fw = requirements.tech_preferences.get("frontend", "nextjs").lower()
@@ -80,6 +81,19 @@ class DesignParserAgent(BaseAgent):
                 f"Preferred styling: {requirements.tech_preferences.get('styling', 'tailwind')}\n"
             )
 
+        # Ground page design in actual backend resources so the parser
+        # doesn't hallucinate pages with no corresponding API endpoints.
+        api_text = ""
+        if api_contract and hasattr(api_contract, "endpoints") and api_contract.endpoints:
+            resource_lines = "\n".join(
+                f"  {ep.method} {ep.path} — {ep.description}"
+                for ep in api_contract.endpoints
+            )
+            api_text = (
+                f"Available backend API resources (design pages to cover these):\n"
+                f"{resource_lines}\n"
+            )
+
         figma_context = f"Figma URL provided: {figma_url}\n" if figma_url else "No Figma URL provided.\n"
         if figma_url:
             file_key = self._extract_figma_key(figma_url)
@@ -87,7 +101,7 @@ class DesignParserAgent(BaseAgent):
                 figma_context += f"The Figma File Key is: {file_key}. Use your MCP tools to get a summary of this file.\n"
 
         return (
-            f"{req_text}{figma_context}\n"
+            f"{req_text}{api_text}{figma_context}\n"
             "Use your tools to explore the design if necessary, then output the UIDesignSpec JSON object."
         )
 
@@ -95,6 +109,7 @@ class DesignParserAgent(BaseAgent):
         self,
         requirements: ProductRequirements,
         figma_url: str = "",
+        api_contract: Any | None = None,
     ) -> UIDesignSpec:
         """Convenience facade called by FrontendPipeline.
 
@@ -117,13 +132,19 @@ class DesignParserAgent(BaseAgent):
             description="",
             architecture_style="",
         )
+        metadata: dict[str, Any] = {
+            "requirements": requirements,
+            "figma_url": figma_url,
+        }
+        if api_contract is not None:
+            metadata["api_contract"] = api_contract
         context = _AgentContext(
             task=Task(
                 task_id=0,
                 task_type=TaskType.PARSE_DESIGN,
                 file="",
                 description="Parse design spec",
-                metadata={"requirements": requirements, "figma_url": figma_url},
+                metadata=metadata,
             ),
             blueprint=stub_blueprint,
         )

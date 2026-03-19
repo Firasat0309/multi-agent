@@ -118,7 +118,7 @@ class FrontendPipeline:
                 mcp_client = MCPClient(self._settings.mcp_server_command)
                 await mcp_client.initialize()
             except Exception as e:
-                logger.error("Failed to initialize MCP client in frontend pipeline: %e", e)
+                logger.error("Failed to initialize MCP client in frontend pipeline: %s", e)
                 mcp_client = None
 
         # ── Sandbox setup ─────────────────────────────────────────────────────
@@ -130,7 +130,7 @@ class FrontendPipeline:
             logger.info("[FE Phase 1] Parsing design spec...")
             design_spec: UIDesignSpec | None = None
             parser = DesignParserAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
-            design_spec = await parser.parse_design(requirements, figma_url)
+            design_spec = await parser.parse_design(requirements, figma_url, api_contract=api_contract)
             logger.info(
                 "UIDesignSpec: %d pages, framework=%s",
                 len(design_spec.pages), design_spec.framework,

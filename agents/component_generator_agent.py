@@ -194,16 +194,39 @@ class ComponentGeneratorAgent(BaseAgent):
 
         contract_text = ""
         if contract and component and component.api_calls:
+            # Match endpoints where the call path is a prefix of the endpoint
+            # path or vice-versa, handling parameterised segments correctly.
+            # e.g. call="/users" matches ep="/users" and ep="/users/{id}".
+            def _paths_match(call: str, ep_path: str) -> bool:
+                call_stripped = call.strip("/").split("?")[0]
+                ep_stripped = ep_path.strip("/")
+                return (
+                    call_stripped == ep_stripped
+                    or ep_stripped.startswith(call_stripped + "/")
+                    or call_stripped.startswith(ep_stripped + "/")
+                )
+
             relevant = [
                 ep for ep in contract.endpoints
-                if any(call in ep.path for call in component.api_calls)
+                if any(_paths_match(call, ep.path) for call in component.api_calls)
             ]
             if relevant:
-                endpoint_lines = "\n".join(
-                    f"  {ep.method} {ep.path}: {ep.description}"
-                    for ep in relevant
-                )
-                contract_text = f"Relevant API endpoints:\n{endpoint_lines}\n"
+                import json as _json
+                endpoint_lines: list[str] = []
+                for ep in relevant:
+                    line = f"  {ep.method} {ep.path}: {ep.description}"
+                    if ep.request_schema:
+                        try:
+                            line += f"\n    Request: {_json.dumps(ep.request_schema)}"
+                        except Exception:
+                            pass
+                    if ep.response_schema:
+                        try:
+                            line += f"\n    Response: {_json.dumps(ep.response_schema)}"
+                        except Exception:
+                            pass
+                    endpoint_lines.append(line)
+                contract_text = f"Relevant API endpoints:\n" + "\n".join(endpoint_lines) + "\n"
 
         # Build dependency reading instructions
         dep_instructions = ""

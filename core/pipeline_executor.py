@@ -33,7 +33,7 @@ import time
 from typing import Any, TYPE_CHECKING
 
 from core.checkpoint import BuildCheckpoint, CheckpointCycleResult, CheckpointResult
-from core.error_attributor import CompilerErrorAttributor, extract_error_lines
+from core.error_attributor import CompilerErrorAttributor, extract_error_lines, llm_attribute
 from core.event_bus import AgentEvent, BusEventType
 from core.models import AgentContext, Task, TaskResult, TaskType
 from core.state_machine import EventType, FilePhase, LifecycleEngine
@@ -82,14 +82,24 @@ class PipelineExecutor:
         # Files queued for re-verification at the next checkpoint because
         # an upstream dependency was modified after they reached a terminal
         # or post-review phase.
-        # NOTE: asyncio is single-threaded — no true concurrent mutation of
-        # this set occurs between handlers.  The TOCTOU window (phase check
-        # then set.add) is benign: the worst case is a harmless extra
-        # re-verification of a file whose phase changed after the check.
-        # We document this explicitly and atomically snapshot+clear in
-        # _drain_reverify_queue() to prevent duplicate processing.
+        #
+        # asyncio uses cooperative multitasking (single OS thread): two
+        # coroutines can never run truly simultaneously, but context switches
+        # DO occur at every ``await`` point.  Without a lock, a context switch
+        # between the set-intersection read and the set-difference write in
+        # _drain_reverify_queue() could allow on_file_changed() to insert a
+        # new entry that the drain then silently removes — losing a pending
+        # re-verification.  The lock makes that read-then-clear operation
+        # atomic across await points, preventing any such lost update.
         self._reverify_queue: set[str] = set()
         self._reverify_lock = asyncio.Lock()
+        # Per-file re-verification counter.  A file that is permanently broken
+        # (e.g. circular import that the fix agent can't resolve) will keep
+        # triggering FILE_WRITTEN events as it bounces between FIXING and
+        # GENERATING, queuing its dependents on each write.  Capping at
+        # _MAX_REVERIFY_DEPTH prevents this from becoming an infinite cascade.
+        self._reverify_counts: dict[str, int] = {}
+        self._MAX_REVERIFY_DEPTH = 5
 
     def _wire_event_bus(self, engine: LifecycleEngine) -> None:
         """Register event bus subscribers for cross-file coordination.
@@ -121,14 +131,30 @@ class PipelineExecutor:
                         # files still in early phases will naturally pick up changes.
                         if lc.phase in (FilePhase.BUILDING, FilePhase.TESTING,
                                         FilePhase.PASSED, FilePhase.DEGRADED):
+                            # Enforce depth cap — if this dependent has already
+                            # been queued _MAX_REVERIFY_DEPTH times, the upstream
+                            # file is likely in an unresolvable fix loop.  Stop
+                            # cascading to prevent the reverify queue growing
+                            # unboundedly and wasting LLM calls on each rebuild.
+                            count = self._reverify_counts.get(dep_path, 0)
+                            if count >= self._MAX_REVERIFY_DEPTH:
+                                logger.warning(
+                                    "Reverify depth cap reached for %s "
+                                    "(queued %d times) — suppressing further "
+                                    "re-verifications (upstream: %s)",
+                                    dep_path, count, event.file_path,
+                                )
+                                continue
+                            self._reverify_counts[dep_path] = count + 1
                             to_queue.append(dep_path)
                 if to_queue:
                     async with self._reverify_lock:
                         self._reverify_queue.update(to_queue)
                     for dep_path in to_queue:
                         logger.debug(
-                            "Queued %s for re-verification (upstream %s changed)",
+                            "Queued %s for re-verification (upstream %s changed, depth=%d)",
                             dep_path, event.file_path,
+                            self._reverify_counts.get(dep_path, 0),
                         )
             except Exception:
                 logger.debug(
@@ -420,10 +446,19 @@ class PipelineExecutor:
                 global_graph.mark_completed(sentinel.task_id)
             await self._am.execute_graph(global_graph)
 
-        # Run both tracks concurrently
-        logger.info("=== Post-Generation Phase: Track A (Security → Integration) "
-                     "|| Track B (Advisory) ===")
-        await asyncio.gather(_track_a(), _track_b())
+        # Run Track A first (Security → Integration), then Track B (Advisory).
+        #
+        # Track A's checkpoints may write security/integration fixes to source
+        # files (controllers, handlers, etc.).  Track B's WriterAgent reads
+        # those same files to produce API documentation.  Running them
+        # concurrently risks WriterAgent snapshotting pre-fix file content and
+        # documenting vulnerable or incorrect code.  Sequential execution
+        # guarantees all fixes are persisted to disk before documentation and
+        # deploy artifacts are generated from the final workspace state.
+        logger.info("=== Post-Generation Phase: Track A (Security → Integration) ===")
+        await _track_a()
+        logger.info("=== Post-Generation Phase: Track B (Advisory Tasks) ===")
+        await _track_b()
 
         # ── Results ─────────────────────────────────────────────────────────
         elapsed = time.monotonic() - start_time
@@ -795,15 +830,43 @@ class PipelineExecutor:
             affected = result.affected_files
             unattributed_fallback = False
             if not affected:
-                # Errors couldn't be attributed to specific files — pass
-                # the raw build output to all tier files so the fix agent
-                # has something actionable to work with (instead of empty
-                # error context which produces identical-content fixes).
+                # Regex attribution produced no file-specific errors.
+                # Try LLM-based attribution before falling back to all-tier fix,
+                # which generates identical-content fixes with empty error context.
                 logger.warning(
                     "[Checkpoint] Build failed but no errors could be attributed "
                     "to specific files. %d unattributed error lines. "
-                    "Raw output (first 500 chars): %s",
+                    "Attempting LLM attribution fallback…",
                     len(result.attribution.unattributed_errors) if result.attribution else 0,
+                )
+                try:
+                    llm_result = await llm_attribute(
+                        result.raw_output,
+                        self._am.llm,
+                        known_files=known_files,
+                    )
+                    if llm_result.errors_by_file:
+                        logger.info(
+                            "[Checkpoint] LLM attribution resolved %d file(s): %s",
+                            len(llm_result.affected_files), llm_result.affected_files,
+                        )
+                        # Merge LLM attribution into the checkpoint result so that
+                        # get_fix_context_for_file() returns meaningful error text.
+                        if result.attribution is not None:
+                            for fp, errs in llm_result.errors_by_file.items():
+                                result.attribution.errors_by_file.setdefault(fp, []).extend(errs)
+                        affected = llm_result.affected_files
+                except Exception:
+                    logger.debug(
+                        "[Checkpoint] LLM attribution fallback raised", exc_info=True
+                    )
+
+            if not affected:
+                # Neither regex nor LLM could attribute errors — fall back to
+                # fixing all tier files with the raw build output as context.
+                logger.warning(
+                    "[Checkpoint] LLM attribution also produced no file-specific errors. "
+                    "Raw output (first 500 chars): %s",
                     result.raw_output[:500],
                 )
                 # Try to fix all tier files as a fallback
@@ -888,6 +951,19 @@ class PipelineExecutor:
 
             if fix_tasks:
                 await asyncio.gather(*fix_tasks, return_exceptions=True)
+            else:
+                # No fix tasks were dispatched this attempt — either all
+                # affected files are terminal, all hit the per-file fix cap,
+                # or all errors are unchanged (hash match).  Further retries
+                # would rebuild the same broken code without any modifications,
+                # so bail out early to avoid wasting time and LLM calls.
+                logger.warning(
+                    "[Checkpoint] No fix tasks dispatched on attempt %d — "
+                    "all affected files are either terminal, capped, or have "
+                    "unchanged errors.  Aborting remaining %d retry attempt(s).",
+                    attempt, checkpoint_def.max_retries - attempt,
+                )
+                break
 
             if self._event_bus:
                 await self._event_bus.publish(AgentEvent(

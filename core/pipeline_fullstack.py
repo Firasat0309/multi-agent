@@ -338,6 +338,13 @@ class FullstackPipeline:
             interactive=self._interactive,
         )
 
+        # Validate that the contract is internally consistent and all required
+        # fields are present before any downstream agent consumes it.
+        # This catches LLM-generated contracts that are syntactically valid
+        # but semantically incomplete (e.g. endpoints with missing methods,
+        # empty base_url) before they silently corrupt generated code.
+        self._validate_contract_fields(api_contract)
+
         # Validate that the contract is consistent with the backend blueprint —
         # emit warnings so the architect can see any coverage gaps before generation.
         self._validate_contract_blueprint(api_contract, backend_blueprint)
@@ -390,6 +397,15 @@ class FullstackPipeline:
                     errors.extend([f"FE: {e}" for e in res.errors])
 
         self._complete_phase("Parallel BE+FE Generation")
+
+        # ── Cross-pipeline contract verification ─────────────────────────────
+        # After both pipelines complete, verify that the FE-generated types.ts
+        # covers the API contract schemas.  This catches type drift that occurs
+        # when both sides interpret the same contract schemas differently.
+        if requirements.has_frontend and requirements.has_backend and api_contract:
+            await self._verify_fe_contract_coverage(
+                frontend_workspace, api_contract, errors,
+            )
 
         # ── Aggregate results ─────────────────────────────────────────────────
         be_ok = (not requirements.has_backend) or (be_result is not None and be_result.success)
@@ -497,6 +513,57 @@ class FullstackPipeline:
         return "\n".join(lines)
 
     @staticmethod
+    def _validate_contract_fields(api_contract: APIContract) -> None:
+        """Validate that the API contract has all required fields before propagation.
+
+        Catches LLM responses that are structurally valid (parse without error)
+        but semantically incomplete — empty titles, missing methods, invalid
+        HTTP methods — before such contracts silently corrupt generated code or
+        documentation downstream.
+
+        All issues are logged as warnings (not errors) because the pipeline can
+        still proceed with a partial contract; the backend coders receive the
+        contract regardless, and the architect prompt already includes the full
+        endpoint list.
+        """
+        _VALID_HTTP_METHODS = frozenset(
+            {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+        )
+
+        if not api_contract.title:
+            logger.warning("[FS] API contract has an empty title field")
+
+        if not api_contract.base_url:
+            logger.warning("[FS] API contract has an empty base_url — "
+                           "generated code may use incorrect API paths")
+
+        malformed_endpoints: list[str] = []
+        for ep in api_contract.endpoints:
+            issues: list[str] = []
+            if not ep.path or not ep.path.startswith("/"):
+                issues.append(f"path='{ep.path}' (must start with /)")
+            if ep.method.upper() not in _VALID_HTTP_METHODS:
+                issues.append(f"method='{ep.method}' (not a valid HTTP method)")
+            if not ep.description:
+                issues.append("missing description")
+            if issues:
+                malformed_endpoints.append(f"{ep.method} {ep.path}: {'; '.join(issues)}")
+
+        if malformed_endpoints:
+            logger.warning(
+                "[FS] API contract has %d malformed endpoint(s) — backend coders "
+                "may generate incorrect implementations:\n  %s",
+                len(malformed_endpoints),
+                "\n  ".join(malformed_endpoints),
+            )
+        else:
+            logger.info(
+                "[FS] API contract validation passed: %d endpoint(s), base_url='%s'",
+                len(api_contract.endpoints),
+                api_contract.base_url,
+            )
+
+    @staticmethod
     def _validate_contract_blueprint(
         api_contract: APIContract,
         blueprint: RepositoryBlueprint,
@@ -559,6 +626,53 @@ class FullstackPipeline:
                 "[FS] API contract resources %s may not have matching controller files "
                 "in the backend blueprint.  Endpoint coverage may be incomplete.",
                 uncovered,
+            )
+
+    @staticmethod
+    async def _verify_fe_contract_coverage(
+        frontend_workspace: Path,
+        api_contract: APIContract,
+        errors: list[str],
+    ) -> None:
+        """Verify that the FE types.ts file references all contract schemas.
+
+        This is a lightweight post-build check — it reads the generated
+        ``src/lib/types.ts`` and checks that every schema name from the
+        API contract appears as an interface/type name.  Mismatches are
+        logged as warnings so the developer can review.
+        """
+        import aiofiles
+        import aiofiles.os
+
+        types_path = frontend_workspace / "src" / "lib" / "types.ts"
+        if not await aiofiles.os.path.exists(types_path):
+            logger.info("[FS] No src/lib/types.ts found — skipping FE contract coverage check")
+            return
+
+        if not api_contract.schemas:
+            return
+
+        try:
+            async with aiofiles.open(types_path, encoding="utf-8", errors="replace") as f:
+                types_content = (await f.read()).lower()
+        except OSError:
+            return
+
+        missing_schemas: list[str] = []
+        for schema_name in api_contract.schemas:
+            if schema_name.lower() not in types_content:
+                missing_schemas.append(schema_name)
+
+        if missing_schemas:
+            logger.warning(
+                "[FS] FE types.ts is missing %d schema(s) from the API contract: %s. "
+                "Frontend may have incomplete TypeScript interfaces.",
+                len(missing_schemas), missing_schemas,
+            )
+        else:
+            logger.info(
+                "[FS] FE contract coverage check passed: all %d schema(s) present in types.ts",
+                len(api_contract.schemas),
             )
 
     def _phase(self, name: str, status: str) -> None:

@@ -84,12 +84,29 @@ class ProductPlannerAgent(BaseAgent):
     async def plan_product(self, user_prompt: str) -> ProductRequirements:
         """Parse the user prompt into structured ProductRequirements."""
         logger.info("ProductPlannerAgent: planning product from prompt")
-        raw = await self._call_llm_json(
+        prompt = (
             f"User request:\n{user_prompt}\n\n"
             "Produce the product requirements JSON document now."
         )
-        self._metrics["llm_calls"] += 1
-        return self._parse_requirements(raw)
+        try:
+            raw = await self._call_llm_json(prompt)
+            self._metrics["llm_calls"] += 1
+            return self._parse_requirements(raw)
+        except Exception as first_err:
+            logger.warning(
+                "ProductPlannerAgent: first attempt failed (%s) — retrying with corrective prompt",
+                first_err,
+            )
+            corrective = (
+                "Your previous response was not valid JSON.  The parser returned:\n"
+                f"  {first_err}\n\n"
+                f"Original request:\n{user_prompt}\n\n"
+                "Please return ONLY the corrected product requirements JSON object — "
+                "no explanation, no markdown fences."
+            )
+            raw = await self._call_llm_json(corrective)
+            self._metrics["llm_calls"] += 1
+            return self._parse_requirements(raw)
 
     async def revise_product(
         self,

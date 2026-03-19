@@ -437,22 +437,75 @@ class BaseAgent(ABC):
         return header + "\n" + "\n".join(chunk)
 
     @staticmethod
+    def _strip_string_literals(content: str) -> str:
+        """Remove string literals from source code before structural analysis.
+
+        Strips double-quoted, single-quoted, and backtick strings (including
+        common escape sequences) so that brace/bracket counts reflect the code
+        structure rather than string content.
+
+        This is a best-effort heuristic — not a full parser.  It handles:
+          - "..." and '...' with \\-escapes
+          - Template literals `...` (JS/TS)
+          - Triple-double-quoted strings (Python)
+          - Line comments: // and #
+          - Multi-line comments: /* ... */
+
+        Multi-line strings are handled by consuming newlines within the string
+        so the line count is preserved (avoids off-by-one issues in error messages).
+        """
+        import re as _re
+        # Patterns ordered longest-match first to avoid partial matches.
+        _STRING_RE = _re.compile(
+            r'"""[\s\S]*?"""'          # Python triple-double
+            r"|'''[\s\S]*?'''"         # Python triple-single
+            r"|`(?:[^`\\]|\\.)*`"      # JS/TS template literal
+            r'|"(?:[^"\\]|\\.)*"'      # double-quoted
+            r"|'(?:[^'\\]|\\.)*'"      # single-quoted
+            r"|//[^\n]*"               # line comment (//)
+            r"|#[^\n]*"                # line comment (#)
+            r"|/\*[\s\S]*?\*/"         # block comment
+        )
+        # Replace matched strings with spaces to preserve character positions
+        # for accurate brace counting without shifting indices.
+        return _STRING_RE.sub(lambda m: " " * len(m.group()), content)
+
+    @staticmethod
     def _detect_truncated_code(content: str, path: str) -> str | None:
         """Check if written code looks truncated (unbalanced braces/brackets).
 
         Returns a warning message if the code appears incomplete, None otherwise.
         Applies only to languages that use braces for scoping.
+
+        Improvements over the naive brace-count approach:
+        - Strips string literals and comments before counting so that JSON-like
+          structures (e.g. ``{"key": {}}`` in object literals) don't produce
+          false positives.
+        - Also checks parentheses to catch unclosed function signatures.
+        - Threshold of 2 unclosed braces (not 1) to tolerate deliberate partial
+          files (e.g. a config-only class with a single open block).
         """
         ext = path.rsplit(".", 1)[-1] if "." in path else ""
         if ext not in ("java", "ts", "tsx", "js", "jsx", "go", "rs", "cs", "kt", "scala", "c", "cpp", "h"):
             return None
 
-        # Count braces (ignoring those inside string literals and comments)
-        # Simple heuristic: just count raw braces — good enough for detection
-        opens = content.count("{") - content.count("}")
-        if opens >= 2:
+        # Strip string literals and comments before counting structural tokens
+        # to prevent e.g. {"key": {}} in a string from counting as an open brace.
+        stripped = BaseAgent._strip_string_literals(content)
+
+        opens_braces = stripped.count("{") - stripped.count("}")
+        opens_parens = stripped.count("(") - stripped.count(")")
+
+        reasons: list[str] = []
+        if opens_braces >= 2:
+            reasons.append(f"{opens_braces} unclosed braces")
+        if opens_parens >= 3:
+            # Parens are noisier (macros, decorators) so use a higher threshold
+            reasons.append(f"{opens_parens} unclosed parentheses")
+
+        if reasons:
             return (
-                f"⚠ TRUNCATED CODE DETECTED: {opens} unclosed braces in {path}. "
+                f"⚠ TRUNCATED CODE DETECTED: {', '.join(reasons)} in {path}. "
                 f"The file content appears incomplete — it likely ends mid-class or mid-method. "
                 f"Please call write_file again with the COMPLETE file content. "
                 f"Make sure all classes, methods, and blocks are properly closed."

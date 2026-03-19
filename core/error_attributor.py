@@ -23,6 +23,7 @@ import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -572,3 +573,109 @@ class CompilerErrorAttributor(BaseErrorAttributor):
                 seen.add(key)
                 unique.append(e)
         return unique
+
+
+async def llm_attribute(
+    build_output: str,
+    llm_client: "Any",
+    known_files: set[str] | None = None,
+) -> AttributionResult:
+    """LLM-based fallback attribution for non-standard or ambiguous compiler output.
+
+    Called when ``CompilerErrorAttributor`` produces no file-specific errors
+    despite the build failing.  The LLM is asked to parse the raw output and
+    return a structured list of (file, line, message) triples.
+
+    The known_files set is passed as a hint so the LLM can resolve partial
+    paths (e.g. ``User.java`` → ``src/main/java/com/example/User.java``).
+
+    Returns an ``AttributionResult`` populated from the LLM response.  On any
+    failure (LLM error, parse error) returns an empty result so the caller can
+    continue with its existing fallback logic.
+    """
+    import json as _json
+
+    known_hint = ""
+    if known_files:
+        # Limit hint size to avoid token explosion — show the 40 shortest paths
+        sorted_known = sorted(known_files, key=len)[:40]
+        known_hint = (
+            "\n\nKnown workspace files (use exact paths from this list):\n"
+            + "\n".join(f"  {p}" for p in sorted_known)
+        )
+
+    compact_output = extract_error_lines(build_output, max_chars=3000)
+
+    prompt = (
+        "Parse the following build/compiler output and extract all errors.\n"
+        "Return a JSON array where each element is:\n"
+        '{"file": "path/to/file.ext", "line": 42, "message": "error description"}\n'
+        "Use null for line if not available.\n"
+        "Return ONLY the JSON array — no prose, no markdown fences.\n"
+        f"{known_hint}\n\n"
+        f"Build output:\n```\n{compact_output}\n```"
+    )
+
+    result = AttributionResult()
+    try:
+        response = await llm_client.generate(
+            system_prompt=(
+                "You are a build error parser. Extract file, line, and message from "
+                "compiler output. Return only a JSON array, nothing else."
+            ),
+            user_prompt=prompt,
+            max_tokens=2048,
+        )
+
+        # Strip markdown fences if the model wrapped the response
+        text = response.content.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1]
+            text = text.rsplit("```", 1)[0]
+
+        entries = _json.loads(text)
+        if not isinstance(entries, list):
+            return result
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            raw_path = str(entry.get("file", "")).strip()
+            if not raw_path:
+                continue
+
+            # Resolve to known file if provided
+            file_path = raw_path
+            if known_files:
+                # Try suffix match
+                matches = [k for k in known_files if k.endswith(raw_path) or raw_path.endswith(k)]
+                if len(matches) == 1:
+                    file_path = matches[0]
+
+            line_val = entry.get("line")
+            line_no = int(line_val) if line_val is not None else None
+            message = str(entry.get("message", "")).strip() or "Build error"
+
+            error = AttributedError(
+                file_path=file_path,
+                line=line_no,
+                message=message,
+            )
+            result.errors_by_file.setdefault(file_path, []).append(error)
+
+        if result.errors_by_file:
+            logger.info(
+                "LLM attribution: %d errors across %d files",
+                result.total_errors, len(result.affected_files),
+            )
+        else:
+            # LLM parsed the output but found no file-specific errors —
+            # treat the whole output as an unattributed error so callers
+            # know the build failed even without specific file attribution.
+            result.unattributed_errors.append(compact_output[:500])
+            logger.debug("LLM attribution: no file-specific errors found")
+
+    except Exception:
+        logger.debug("LLM attribution failed (non-critical)", exc_info=True)
+
+    return result
