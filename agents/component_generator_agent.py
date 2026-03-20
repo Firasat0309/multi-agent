@@ -21,6 +21,62 @@ from core.models import (
 
 logger = logging.getLogger(__name__)
 
+
+# ── Shared type-extraction helper ────────────────────────────────────────────
+
+# Matches interface/type/enum/class definitions (TS, Java, Go, Rust, Python)
+_TYPE_DEF = _re.compile(
+    r"^\s*(?:export\s+)?(?:declare\s+)?"
+    r"(?:interface|type|class|enum)\s+(\w+)"
+)
+
+# Matches type fields: name: Type; / name?: Type; / readonly name: Type
+_TYPE_FIELD = _re.compile(
+    r"^\s+(?:readonly\s+)?(\w+)\??\s*:\s*(.+?)\s*;?\s*$"
+)
+
+
+def _extract_type_definitions(content: str) -> list[str]:
+    """Extract interface/type definitions with their fields from TS/JS source.
+
+    Returns indented lines like:
+        interface ButtonProps
+            variant: "primary" | "secondary"
+            size?: "sm" | "md" | "lg"
+    """
+    lines: list[str] = []
+    in_type = False
+    brace_depth = 0
+
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+
+        # Start of a new type definition
+        m = _TYPE_DEF.match(stripped)
+        if m and not in_type:
+            in_type = True
+            brace_depth = 0
+            # Show the full definition line (e.g. "interface ButtonProps")
+            header = stripped.rstrip("{").rstrip()
+            lines.append(f"  {header}")
+            brace_depth += stripped.count("{") - stripped.count("}")
+            continue
+
+        if in_type:
+            brace_depth += stripped.count("{") - stripped.count("}")
+            # Capture field definitions
+            fm = _TYPE_FIELD.match(raw_line)
+            if fm:
+                lines.append(f"    {fm.group(1)}: {fm.group(2).rstrip(';').strip()}")
+            # Type definition ended
+            if brace_depth <= 0:
+                in_type = False
+
+    return lines
+
+
 _WRITE_TOOL = ToolDefinition(
     name="write_file",
     description="Write the generated component source code to disk.",
@@ -278,10 +334,12 @@ class ComponentGeneratorAgent(BaseAgent):
         # Extract and prominently display function signatures from pre-loaded
         # store/lib/hook files so the LLM sees exact parameter counts.
         store_sigs = self._extract_store_signatures(context.related_files or {})
+        # Extract prop types from component dependencies (Button, Card, etc.)
+        dep_sigs = self._extract_dep_signatures(context.related_files or {})
 
         return (
             f"{req_text}{comp_text}\n{plan_text}\n{design_text}\n{contract_text}\n"
-            f"{store_sigs}"
+            f"{store_sigs}{dep_sigs}"
             f"{store_discovery}{dep_instructions}"
             "If a Figma Node ID is provided, use your tools to fetch the structural code skeleton FIRST. "
             "Hydrate the skeleton with the described API and state handlers, then generate "
@@ -356,6 +414,7 @@ class ComponentGeneratorAgent(BaseAgent):
             context = await self._inject_store_context(context, component)
 
         store_sigs = self._extract_store_signatures(context.related_files or {})
+        dep_sigs = self._extract_dep_signatures(context.related_files or {})
 
         # ── Build related-file stubs section ──────────────────────────────
         related_section = ""
@@ -395,7 +454,7 @@ class ComponentGeneratorAgent(BaseAgent):
 
         prompt = (
             f"{comp_info}{plan_info}"
-            f"{store_sigs}"
+            f"{store_sigs}{dep_sigs}"
             f"{related_section}"
             f"FIX TASK for: {file_path}\n\n"
             f"Current content:\n```typescript\n{current_content}\n```\n\n"
@@ -405,8 +464,9 @@ class ComponentGeneratorAgent(BaseAgent):
             "2. Do NOT remove, rename, or reorganise existing functions or components.\n"
             "3. Do NOT add new functionality beyond what is needed to fix errors.\n"
             "4. Do NOT change the component signature (props) unless the error requires it.\n"
-            "5. Check the STORE / LIB FUNCTION SIGNATURES above for exact function names,\n"
-            "   parameter counts, and types. Match them EXACTLY.\n"
+            "5. Check the STORE / LIB SIGNATURES and COMPONENT DEPENDENCY SIGNATURES above\n"
+            "   for exact function names, parameter counts, prop types, and allowed values.\n"
+            "   Match them EXACTLY — do not invent prop values that are not listed.\n"
             "6. If the error says 'Expected N arguments, but got M', check the signatures\n"
             "   above and fix the call to pass exactly the right number of arguments.\n"
             "7. Import paths must be RELATIVE (e.g. '../../store/useAuthStore').\n"
@@ -496,10 +556,12 @@ class ComponentGeneratorAgent(BaseAgent):
 
     @staticmethod
     def _extract_store_signatures(related_files: dict[str, str]) -> str:
-        """Extract exported function/const signatures from pre-loaded store/lib/hook files.
+        """Extract exported function/const signatures AND type definitions
+        from pre-loaded store/lib/hook files.
 
-        Returns a prominent block listing each function with its exact parameter
-        list so the LLM can match argument counts precisely.
+        Returns a prominent block listing each function with its exact
+        parameter list AND each type/interface with its fields, so the LLM
+        can match argument counts and field names precisely.
         """
         import re as _re
 
@@ -533,6 +595,11 @@ class ComponentGeneratorAgent(BaseAgent):
         for fpath, content in store_lib_files.items():
             sigs: list[str] = []
 
+            # ── Type / interface definitions with fields ──────────────────
+            type_lines = _extract_type_definitions(content)
+            if type_lines:
+                sigs.extend(type_lines)
+
             # Exported functions / consts
             for m in _EXPORT_FN.finditer(content):
                 fn_name = m.group(1) or m.group(3)
@@ -560,7 +627,62 @@ class ComponentGeneratorAgent(BaseAgent):
             return ""
 
         return (
-            "STORE / LIB FUNCTION SIGNATURES — use these EXACT names and argument counts:\n"
+            "STORE / LIB SIGNATURES — use these EXACT names, argument counts, and types:\n"
+            + "\n".join(sections)
+            + "\n\n"
+        )
+
+    @staticmethod
+    def _extract_dep_signatures(related_files: dict[str, str]) -> str:
+        """Extract type/interface definitions AND prop types from component
+        dependencies (Button, Card, etc.) so the LLM sees the EXACT allowed
+        prop values.
+
+        This prevents type mismatches like using variant="outline" when
+        ButtonProps only allows "primary" | "secondary".
+        """
+        # Only process component files (not store/lib which are handled separately)
+        comp_files = {
+            p: c for p, c in related_files.items()
+            if not any(seg in p for seg in ("store", "lib", "hooks", "hook"))
+        }
+        if not comp_files:
+            return ""
+
+        sections: list[str] = []
+        for fpath, content in comp_files.items():
+            lines: list[str] = []
+
+            # Type/interface definitions with fields
+            type_lines = _extract_type_definitions(content)
+            if type_lines:
+                lines.extend(type_lines)
+
+            # Exported function/component signatures
+            import re as _re
+            for raw_line in content.splitlines():
+                stripped = raw_line.strip()
+                if not stripped or stripped in ("{", "}", "};"):
+                    continue
+                # export function ComponentName(props: Props)
+                # export default function ComponentName(...)
+                # export const ComponentName = ...
+                if _re.match(
+                    r"^\s*(?:export\s+(?:default\s+)?)"
+                    r"(?:(?:async\s+)?function\s+\w+\s*\(|const\s+\w+)",
+                    stripped,
+                ):
+                    sig = stripped.rstrip("{").rstrip().rstrip(";").strip()
+                    lines.append(f"  {sig}")
+
+            if lines:
+                sections.append(f"  {fpath}:\n" + "\n".join(lines))
+
+        if not sections:
+            return ""
+
+        return (
+            "COMPONENT DEPENDENCY SIGNATURES — use ONLY these exact prop types and values:\n"
             + "\n".join(sections)
             + "\n\n"
         )

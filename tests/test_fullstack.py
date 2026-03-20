@@ -1871,6 +1871,140 @@ class TestContextBuilderApiContract:
         assert ctx.api_contract is None
 
 
+# ── ComponentGeneratorAgent type extraction tests ────────────────────────────
+
+
+class TestComponentGeneratorTypeExtraction:
+    """Verify that type/interface definitions are extracted from dependencies."""
+
+    def test_extract_type_definitions_button_props(self):
+        """ButtonProps interface fields should be extracted."""
+        from agents.component_generator_agent import _extract_type_definitions
+
+        button_src = (
+            "'use client';\n"
+            "import React from 'react';\n\n"
+            "export interface ButtonProps {\n"
+            "  variant: \"primary\" | \"secondary\";\n"
+            "  size?: \"sm\" | \"md\" | \"lg\";\n"
+            "  children: React.ReactNode;\n"
+            "  onClick?: () => void;\n"
+            "}\n\n"
+            "export default function Button({ variant, size, children, onClick }: ButtonProps) {\n"
+            "  return <button className={variant}>{children}</button>;\n"
+            "}\n"
+        )
+        lines = _extract_type_definitions(button_src)
+        text = "\n".join(lines)
+        assert "ButtonProps" in text
+        assert '"primary" | "secondary"' in text
+        assert "size" in text
+        # Should NOT include function bodies
+        assert "return <button" not in text
+
+    def test_extract_type_definitions_auth_response(self):
+        """AuthResponse type should be extracted with its fields."""
+        from agents.component_generator_agent import _extract_type_definitions
+
+        store_src = (
+            "export interface AuthResponse {\n"
+            "  token: string;\n"
+            "  refreshToken: string;\n"
+            "}\n\n"
+            "export interface AuthState {\n"
+            "  user: User | null;\n"
+            "  isAuthenticated: boolean;\n"
+            "  login: (email: string, password: string) => Promise<void>;\n"
+            "}\n"
+        )
+        lines = _extract_type_definitions(store_src)
+        text = "\n".join(lines)
+        assert "AuthResponse" in text
+        assert "token: string" in text
+        # AuthResponse does NOT have 'user' field — this is the exact bug
+        assert "AuthState" in text
+        assert "user: User | null" in text
+
+    def test_extract_dep_signatures_component_files(self):
+        """Component dep signatures should include prop types."""
+        from agents.component_generator_agent import ComponentGeneratorAgent
+
+        related_files = {
+            "src/components/ui/Button.tsx": (
+                "export interface ButtonProps {\n"
+                "  variant: \"primary\" | \"secondary\";\n"
+                "  children: React.ReactNode;\n"
+                "}\n\n"
+                "export default function Button(props: ButtonProps) {\n"
+                "  return <button>{props.children}</button>;\n"
+                "}\n"
+            ),
+        }
+        result = ComponentGeneratorAgent._extract_dep_signatures(related_files)
+        assert "COMPONENT DEPENDENCY SIGNATURES" in result
+        assert "ButtonProps" in result
+        assert '"primary" | "secondary"' in result
+
+    def test_extract_dep_signatures_skips_store_files(self):
+        """Store files should be handled by _extract_store_signatures, not dep."""
+        from agents.component_generator_agent import ComponentGeneratorAgent
+
+        related_files = {
+            "src/store/useAuthStore.ts": "export const useAuthStore = () => {};",
+        }
+        result = ComponentGeneratorAgent._extract_dep_signatures(related_files)
+        assert result == ""
+
+    def test_extract_store_signatures_includes_types(self):
+        """Store signatures should now include type definitions too."""
+        from agents.component_generator_agent import ComponentGeneratorAgent
+
+        related_files = {
+            "src/store/useAuthStore.ts": (
+                "export interface AuthResponse {\n"
+                "  token: string;\n"
+                "  refreshToken: string;\n"
+                "}\n\n"
+                "export const useAuthStore = create<AuthState>((set) => ({\n"
+                "  login: async (email: string, password: string) => {\n"
+                "    const res = await api.post('/auth/login');\n"
+                "    set({ user: res.data.user });\n"
+                "  },\n"
+                "}));\n"
+            ),
+        }
+        result = ComponentGeneratorAgent._extract_store_signatures(related_files)
+        assert "AuthResponse" in result
+        assert "token: string" in result
+        assert "useAuthStore" in result
+
+    def test_extract_type_definitions_enum(self):
+        """TypeScript enum definitions should be captured."""
+        from agents.component_generator_agent import _extract_type_definitions
+
+        src = (
+            "export enum Status {\n"
+            "  Active = 'active',\n"
+            "  Inactive = 'inactive',\n"
+            "}\n"
+        )
+        lines = _extract_type_definitions(src)
+        text = "\n".join(lines)
+        assert "enum Status" in text
+
+    def test_extract_type_definitions_no_types(self):
+        """Pure function file with no types returns empty."""
+        from agents.component_generator_agent import _extract_type_definitions
+
+        src = (
+            "export function formatDate(date: Date): string {\n"
+            "  return date.toISOString();\n"
+            "}\n"
+        )
+        lines = _extract_type_definitions(src)
+        assert lines == []
+
+
 # ── CoderAgent API contract section tests ────────────────────────────────────
 
 
