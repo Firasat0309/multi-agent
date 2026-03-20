@@ -1049,55 +1049,39 @@ class LLMClient:
         - Clean JSON: ``{"tool_call": ...}``
         - Fenced JSON: ```` ```json\\n{"tool_call": ...}\\n``` ````
         - JSON with trailing explanation text
+        - JSON preceded by code/explanation text
         - Nested JSON with unescaped newlines in string values
         """
         import re as _re
 
-        # Strip markdown code fences if present
-        stripped = text.strip()
-        fence_match = _re.search(
-            r"```(?:json)?\s*\n?(.*?)```", stripped, _re.DOTALL,
-        )
-        if fence_match:
-            stripped = fence_match.group(1).strip()
-
-        # Strategy 1: try parsing from the first '{' (fast path)
-        start = stripped.find("{")
-        if start == -1:
+        def _balanced_extract(s: str, start: int) -> str | None:
+            """Extract balanced-brace JSON object starting at *start*."""
+            depth = 0
+            in_str = False
+            esc = False
+            for i, ch in enumerate(s[start:], start):
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\":
+                    if in_str:
+                        esc = True
+                    continue
+                if ch == '"' and not esc:
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return s[start:i + 1]
             return None
 
-        candidates = [stripped[start:]]
-
-        # Strategy 2: find balanced braces for the outermost object
-        # (handles trailing text after the JSON)
-        depth = 0
-        in_string = False
-        escape = False
-        end_pos = -1
-        for i, ch in enumerate(stripped[start:], start):
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                if in_string:
-                    escape = True
-                continue
-            if ch == '"' and not escape:
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    end_pos = i + 1
-                    break
-        if end_pos > start and stripped[start:end_pos] != candidates[0]:
-            candidates.insert(0, stripped[start:end_pos])
-
-        for candidate in candidates:
+        def _try_parse(candidate: str) -> ToolCall | None:
+            """Try json.loads; return ToolCall if valid."""
             try:
                 data = json.loads(candidate)
                 if isinstance(data, dict) and "tool_call" in data:
@@ -1108,56 +1092,101 @@ class LLMClient:
                         input=tc_data.get("input", {}),
                     )
             except (json.JSONDecodeError, KeyError, TypeError):
-                continue
+                pass
+            return None
 
-        # Strategy 3: Gemini sometimes fails to escape newlines inside
-        # the "content" string value.  Try to fix common JSON issues.
-        for candidate in candidates:
-            try:
-                # Find "content": "..." and escape raw newlines/tabs inside
-                content_pat = _re.compile(
-                    r'"content"\s*:\s*"', _re.DOTALL,
-                )
-                m = content_pat.search(candidate)
-                if not m:
+        def _try_fix_newlines(candidate: str) -> ToolCall | None:
+            """Fix unescaped newlines inside "content" and re-parse."""
+            content_pat = _re.compile(r'"content"\s*:\s*"', _re.DOTALL)
+            m = content_pat.search(candidate)
+            if not m:
+                return None
+            val_start = m.end()
+            i = val_start
+            fixed_parts = [candidate[:val_start]]
+            while i < len(candidate):
+                ch = candidate[i]
+                if ch == "\\" and i + 1 < len(candidate):
+                    fixed_parts.append(candidate[i:i+2])
+                    i += 2
                     continue
-                val_start = m.end()
-                # Walk forward to find the unescaped closing quote
-                i = val_start
-                fixed_parts = [candidate[:val_start]]
-                while i < len(candidate):
-                    ch = candidate[i]
-                    if ch == "\\" and i + 1 < len(candidate):
-                        fixed_parts.append(candidate[i:i+2])
-                        i += 2
-                        continue
-                    if ch == '"':
-                        break
-                    if ch == "\n":
-                        fixed_parts.append("\\n")
-                    elif ch == "\t":
-                        fixed_parts.append("\\t")
-                    elif ch == "\r":
-                        fixed_parts.append("\\r")
-                    else:
-                        fixed_parts.append(ch)
-                    i += 1
-                fixed = "".join(fixed_parts) + candidate[i:]
-                if fixed != candidate:
-                    data = json.loads(fixed)
-                    if isinstance(data, dict) and "tool_call" in data:
-                        tc_data = data["tool_call"]
-                        logger.warning(
-                            "Recovered Gemini tool call after fixing "
-                            "unescaped newlines in content field"
-                        )
-                        return ToolCall(
-                            tool_use_id=f"gemini-{tc_data['name']}-0",
-                            name=tc_data["name"],
-                            input=tc_data.get("input", {}),
-                        )
-            except (json.JSONDecodeError, KeyError, TypeError):
-                continue
+                if ch == '"':
+                    break
+                if ch == "\n":
+                    fixed_parts.append("\\n")
+                elif ch == "\t":
+                    fixed_parts.append("\\t")
+                elif ch == "\r":
+                    fixed_parts.append("\\r")
+                else:
+                    fixed_parts.append(ch)
+                i += 1
+            fixed = "".join(fixed_parts) + candidate[i:]
+            if fixed != candidate:
+                tc = _try_parse(fixed)
+                if tc:
+                    logger.warning(
+                        "Recovered Gemini tool call after fixing "
+                        "unescaped newlines in content field"
+                    )
+                    return tc
+            return None
+
+        # Strip markdown code fences if present
+        stripped = text.strip()
+        fence_match = _re.search(
+            r"```(?:json)?\s*\n?(.*?)```", stripped, _re.DOTALL,
+        )
+        if fence_match:
+            stripped = fence_match.group(1).strip()
+
+        # ── Strategy 1: anchor on "tool_call" substring ──────────────────
+        # Gemini often emits code/explanation BEFORE the JSON tool call.
+        # Scanning from the first '{' latches onto code braces instead.
+        # Find the `{"tool_call"` marker and extract from there.
+        # Scan ALL occurrences — "tool_call" may appear as a *value* in
+        # earlier JSON or prose before the real `{"tool_call": ...}` key.
+        _marker = '"tool_call"'
+        _search_start = 0
+        while True:
+            tc_anchor = stripped.find(_marker, _search_start)
+            if tc_anchor == -1:
+                break
+            # Walk backwards to find the opening '{'
+            obj_start = stripped.rfind("{", 0, tc_anchor)
+            if obj_start != -1:
+                balanced = _balanced_extract(stripped, obj_start)
+                if balanced:
+                    tc = _try_parse(balanced)
+                    if tc:
+                        return tc
+                    tc = _try_fix_newlines(balanced)
+                    if tc:
+                        return tc
+            # This occurrence didn't yield a valid tool call — try next one
+            _search_start = tc_anchor + len(_marker)
+
+        # ── Strategy 2: first '{' fast path (clean JSON responses) ───────
+        start = stripped.find("{")
+        if start == -1:
+            return None
+
+        candidates: list[str] = []
+        balanced = _balanced_extract(stripped, start)
+        if balanced:
+            candidates.append(balanced)
+        candidates.append(stripped[start:])
+
+        for candidate in candidates:
+            tc = _try_parse(candidate)
+            if tc:
+                return tc
+
+        # ── Strategy 3: fix unescaped newlines in content field ──────────
+        for candidate in candidates:
+            tc = _try_fix_newlines(candidate)
+            if tc:
+                return tc
 
         # Log the failure for debugging
         if '"tool_call"' in text or '"write_file"' in text:

@@ -171,3 +171,49 @@ class TestExtractGeminiToolCall:
         assert tc is not None
         assert tc.name == "write_file"
         assert "HashMap" in tc.input["content"]
+
+    def test_code_with_braces_before_tool_call(self):
+        """Gemini emits code (with braces) THEN the tool call JSON.
+
+        The old parser latched onto the first '{' in the code and missed
+        the actual tool call.  This was the root cause of the production
+        failure where ComponentGeneratorAgent burned 12 iterations.
+        """
+        text = (
+            "I'll implement RegisterForm. Let me check Label first.\n\n"
+            "export default function RegisterForm() {\n"
+            "  return <form></form>;\n"
+            "}\n\n"
+            '{"tool_call": {"name": "read_file", "input": '
+            '{"path": "src/components/ui/Label.tsx"}}}'
+        )
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "read_file"
+        assert tc.input["path"] == "src/components/ui/Label.tsx"
+
+    def test_code_before_and_after_tool_call(self):
+        """Tool call JSON sandwiched between code and explanation."""
+        text = (
+            "function App() {\n"
+            '  return { key: "value" };\n'
+            "}\n\n"
+            '{"tool_call": {"name": "write_file", "input": '
+            '{"path": "App.tsx", "content": "code"}}}\n\n'
+            "I hope this helps!"
+        )
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "write_file"
+
+    def test_unescaped_newlines_with_leading_code(self):
+        """Code before JSON + unescaped newlines in the content field."""
+        text = (
+            "// existing code\nfunction old() { return 1; }\n\n"
+            '{"tool_call": {"name": "write_file", "input": '
+            '{"path": "R.tsx", "content": "line1\nline2\nline3"}}}'
+        )
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "write_file"
+        assert "line1" in tc.input["content"]
