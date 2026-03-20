@@ -249,40 +249,79 @@ class ComponentGeneratorAgent(BaseAgent):
                 req_text += f"Features: {', '.join(requirements.features[:5])}\n"
 
         contract_text = ""
-        if contract and component and component.api_calls:
-            # Match endpoints where the call path is a prefix of the endpoint
-            # path or vice-versa, handling parameterised segments correctly.
-            # e.g. call="/users" matches ep="/users" and ep="/users/{id}".
-            def _paths_match(call: str, ep_path: str) -> bool:
-                call_stripped = call.strip("/").split("?")[0]
-                ep_stripped = ep_path.strip("/")
-                return (
-                    call_stripped == ep_stripped
-                    or ep_stripped.startswith(call_stripped + "/")
-                    or call_stripped.startswith(ep_stripped + "/")
-                )
+        if contract and component:
+            import json as _json
 
-            relevant = [
-                ep for ep in contract.endpoints
-                if any(_paths_match(call, ep.path) for call in component.api_calls)
-            ]
-            if relevant:
-                import json as _json
-                endpoint_lines: list[str] = []
-                for ep in relevant:
-                    line = f"  {ep.method} {ep.path}: {ep.description}"
-                    if ep.request_schema:
-                        try:
-                            line += f"\n    Request: {_json.dumps(ep.request_schema)}"
-                        except Exception:
-                            pass
-                    if ep.response_schema:
-                        try:
-                            line += f"\n    Response: {_json.dumps(ep.response_schema)}"
-                        except Exception:
-                            pass
-                    endpoint_lines.append(line)
-                contract_text = f"Relevant API endpoints:\n" + "\n".join(endpoint_lines) + "\n"
+            # ── Endpoint details for components with API calls ────────────
+            if component.api_calls and contract.endpoints:
+                # Match endpoints where the call path is a prefix of the endpoint
+                # path or vice-versa, handling parameterised segments correctly.
+                def _paths_match(call: str, ep_path: str) -> bool:
+                    call_stripped = call.strip("/").split("?")[0]
+                    ep_stripped = ep_path.strip("/")
+                    return (
+                        call_stripped == ep_stripped
+                        or ep_stripped.startswith(call_stripped + "/")
+                        or call_stripped.startswith(ep_stripped + "/")
+                    )
+
+                relevant = [
+                    ep for ep in contract.endpoints
+                    if any(_paths_match(call, ep.path) for call in component.api_calls)
+                ]
+                if relevant:
+                    endpoint_lines: list[str] = []
+                    for ep in relevant:
+                        line = f"  {ep.method} {ep.path}: {ep.description}"
+                        if ep.request_schema:
+                            try:
+                                line += f"\n    Request: {_json.dumps(ep.request_schema)}"
+                            except Exception:
+                                pass
+                        if ep.response_schema:
+                            try:
+                                line += f"\n    Response: {_json.dumps(ep.response_schema)}"
+                            except Exception:
+                                pass
+                        endpoint_lines.append(line)
+                    contract_text = "Relevant API endpoints:\n" + "\n".join(endpoint_lines) + "\n\n"
+
+            # ── Schema definitions — always inject when available ──────────
+            # Store files and components that consume API data must define
+            # TypeScript types that EXACTLY match the contract schemas.
+            # Without this, the LLM invents fields (e.g. AuthResponse.user)
+            # that don't exist in the actual API response.
+            if contract.schemas:
+                # Filter schemas relevant to this component's API calls or
+                # state needs; fall back to all schemas for store/lib files.
+                is_store = any(
+                    seg in (component.file_path or "")
+                    for seg in ("store", "lib", "hooks")
+                )
+                relevant_schemas = contract.schemas
+                if not is_store and component.api_calls:
+                    # Try to narrow to schemas referenced by matched endpoints
+                    ep_text = contract_text.lower()
+                    filtered = {
+                        k: v for k, v in contract.schemas.items()
+                        if k.lower() in ep_text
+                    }
+                    if filtered:
+                        relevant_schemas = filtered
+
+                schema_lines: list[str] = [
+                    "API CONTRACT SCHEMAS — your TypeScript types MUST match these EXACTLY.",
+                    "Do NOT add, remove, or rename fields. If you define an interface or type",
+                    "for an API response, it must have ONLY the fields listed here:\n",
+                ]
+                for name, definition in relevant_schemas.items():
+                    schema_lines.append(f"  {name}:")
+                    try:
+                        schema_lines.append(f"    {_json.dumps(definition, indent=4)}")
+                    except Exception:
+                        schema_lines.append(f"    {definition}")
+                schema_lines.append("")
+                contract_text += "\n".join(schema_lines) + "\n"
 
         # Build dependency reading instructions
         dep_instructions = ""
@@ -445,6 +484,7 @@ class ComponentGeneratorAgent(BaseAgent):
             )
 
         plan: ComponentPlan | None = context.task.metadata.get("component_plan")
+        contract: APIContract | None = context.task.metadata.get("api_contract")
         plan_info = ""
         if plan:
             plan_info = (
@@ -452,9 +492,28 @@ class ComponentGeneratorAgent(BaseAgent):
                 f"State solution: {plan.state_solution}\n\n"
             )
 
+        # Inject API contract schemas so the fix agent knows the exact
+        # fields each API response type should have.
+        schema_text = ""
+        if contract and contract.schemas:
+            import json as _json
+            schema_lines = [
+                "API CONTRACT SCHEMAS — your TypeScript types MUST match these EXACTLY.",
+                "Do NOT add, remove, or rename fields:\n",
+            ]
+            for name, definition in contract.schemas.items():
+                schema_lines.append(f"  {name}:")
+                try:
+                    schema_lines.append(f"    {_json.dumps(definition, indent=4)}")
+                except Exception:
+                    schema_lines.append(f"    {definition}")
+            schema_lines.append("")
+            schema_text = "\n".join(schema_lines) + "\n"
+
         prompt = (
             f"{comp_info}{plan_info}"
             f"{store_sigs}{dep_sigs}"
+            f"{schema_text}"
             f"{related_section}"
             f"FIX TASK for: {file_path}\n\n"
             f"Current content:\n```typescript\n{current_content}\n```\n\n"

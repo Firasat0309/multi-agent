@@ -2005,6 +2005,114 @@ class TestComponentGeneratorTypeExtraction:
         assert lines == []
 
 
+class TestComponentGeneratorContractSchemas:
+    """Verify API contract schemas are injected into component generation."""
+
+    def test_store_component_gets_all_schemas(self, mock_llm, mock_repo_manager):
+        """Store files should receive ALL contract schemas."""
+        from agents.component_generator_agent import ComponentGeneratorAgent
+
+        agent = ComponentGeneratorAgent(
+            llm_client=mock_llm, repo_manager=mock_repo_manager
+        )
+        component = UIComponent(
+            name="AuthStore",
+            file_path="src/store/authStore.ts",
+            component_type="shared",
+            description="Auth state management",
+            api_calls=["/auth/login", "/auth/register"],
+        )
+        contract = APIContract(
+            title="API",
+            endpoints=[
+                APIEndpoint(
+                    path="/auth/login", method="POST",
+                    description="Login",
+                    response_schema={"token": "string", "refreshToken": "string"},
+                ),
+                APIEndpoint(
+                    path="/auth/register", method="POST",
+                    description="Register",
+                    response_schema={"token": "string", "refreshToken": "string"},
+                ),
+            ],
+            schemas={
+                "AuthResponse": {
+                    "type": "object",
+                    "properties": {
+                        "token": {"type": "string"},
+                        "refreshToken": {"type": "string"},
+                    },
+                },
+                "User": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "email": {"type": "string"},
+                    },
+                },
+            },
+        )
+        context = AgentContext(
+            task=Task(
+                task_id=1,
+                task_type=TaskType.GENERATE_COMPONENT,
+                file=component.file_path,
+                description="Generate auth store",
+                metadata={
+                    "component": component,
+                    "api_contract": contract,
+                },
+            ),
+            blueprint=MagicMock(),
+        )
+        prompt = agent._build_prompt(context)
+        # Store file should see schemas
+        assert "API CONTRACT SCHEMAS" in prompt
+        assert "AuthResponse" in prompt
+        assert "refreshToken" in prompt
+        # Critical: instruction to match exactly
+        assert "MUST match these EXACTLY" in prompt
+
+    def test_component_without_api_calls_still_gets_schemas(
+        self, mock_llm, mock_repo_manager
+    ):
+        """Non-API components should still receive schemas if contract exists."""
+        from agents.component_generator_agent import ComponentGeneratorAgent
+
+        agent = ComponentGeneratorAgent(
+            llm_client=mock_llm, repo_manager=mock_repo_manager
+        )
+        component = UIComponent(
+            name="ProfileCard",
+            file_path="src/components/feature/ProfileCard.tsx",
+            component_type="feature",
+            description="Displays user profile",
+            api_calls=[],
+        )
+        contract = APIContract(
+            title="API",
+            schemas={"User": {"type": "object", "properties": {"email": {"type": "string"}}}},
+        )
+        context = AgentContext(
+            task=Task(
+                task_id=1,
+                task_type=TaskType.GENERATE_COMPONENT,
+                file=component.file_path,
+                description="Generate profile card",
+                metadata={
+                    "component": component,
+                    "api_contract": contract,
+                },
+            ),
+            blueprint=MagicMock(),
+        )
+        prompt = agent._build_prompt(context)
+        # Should still see schemas even without api_calls
+        assert "API CONTRACT SCHEMAS" in prompt
+        assert "User" in prompt
+
+
 # ── CoderAgent API contract section tests ────────────────────────────────────
 
 
