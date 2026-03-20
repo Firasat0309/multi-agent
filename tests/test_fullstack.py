@@ -1913,7 +1913,7 @@ class TestCoderAgentApiContractSection:
         assert "API CONTRACT" in section
         assert "/tasks" in section
 
-    def test_extract_api_contract_section_model_layer_empty(
+    def test_extract_api_contract_section_model_layer_gets_schemas(
         self, mock_llm, mock_repo_manager, sample_api_contract
     ):
         from agents.coder_agent import CoderAgent
@@ -1941,7 +1941,45 @@ class TestCoderAgentApiContractSection:
             api_contract=sample_api_contract,
         )
         section = agent._extract_api_contract_section(ctx)
-        # Model layer should NOT include the API contract
+        # Model layer should receive schema definitions from the contract
+        assert "API CONTRACT SCHEMAS" in section
+        assert "Task" in section
+
+    def test_extract_api_contract_section_model_layer_empty_without_schemas(
+        self, mock_llm, mock_repo_manager,
+    ):
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/models/Task.java",
+            purpose="Task model",
+            layer="model",
+        )
+        task = Task(
+            task_id=1,
+            task_type=TaskType.GENERATE_FILE,
+            file=fb.path,
+            description="gen",
+        )
+        # Contract with no schemas — model layer should get empty section
+        contract_no_schemas = APIContract(
+            title="API", endpoints=[
+                APIEndpoint(path="/tasks", method="GET", description="List"),
+            ],
+            schemas={},
+        )
+        ctx = AgentContext(
+            task=task,
+            blueprint=blueprint,
+            file_blueprint=fb,
+            api_contract=contract_no_schemas,
+        )
+        section = agent._extract_api_contract_section(ctx)
         assert section == ""
 
     def test_extract_api_contract_section_no_contract(
@@ -1968,6 +2006,378 @@ class TestCoderAgentApiContractSection:
         ctx = AgentContext(task=task, blueprint=blueprint, file_blueprint=fb)
         section = agent._extract_api_contract_section(ctx)
         assert section == ""
+
+    def test_extract_api_contract_section_config_layer_skipped(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """Config layer files should NOT receive the API contract."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/config/SecurityConfig.java",
+            purpose="Security config",
+            layer="config",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        assert section == ""
+
+    def test_extract_api_contract_section_unknown_layer_gets_schemas(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """Unknown/custom layers should still receive schema definitions."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        # Architect used a non-standard layer name
+        fb = FileBlueprint(
+            path="src/adapter/TaskMapper.java",
+            purpose="Maps Task entity to DTO",
+            layer="adapter",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        assert "API CONTRACT SCHEMAS" in section
+        assert "Task" in section
+
+    def test_extract_api_contract_section_service_gets_endpoints(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """Service layer should receive full endpoint details."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/service/TaskService.java",
+            purpose="Task business logic",
+            layer="service",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        assert "API CONTRACT" in section
+        assert "/tasks" in section
+
+    def test_extract_api_contract_section_config_path_skipped(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """Files with config-like paths should be skipped even with empty layer."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/main/resources/application.properties",
+            purpose="App config",
+            layer="",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        assert section == ""
+
+    def test_extract_api_contract_section_go_directory_keywords(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """Go handler where entity name is in directory, not file stem."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="internal/task/handler.go",
+            purpose="HTTP handler for tasks",
+            layer="handler",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        # Should get endpoint details (handler layer) with /tasks matched
+        # via "task" keyword from parent directory
+        assert "API CONTRACT" in section
+        assert "/tasks" in section
+
+    def test_extract_api_contract_section_rust_mod_rs(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """Rust mod.rs where entity name is only in directory."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/models/user/mod.rs",
+            purpose="User domain model",
+            layer="model",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        # Should get schema section with User matched from directory name
+        assert "API CONTRACT SCHEMAS" in section
+        assert "User" in section
+
+    def test_extract_api_contract_section_python_plural_match(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """Python file with plural name matches singular schema."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="app/crud/tasks.py",
+            purpose="Task CRUD operations",
+            layer="crud",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        # crud in purpose → endpoint-facing; "tasks" singularized to "task" matches /tasks
+        assert "API CONTRACT" in section
+        assert "/tasks" in section
+
+    def test_extract_api_contract_section_exports_keyword(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """Keywords from exports should help match schemas."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        # Generic filename but exports reveal the entity
+        fb = FileBlueprint(
+            path="src/domain/aggregate.rs",
+            purpose="Domain aggregate root",
+            layer="domain",
+            exports=["TaskAggregate"],
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        assert "API CONTRACT SCHEMAS" in section
+        assert "Task" in section
+
+    def test_extract_api_contract_section_no_false_positive_on_rest_in_path(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """'forest' in path should NOT trigger endpoint-facing detection."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/models/ForestData.java",
+            purpose="Forest data model",
+            layer="model",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        # Should get schemas (model layer), NOT endpoint details
+        if section:
+            assert "API CONTRACT SCHEMAS" in section
+            assert "API CONTRACT —" not in section
+
+    def test_extract_api_contract_section_migration_service_not_skipped(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """migration_service.py should NOT be skipped — only config files."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/services/migration_service.py",
+            purpose="Data migration service",
+            layer="service",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        # Service layer is endpoint-facing, should get contract
+        assert "API CONTRACT" in section
+
+    def test_extract_api_contract_section_none_schemas_no_crash(
+        self, mock_llm, mock_repo_manager,
+    ):
+        """Endpoints with None request/response schemas should not crash."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/controllers/TaskController.java",
+            purpose="Task controller",
+            layer="controller",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        contract = APIContract(
+            title="API",
+            endpoints=[
+                APIEndpoint(
+                    path="/tasks", method="GET", description="List",
+                    request_schema=None, response_schema=None,
+                ),
+            ],
+            schemas={"Task": {"type": "object"}},
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=contract,
+        )
+        # Should not raise
+        section = agent._extract_api_contract_section(ctx)
+        assert "API CONTRACT" in section
+
+    def test_extract_api_contract_section_all_noise_tokens_no_dump(
+        self, mock_llm, mock_repo_manager, sample_api_contract
+    ):
+        """When all file tokens are noise words, don't dump all schemas."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        # Every token in path/purpose is a noise word
+        fb = FileBlueprint(
+            path="src/app/index.ts",
+            purpose="Main app module",
+            layer="module",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=sample_api_contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        # Should return empty — no entity signal, don't dump all schemas
+        assert section == ""
+
+    def test_extract_api_contract_section_singularize_status_preserved(
+        self, mock_llm, mock_repo_manager,
+    ):
+        """'status' should not be singularized to 'statu'."""
+        from agents.coder_agent import CoderAgent
+
+        agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
+        blueprint = RepositoryBlueprint(
+            name="bp", description="", architecture_style="REST"
+        )
+        fb = FileBlueprint(
+            path="src/models/TaskStatus.java",
+            purpose="Task status enum",
+            layer="model",
+        )
+        task = Task(
+            task_id=1, task_type=TaskType.GENERATE_FILE,
+            file=fb.path, description="gen",
+        )
+        contract = APIContract(
+            title="API",
+            schemas={"TaskStatus": {"type": "string", "enum": ["OPEN", "CLOSED"]}},
+        )
+        ctx = AgentContext(
+            task=task, blueprint=blueprint, file_blueprint=fb,
+            api_contract=contract,
+        )
+        section = agent._extract_api_contract_section(ctx)
+        assert "TaskStatus" in section
 
 
 # ── BaseAgent _format_context api_contract section tests ─────────────────────

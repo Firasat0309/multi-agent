@@ -340,77 +340,265 @@ class CoderAgent(BaseAgent):
 
     @staticmethod
     def _extract_api_contract_section(context: AgentContext) -> str:
-        """Return an API contract block for controller / service / route files.
+        """Return an API contract block for any code file (denylist approach).
 
-        Only injects contract details when:
-        1. An api_contract is present on the context (fullstack mode).
-        2. The file being generated is a controller, handler, router, or route layer.
+        Injects contract details to ALL files except non-code layers where
+        the contract is irrelevant (config, infrastructure, build, deploy,
+        docs).  This is language-agnostic — no hardcoded allowlist of layer
+        names that would silently miss architect-chosen naming conventions.
 
-        This avoids polluting model/repository prompts with irrelevant contract noise.
+        The injection format adapts based on what the file likely needs:
+
+        - **Endpoint-facing layers** (file stem contains controller/handler/
+          router/route/service keywords, or layer is explicitly one of those):
+          Full endpoint details with request/response schemas.
+
+        - **All other code layers** (models, DTOs, repositories, mappers,
+          adapters, utilities, etc.):
+          Shared schema definitions so field names and types align across the
+          entire codebase.
 
         Endpoint filtering uses a two-pass strategy so files like
         ``UserAuthController.java`` still match ``/users`` endpoints:
           Pass 1 — check if the file-stem word appears in the endpoint path or tags.
-          Pass 2 — fall back to all endpoints when no matches found (ensures the
-                   agent always sees the full contract for routing files).
+          Pass 2 — fall back to all endpoints when no matches found.
         """
         fb = context.file_blueprint
         if not context.api_contract or not fb:
             return ""
 
-        _CONTRACT_LAYERS = {"controller", "handler", "router", "route", "api", "resource"}
-        if fb.layer.lower() not in _CONTRACT_LAYERS:
-            return ""
-
         ac = context.api_contract
-        if not ac.endpoints:
+        layer = fb.layer.lower() if fb.layer else ""
+
+        # Skip layers where the API contract adds no value.
+        _SKIP_LAYERS = {
+            "config", "configuration", "infrastructure", "build", "deploy",
+            "docs", "documentation", "test", "testing", "migration",
+        }
+        if layer in _SKIP_LAYERS:
             return ""
 
-        # Derive candidate keywords from the file stem by removing common routing
-        # suffixes and splitting on camelCase / underscores.  E.g.:
-        #   "UserAuthController.java" → {"userauth", "user", "auth"}
+        # Also skip common config file patterns by path when layer is empty
+        # or non-standard (architect didn't set a recognised layer name).
+        # Uses filename/segment matching (not substring) to avoid false
+        # positives like "reconfiguration" matching "config".
+        path_lower = fb.path.lower()
+        _path_parts = {p.lower() for p in Path(fb.path).parts}
+        _filename = Path(fb.path).name.lower()
+        _SKIP_PATH_SEGMENTS = {
+            "config", "configuration", "migration", "migrations",
+        }
+        _SKIP_FILENAMES = {
+            "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+            "webpack.config.js", "webpack.config.ts",
+            "vite.config.js", "vite.config.ts", "vite.config.mjs",
+            "tsconfig.json", "tsconfig.base.json",
+            ".eslintrc.js", ".eslintrc.json", "eslint.config.js",
+            ".prettierrc", ".prettierrc.json",
+            "build.gradle", "build.gradle.kts", "settings.gradle",
+            "pom.xml",
+            "settings.py", "manage.py",
+            "application.properties", "application.yml", "application.yaml",
+        }
+        if _path_parts & _SKIP_PATH_SEGMENTS or _filename in _SKIP_FILENAMES:
+            return ""
+
+        if not ac.endpoints and not ac.schemas:
+            return ""
+
         import re as _re
         import json as _json
 
-        raw_stem = _re.sub(
-            r"(controller|handler|router|route|resource|api)",
-            " ",
-            Path(fb.path).stem,
-            flags=_re.IGNORECASE,
-        )
-        # Split on camelCase boundaries and non-alphanumeric characters
-        words = {
-            w.lower()
-            for w in _re.split(r"(?<=[a-z])(?=[A-Z])|[^a-zA-Z0-9]+", raw_stem)
-            if len(w) > 1
+        # ── Derive entity keywords from multiple sources ─────────────────
+        # Language-agnostic: works for CamelCase (Java/C#/Kotlin),
+        # snake_case (Python/Rust), dot-separated (TS), and directory-
+        # based naming (Go: internal/user/handler.go).
+        _NOISE_WORDS = {
+            # Layer/role suffixes (all languages)
+            "controller", "handler", "router", "route", "resource", "api",
+            "service", "usecase", "repository", "repo", "impl", "model",
+            "entity", "dto", "request", "response", "schema", "store",
+            "crud", "views", "view", "concerns", "middleware", "guard",
+            "interceptor", "filter", "pipe", "module", "provider",
+            "factory", "adapter", "mapper", "gateway", "facade",
+            "transport", "delivery", "presentation", "domain", "port",
+            # Generic filenames
+            "index", "mod", "lib", "main", "base", "abstract", "interface",
+            "types", "utils", "helpers", "constants", "common", "shared",
+            "src", "app", "internal", "pkg", "cmd",
         }
 
-        def _matches(ep: "APIEndpoint") -> bool:
-            path_lower = ep.path.lower()
-            tags_lower = " ".join(ep.tags).lower()
-            return any(w in path_lower or w in tags_lower for w in words)
+        def _tokenize(text: str) -> set[str]:
+            """Split text on CamelCase, snake_case, dots, hyphens."""
+            parts = _re.split(r"(?<=[a-z])(?=[A-Z])|[^a-zA-Z0-9]+", text)
+            return {w.lower() for w in parts if len(w) > 1}
 
-        relevant = [ep for ep in ac.endpoints if _matches(ep)] or list(ac.endpoints)
+        def _singularize(word: str) -> str:
+            """Simple English singular: tasks→task, entities→entity.
+
+            Conservative: only strips suffixes that are almost always
+            inflectional. Leaves ambiguous words (status, address, bus)
+            untouched to avoid corrupting keywords.
+            """
+            _NO_STRIP = {
+                "status", "address", "bus", "class", "process",
+                "access", "success", "progress", "canvas", "alias",
+                "bonus", "campus", "corpus", "focus", "genus",
+                "nexus", "radius", "stimulus", "virus", "consensus",
+            }
+            if word in _NO_STRIP:
+                return word
+            if word.endswith("ies") and len(word) > 4:
+                return word[:-3] + "y"
+            if word.endswith("ses") or word.endswith("xes") or word.endswith("zes"):
+                return word[:-2]
+            if word.endswith("es") and len(word) > 4:
+                return word[:-2]
+            if word.endswith("s") and len(word) > 3 and not word.endswith("ss"):
+                return word[:-1]
+            return word
+
+        raw_words: set[str] = set()
+
+        # Source 1: file stem (TaskController.java → task)
+        raw_words |= _tokenize(Path(fb.path).stem)
+
+        # Source 2: parent directories (internal/user/handler.go → user)
+        for part in Path(fb.path).parent.parts:
+            raw_words |= _tokenize(part)
+
+        # Source 3: blueprint purpose ("Task business logic" → task)
+        if fb.purpose:
+            raw_words |= _tokenize(fb.purpose)
+
+        # Source 4: blueprint exports (["TaskService"] → task)
+        for export in (fb.exports or []):
+            raw_words |= _tokenize(export)
+
+        # Filter noise and add singular forms
+        words: set[str] = set()
+        for w in raw_words:
+            if w not in _NOISE_WORDS:
+                words.add(w)
+                singular = _singularize(w)
+                if singular != w:
+                    words.add(singular)
+
+        # ── Detect whether this file is endpoint-facing ──────────────────
+        # Check layer, path tokens, AND purpose tokens — covers all language
+        # conventions. Uses token-level matching (not substring) to avoid
+        # false positives like "forest" matching "rest".
+        _ENDPOINT_HINTS = {
+            "controller", "handler", "router", "route", "api", "resource",
+            "service", "usecase", "endpoint", "transport", "delivery",
+            "rest", "web", "grpc", "graphql", "crud", "views",
+        }
+        _check_tokens = {layer} | _tokenize(path_lower) | _tokenize((fb.purpose or "").lower())
+        is_endpoint_facing = bool(_check_tokens & _ENDPOINT_HINTS)
+
+        # ── Endpoint-facing files: full endpoint details + schemas ───────
+        if is_endpoint_facing and ac.endpoints:
+            def _matches(ep: "APIEndpoint") -> bool:
+                ep_path_lower = ep.path.lower()
+                tags_lower = " ".join(ep.tags).lower()
+                return any(w in ep_path_lower or w in tags_lower for w in words)
+
+            relevant = [ep for ep in ac.endpoints if _matches(ep)] or list(ac.endpoints)
+
+            lines = [
+                "API CONTRACT — implement these endpoints EXACTLY as specified:",
+                f"  Base URL: {ac.base_url}",
+            ]
+            for ep in relevant:
+                auth = " [requires authentication]" if ep.auth_required else ""
+                lines.append(f"  {ep.method} {ep.path}{auth}")
+                lines.append(f"    Description: {ep.description}")
+                if ep.request_schema:
+                    try:
+                        lines.append(f"    Request body: {_json.dumps(ep.request_schema)}")
+                    except Exception:
+                        pass
+                if ep.response_schema:
+                    try:
+                        lines.append(f"    Response body: {_json.dumps(ep.response_schema)}")
+                    except Exception:
+                        pass
+
+            # Append relevant shared schemas
+            if ac.schemas:
+                schema_lines: list[str] = []
+                ep_text = " ".join(
+                    _json.dumps(ep.request_schema or {}) + _json.dumps(ep.response_schema or {})
+                    for ep in relevant
+                )
+                for schema_name, schema_def in ac.schemas.items():
+                    if schema_name.lower() in ep_text.lower() or any(
+                        w in schema_name.lower() for w in words
+                    ):
+                        try:
+                            schema_lines.append(
+                                f"  {schema_name}: {_json.dumps(schema_def)}"
+                            )
+                        except Exception:
+                            pass
+                if schema_lines:
+                    lines.append("")
+                    lines.append("Shared DTO/Model schemas (use these EXACT field names and types):")
+                    lines.extend(schema_lines)
+
+            lines.append("")
+            return "\n".join(lines) + "\n"
+
+        # ── All other code files: inject schema definitions ──────────────
+        if not ac.schemas:
+            return ""
+
+        # Filter schemas by keyword match.  Only fall back to all schemas
+        # when we have entity keywords but none matched — if `words` is
+        # empty (all tokens were noise), we have no signal and should not
+        # dump the entire schema catalog into the prompt.
+        def _schema_matches(name: str) -> bool:
+            name_lower = name.lower()
+            return any(w in name_lower for w in words)
+
+        if not words:
+            return ""
+
+        relevant_schemas = {
+            k: v for k, v in ac.schemas.items() if _schema_matches(k)
+        }
+        if not relevant_schemas:
+            relevant_schemas = ac.schemas
 
         lines = [
-            "API CONTRACT — implement these endpoints EXACTLY as specified:",
-            f"  Base URL: {ac.base_url}",
+            "API CONTRACT SCHEMAS — your model/DTO MUST match these definitions exactly.",
+            "Field names, types, and required/optional status must align so controllers",
+            "and services that reference this model compile without type mismatches:",
+            "",
         ]
-        for ep in relevant:
-            auth = " [requires authentication]" if ep.auth_required else ""
-            lines.append(f"  {ep.method} {ep.path}{auth}")
-            lines.append(f"    Description: {ep.description}")
-            if ep.request_schema:
-                try:
-                    lines.append(f"    Request body: {_json.dumps(ep.request_schema)}")
-                except Exception:
-                    pass
-            if ep.response_schema:
-                try:
-                    lines.append(f"    Response body: {_json.dumps(ep.response_schema)}")
-                except Exception:
-                    pass
+        for schema_name, schema_def in relevant_schemas.items():
+            lines.append(f"  Schema: {schema_name}")
+            try:
+                lines.append(f"    {_json.dumps(schema_def, indent=4)}")
+            except Exception:
+                lines.append(f"    {schema_def}")
         lines.append("")
+
+        # Show which endpoints use these schemas for usage context.
+        if ac.endpoints:
+            usage_lines: list[str] = []
+            for ep in ac.endpoints:
+                ep_schemas = _json.dumps(ep.request_schema or {}) + _json.dumps(ep.response_schema or {})
+                for sname in relevant_schemas:
+                    if sname.lower() in ep_schemas.lower():
+                        usage_lines.append(
+                            f"  {ep.method} {ep.path} uses {sname}"
+                        )
+                        break
+            if usage_lines:
+                lines.append("Endpoints referencing these schemas:")
+                lines.extend(usage_lines)
+                lines.append("")
 
         return "\n".join(lines) + "\n"
 
