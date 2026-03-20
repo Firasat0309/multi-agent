@@ -1080,3 +1080,153 @@ class TestFrontendE2EWriteConfigEdgeCases:
 
         pkg = json.loads((ws / "package.json").read_text())
         assert "zustand" in pkg.get("dependencies", {})
+
+    def test_nextjs_segment_layouts_injected(self, tmp_path):
+        """Nested page routes should get auto-injected segment layouts."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "next-app"
+        ws.mkdir()
+        plan = ComponentPlan(
+            components=[
+                UIComponent(
+                    name="DashboardPage",
+                    file_path="src/app/dashboard/page.tsx",
+                    component_type="page",
+                    description="Dashboard",
+                ),
+                UIComponent(
+                    name="SettingsPage",
+                    file_path="src/app/dashboard/settings/page.tsx",
+                    component_type="page",
+                    description="Settings",
+                ),
+                UIComponent(
+                    name="HomePage",
+                    file_path="src/app/page.tsx",
+                    component_type="page",
+                    description="Home",
+                ),
+            ],
+            framework="nextjs",
+            state_solution="zustand",
+            api_base_url="/api",
+        )
+        req = ProductRequirements(title="App", description="Test",
+                                  tech_preferences={"styling": "tailwind"})
+
+        FrontendPipeline._write_config_files(ws, plan, req)
+
+        # Root layout should exist
+        assert (ws / "src" / "app" / "layout.tsx").exists()
+        # Dashboard segment layout should be auto-injected
+        assert (ws / "src" / "app" / "dashboard" / "layout.tsx").exists()
+        dashboard_layout = (ws / "src" / "app" / "dashboard" / "layout.tsx").read_text()
+        assert "DashboardLayout" in dashboard_layout
+        assert "children" in dashboard_layout
+        # Settings is nested under dashboard — dashboard layout covers it,
+        # but settings itself also needs a layout
+        assert (ws / "src" / "app" / "dashboard" / "settings" / "layout.tsx").exists()
+        # Home page is direct child of app/ — no extra layout needed
+        # (root layout handles it)
+
+    def test_nextjs_no_duplicate_layouts(self, tmp_path):
+        """If component planner already created a layout, don't overwrite it."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "next-app"
+        ws.mkdir()
+        # Pre-create a custom dashboard layout
+        dash_dir = ws / "src" / "app" / "dashboard"
+        dash_dir.mkdir(parents=True)
+        custom_layout = "export default function CustomDashboardLayout({ children }) { return <nav>{children}</nav>; }\n"
+        (dash_dir / "layout.tsx").write_text(custom_layout)
+
+        plan = ComponentPlan(
+            components=[
+                UIComponent(
+                    name="DashboardPage",
+                    file_path="src/app/dashboard/page.tsx",
+                    component_type="page",
+                    description="Dashboard",
+                ),
+            ],
+            framework="nextjs",
+            state_solution="zustand",
+            api_base_url="/api",
+        )
+        req = ProductRequirements(title="App", description="Test",
+                                  tech_preferences={"styling": "tailwind"})
+
+        FrontendPipeline._write_config_files(ws, plan, req)
+
+        # Custom layout should NOT be overwritten
+        assert "CustomDashboardLayout" in (dash_dir / "layout.tsx").read_text()
+
+    def test_nextjs_non_page_components_ignored(self, tmp_path):
+        """Non-page components should not trigger layout injection."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "next-app"
+        ws.mkdir()
+        plan = ComponentPlan(
+            components=[
+                UIComponent(
+                    name="Button",
+                    file_path="src/components/ui/Button.tsx",
+                    component_type="ui",
+                    description="Button",
+                ),
+            ],
+            framework="nextjs",
+            state_solution="zustand",
+            api_base_url="/api",
+        )
+        req = ProductRequirements(title="App", description="Test",
+                                  tech_preferences={"styling": "tailwind"})
+
+        FrontendPipeline._write_config_files(ws, plan, req)
+
+        # Root layout should exist (always for Next.js)
+        assert (ws / "src" / "app" / "layout.tsx").exists()
+        # No components/ui/layout.tsx should be created
+        assert not (ws / "src" / "components" / "ui" / "layout.tsx").exists()
+
+    def test_nextjs_app_without_src_prefix(self, tmp_path):
+        """When LLM outputs app/ paths (no src/), layouts go to workspace/app/."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "next-app"
+        ws.mkdir()
+        plan = ComponentPlan(
+            components=[
+                UIComponent(
+                    name="DashboardPage",
+                    file_path="app/dashboard/page.tsx",
+                    component_type="page",
+                    description="Dashboard",
+                ),
+                UIComponent(
+                    name="HomePage",
+                    file_path="app/page.tsx",
+                    component_type="page",
+                    description="Home",
+                ),
+            ],
+            framework="nextjs",
+            state_solution="zustand",
+            api_base_url="/api",
+        )
+        req = ProductRequirements(title="App", description="Test",
+                                  tech_preferences={"styling": "tailwind"})
+
+        FrontendPipeline._write_config_files(ws, plan, req)
+
+        # Root layout at app/ (NOT src/app/) — matches page paths
+        assert (ws / "app" / "layout.tsx").exists()
+        root_layout = (ws / "app" / "layout.tsx").read_text()
+        assert "RootLayout" in root_layout
+        # Dashboard segment layout
+        assert (ws / "app" / "dashboard" / "layout.tsx").exists()
+        # Should NOT create src/app/layout.tsx (wrong tree)
+        assert not (ws / "src" / "app" / "layout.tsx").exists()

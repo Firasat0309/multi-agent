@@ -1965,7 +1965,24 @@ class FrontendPipeline:
 
             # Next.js App Router requires a root layout — without it, every
             # page.tsx triggers "doesn't have a root layout" and the build fails.
-            app_dir = workspace / "src" / "app"
+            #
+            # Detect the app/ root from planned page paths.  The LLM may use
+            # "src/app/..." or just "app/..." — we must place the root layout
+            # in the same tree as the pages.
+            page_paths = [
+                c.file_path for c in plan.components
+                if c.component_type == "page" and c.file_path
+            ]
+            # Detect app_prefix: "src/app", "app", or fallback "src/app"
+            app_prefix = "src/app"
+            for pp in page_paths:
+                pp_posix = pp.replace("\\", "/")
+                if "/app/" in pp_posix or pp_posix.startswith("app/"):
+                    idx = pp_posix.find("app/")
+                    app_prefix = pp_posix[:idx + 3]  # e.g. "src/app" or "app"
+                    break
+
+            app_dir = workspace / Path(app_prefix)
             app_dir.mkdir(parents=True, exist_ok=True)
             layout_path = app_dir / "layout.tsx"
             if not layout_path.exists():
@@ -1990,7 +2007,49 @@ class FrontendPipeline:
                     "}\n"
                 )
                 layout_path.write_text(layout_tsx, encoding="utf-8")
-                logger.info("Wrote src/app/layout.tsx")
+                logger.info("Wrote %s/layout.tsx", app_prefix)
+
+            # Next.js App Router also requires a layout at every route segment
+            # that contains a page.  E.g. app/dashboard/page.tsx needs
+            # app/dashboard/layout.tsx (or inherits the root layout only if
+            # the page is a DIRECT child of app/).  Nested segments like
+            # app/dashboard/settings/page.tsx need app/dashboard/layout.tsx.
+            #
+            # Scan all planned page components and inject minimal segment
+            # layouts for any directory that doesn't already have one and
+            # isn't the root app/ dir (which we just handled above).
+            app_prefix_path = Path(app_prefix)
+            for page_path in page_paths:
+                page_dir = Path(page_path.replace("\\", "/")).parent
+                # Skip root app dir — already has layout
+                if page_dir == app_prefix_path:
+                    continue
+                # Walk up from the page's directory to app/, ensuring each
+                # intermediate segment has a layout.
+                parts = page_dir.parts
+                try:
+                    app_idx = list(parts).index("app")
+                except ValueError:
+                    continue
+                for depth in range(app_idx + 1, len(parts)):
+                    seg_dir = workspace / Path(*parts[:depth + 1])
+                    seg_layout = seg_dir / "layout.tsx"
+                    if seg_layout.exists():
+                        continue
+                    seg_dir.mkdir(parents=True, exist_ok=True)
+                    seg_name = parts[depth].replace("-", " ").replace("_", " ").title().replace(" ", "")
+                    segment_layout_tsx = (
+                        f"export default function {seg_name}Layout({{\n"
+                        "  children,\n"
+                        "}: {\n"
+                        "  children: React.ReactNode;\n"
+                        "}) {\n"
+                        "  return <>{children}</>;\n"
+                        "}\n"
+                    )
+                    seg_layout.write_text(segment_layout_tsx, encoding="utf-8")
+                    logger.info("Wrote segment layout %s", seg_layout.relative_to(workspace))
+
         elif "vue" in fw:
             vite_config = (
                 "import { defineConfig } from 'vite';\n"

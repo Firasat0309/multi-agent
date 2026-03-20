@@ -563,8 +563,6 @@ class ComponentGeneratorAgent(BaseAgent):
         parameter list AND each type/interface with its fields, so the LLM
         can match argument counts and field names precisely.
         """
-        import re as _re
-
         # Match exported functions, arrow consts, and zustand store actions
         _EXPORT_FN = _re.compile(
             r"^\s*(?:export\s+)"
@@ -659,7 +657,6 @@ class ComponentGeneratorAgent(BaseAgent):
                 lines.extend(type_lines)
 
             # Exported function/component signatures
-            import re as _re
             for raw_line in content.splitlines():
                 stripped = raw_line.strip()
                 if not stripped or stripped in ("{", "}", "};"):
