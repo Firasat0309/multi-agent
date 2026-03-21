@@ -309,8 +309,10 @@ class PipelineExecutor:
                 logger.info("=== Phase: %s ===", phase.name)
 
                 for tier_idx, tier in enumerate(tiers):
+                    tier_names = [p.rsplit("/", 1)[-1] for p in tier.files]
                     logger.info(
-                        "=== Tier %d: %d files ===", tier.index, len(tier),
+                        "=== Tier %d: %d files === %s",
+                        tier.index, len(tier), tier_names,
                     )
 
                     # Drop stubs for files about to be generated for real.

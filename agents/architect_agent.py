@@ -533,6 +533,81 @@ class ArchitectAgent(BaseAgent):
             for fb in validated.file_blueprints
         ]
 
+        # --- Mandatory Spring Boot files injection ---
+        # LLMs frequently omit Application.java and application.properties.
+        # Inject them when the project is Java-based and they're missing.
+        if project_lang == "java":
+            existing_paths = {fb.path for fb in file_blueprints}
+
+            # Detect common Java package prefix from existing source paths
+            java_dirs = [
+                fp for fp in existing_paths
+                if fp.endswith(".java") and "src/main/java/" in fp
+            ]
+            pkg_prefix = ""
+            if java_dirs:
+                # e.g. "src/main/java/com/example/auth/controller/AuthController.java"
+                # → "src/main/java/com/example/auth"
+                parts = java_dirs[0].split("/")
+                try:
+                    java_idx = parts.index("java")
+                    # Take everything up to but not including the last two segments
+                    # (class file + its immediate package like controller/service/etc.)
+                    pkg_parts = parts[: java_idx + 1]  # ["src","main","java"]
+                    remaining = parts[java_idx + 1 :]   # ["com","example","auth","controller","File.java"]
+                    if len(remaining) > 2:
+                        pkg_parts += remaining[: -2]     # drop "controller/File.java"
+                    elif len(remaining) == 2:
+                        pkg_parts += remaining[:1]       # just the top-level package
+                    pkg_prefix = "/".join(pkg_parts)
+                except ValueError:
+                    pkg_prefix = "src/main/java"
+            else:
+                pkg_prefix = "src/main/java"
+
+            # Inject Application.java if no entry-point class exists
+            has_entry = any(
+                fp.endswith(("Application.java", "App.java", "Main.java"))
+                for fp in existing_paths
+            )
+            if not has_entry:
+                # Derive class name from project name
+                raw_name = validated.name.replace("-", " ").replace("_", " ")
+                class_name = "".join(w.capitalize() for w in raw_name.split()) + "Application"
+                app_path = f"{pkg_prefix}/{class_name}.java"
+                file_blueprints.append(FileBlueprint(
+                    path=app_path,
+                    purpose=f"@SpringBootApplication entry point — {class_name}",
+                    depends_on=[],
+                    exports=[class_name],
+                    language="java",
+                    layer="infrastructure",
+                ))
+                logger.warning(
+                    "Injected mandatory %s — LLM omitted the Spring Boot entry point",
+                    app_path,
+                )
+
+            # Inject application.properties if no config file exists
+            has_config = any(
+                fp.endswith(("application.properties", "application.yml", "application.yaml"))
+                for fp in existing_paths
+            )
+            if not has_config:
+                props_path = "src/main/resources/application.properties"
+                file_blueprints.append(FileBlueprint(
+                    path=props_path,
+                    purpose="Spring Boot application configuration — server port, datasource, JPA settings",
+                    depends_on=[],
+                    exports=[],
+                    language="java",
+                    layer="infrastructure",
+                ))
+                logger.warning(
+                    "Injected mandatory %s — LLM omitted Spring Boot configuration",
+                    props_path,
+                )
+
         return RepositoryBlueprint(
             name=validated.name,
             description=validated.description,
