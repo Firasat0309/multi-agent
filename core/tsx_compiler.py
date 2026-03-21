@@ -71,8 +71,27 @@ class TSXCompileResult:
 class TSXCompiler:
     """Runs the TypeScript compiler in check-only mode and parses its output."""
 
+    @staticmethod
+    def _is_vue_project(workspace: Path) -> bool:
+        """Detect whether *workspace* is a Vue project.
+
+        Checks package.json for a 'vue' dependency or the existence of
+        vue-tsc in devDependencies — faster than scanning for .vue files.
+        """
+        pkg_json = workspace / "package.json"
+        if pkg_json.exists():
+            try:
+                import json
+                pkg = json.loads(pkg_json.read_text(encoding="utf-8"))
+                deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+                if "vue" in deps or "vue-tsc" in deps:
+                    return True
+            except Exception:
+                pass
+        return False
+
     async def check(self, workspace: Path) -> TSXCompileResult:
-        """Run ``tsc --noEmit`` in *workspace* and return structured errors.
+        """Run ``tsc --noEmit`` (or ``vue-tsc --noEmit`` for Vue) in *workspace*.
 
         A missing ``tsconfig.json`` is created automatically with sensible
         defaults so the check can run even on freshly generated workspaces.
@@ -82,9 +101,14 @@ class TSXCompiler:
             tsconfig.write_text(_DEFAULT_TSCONFIG, encoding="utf-8")
             logger.debug("Created default tsconfig.json in %s", workspace)
 
+        # For Vue projects, prefer vue-tsc which understands .vue SFCs.
+        # Fall back to plain tsc if vue-tsc is not available.
+        use_vue_tsc = self._is_vue_project(workspace)
+        compiler = "vue-tsc" if use_vue_tsc else "tsc"
+
         try:
             proc = await asyncio.create_subprocess_exec(
-                "tsc",
+                compiler,
                 "--noEmit",
                 "--pretty",
                 "false",
@@ -93,10 +117,29 @@ class TSXCompiler:
                 stderr=asyncio.subprocess.STDOUT,
             )
         except FileNotFoundError:
-            logger.warning(
-                "tsc not found on PATH — skipping TypeScript compilation check"
-            )
-            return TSXCompileResult(tsc_available=False)
+            if use_vue_tsc:
+                # vue-tsc not installed — fall back to tsc
+                logger.info("vue-tsc not on PATH — falling back to tsc")
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        "tsc",
+                        "--noEmit",
+                        "--pretty",
+                        "false",
+                        cwd=str(workspace),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                    )
+                except FileNotFoundError:
+                    logger.warning(
+                        "Neither vue-tsc nor tsc found on PATH — skipping compilation check"
+                    )
+                    return TSXCompileResult(tsc_available=False)
+            else:
+                logger.warning(
+                    "tsc not found on PATH — skipping TypeScript compilation check"
+                )
+                return TSXCompileResult(tsc_available=False)
 
         try:
             stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=120.0)

@@ -1230,3 +1230,62 @@ class TestFrontendE2EWriteConfigEdgeCases:
         assert (ws / "app" / "dashboard" / "layout.tsx").exists()
         # Should NOT create src/app/layout.tsx (wrong tree)
         assert not (ws / "src" / "app" / "layout.tsx").exists()
+
+
+class TestPreBuildFileVerification:
+    """Verify that the Phase 4a stub-generation logic writes valid stubs."""
+
+    def test_stub_is_valid_tsx(self, tmp_path):
+        """Stubs for missing components should be importable TSX."""
+        comp = UIComponent(
+            name="MissingWidget",
+            file_path="src/components/feature/MissingWidget.tsx",
+            component_type="feature",
+            description="A widget that failed generation",
+        )
+        stub_path = tmp_path / comp.file_path
+        stub_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Simulate the stub-writing logic from Phase 4a
+        stub_name = comp.name or Path(comp.file_path).stem
+        stub = (
+            f"// AUTO-STUB: generation failed for {comp.name}\n"
+            f"// TODO: implement {comp.description or comp.name}\n"
+            f"export default function {stub_name}() {{\n"
+            f"  return <div>{stub_name} — not yet implemented</div>;\n"
+            f"}}\n"
+        )
+        stub_path.write_text(stub, encoding="utf-8")
+
+        content = stub_path.read_text()
+        assert "export default function MissingWidget" in content
+        assert "AUTO-STUB" in content
+        assert "TODO" in content
+
+    def test_missing_file_detection(self, tmp_path):
+        """Missing files should be detected from ordered_components."""
+        components = [
+            UIComponent(
+                name="Button",
+                file_path="src/components/ui/Button.tsx",
+                component_type="ui",
+                description="Button",
+            ),
+            UIComponent(
+                name="Card",
+                file_path="src/components/ui/Card.tsx",
+                component_type="ui",
+                description="Card",
+            ),
+        ]
+        # Only create Button, not Card
+        btn_path = tmp_path / components[0].file_path
+        btn_path.parent.mkdir(parents=True, exist_ok=True)
+        btn_path.write_text("export default function Button() {}", encoding="utf-8")
+
+        missing = [
+            c for c in components
+            if c.file_path and not (tmp_path / c.file_path).exists()
+        ]
+        assert len(missing) == 1
+        assert missing[0].name == "Card"

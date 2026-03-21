@@ -104,18 +104,6 @@ _READ_TOOL = ToolDefinition(
     },
 )
 
-_LIST_TOOL = ToolDefinition(
-    name="list_files",
-    description="List files in a directory to discover store/lib file names.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "directory": {"type": "string", "description": "Directory path relative to workspace"},
-            "pattern": {"type": "string", "description": "Glob pattern (default: **)"},
-        },
-        "required": [],
-    },
-)
 
 
 class ComponentGeneratorAgent(BaseAgent):
@@ -126,11 +114,11 @@ class ComponentGeneratorAgent(BaseAgent):
     """
 
     role = AgentRole.COMPONENT_GENERATOR
-    max_iterations: int = 20
+    max_iterations: int = 10
 
     @property
     def tools(self) -> list[ToolDefinition]:
-        return [_READ_TOOL, _WRITE_TOOL, _LIST_TOOL]
+        return [_READ_TOOL, _WRITE_TOOL]
 
     @property
     def system_prompt(self) -> str:
@@ -138,64 +126,71 @@ class ComponentGeneratorAgent(BaseAgent):
             "You are a senior frontend engineer agent specialising in React/Next.js,\n"
             "Vue 3 (Composition API), and TypeScript.\n\n"
             "Your task is to generate a single, production-quality UI component file.\n\n"
+            "WORKFLOW — WRITE IMMEDIATELY:\n"
+            "The prompt already contains ALL dependency signatures, store exports,\n"
+            "API contract schemas, and related file contents you need.\n"
+            "Call write_file NOW with the complete component code.\n"
+            "Do NOT call read_file — everything you need is already in this prompt.\n"
+            "Every extra tool call wastes budget and degrades output quality.\n\n"
+
             "Rules:\n"
-            "- Use TypeScript throughout (.tsx for React, <script setup lang='ts'> for Vue).\n"
-            "- If the component has a `figma_node_id`, use your MCP tools to fetch its code skeleton FIRST.\n"
             "- Keep components focused on a single responsibility.\n"
-            "- Use named exports for reusable components and types.\n"
             "- Import child components by relative path from the same src/ tree.\n"
-            "- Use the state store (Zustand/Redux/Pinia) ONLY for cross-cutting state;\n"
-            "  use local useState/ref for component-local state.\n"
-            "- Wrap async data fetching in a custom hook or SWR/React Query.\n"
-            "- Include JSDoc comment block at the top of the component.\n"
             "- Write the full file to disk using the write_file tool.\n"
             "- Do NOT include test code in the component file.\n\n"
 
-            "NEXT.JS APP ROUTER — CRITICAL RULES:\n"
-            "- Files in src/app/**/page.tsx MUST use 'export default function'. Next.js\n"
-            "  pages REQUIRE a default export. Named exports like 'export function DashboardPage'\n"
-            "  will cause a build error. Use: export default function DashboardPage() { ... }\n"
-            "- Similarly, src/app/**/layout.tsx MUST use 'export default function'.\n"
-            "- Any component that uses React hooks (useState, useEffect, useContext, useRef,\n"
-            "  useCallback, useMemo, useReducer), event handlers (onClick, onChange, onSubmit),\n"
-            "  useRouter, usePathname, useSearchParams, or any browser-only API MUST have\n"
-            '  "use client"; as the VERY FIRST LINE of the file (before all imports).\n'
-            "- Page components in src/app/ that only render other components and do NOT use\n"
-            "  hooks or event handlers directly should be Server Components (no 'use client').\n"
-            "- If in doubt, add 'use client'; — a client component that could be a server\n"
-            "  component is acceptable; a server component that uses hooks is a build error.\n\n"
-
             "IMPORT RULES:\n"
-            "- Use RELATIVE imports (e.g. '../ui/Button') for importing from other components\n"
-            "  within the same src/ tree. Do NOT use @/ path aliases.\n"
-            "- For API client imports, use relative paths (e.g. '../../lib/api').\n"
-            "- This ensures all imports resolve correctly without tsconfig path aliases.\n\n"
+            "- Use RELATIVE imports (e.g. '../ui/Button') — do NOT use @/ path aliases.\n"
+            "- Import ONLY exports that exist in the SIGNATURES sections of the prompt.\n"
+            "- NEVER invent property names — use the exact names from the signatures.\n\n"
 
-            "STORE / LIB FILE IMPORTS — MANDATORY STEPS (DO NOT SKIP):\n"
-            "If the component has state_needs or api_calls, you MUST do the following\n"
-            "BEFORE calling write_file:\n"
-            "1. Call list_files on the relevant directories (e.g. 'src/store', 'src/lib',\n"
-            "   'src/hooks') to discover the EXACT file names that exist on disk.\n"
-            "2. Call read_file on each discovered store/hook/lib file to see its ACTUAL\n"
-            "   exported types, functions, and properties.\n"
-            "3. In your generated code, import ONLY the exact module path found in step 1\n"
-            "   (e.g. if the file is 'useAuthStore.ts', import from '../../store/useAuthStore'\n"
-            "    — NOT '../../store/authStore').\n"
-            "4. Use ONLY the property/method names that actually exist in the file's exports\n"
-            "   as found in step 2.  NEVER invent or guess property names like 'checkAuth'\n"
-            "   or 'isLoggedIn' — if the store exports 'isAuthenticated', use that exact name.\n"
-            "5. If no store files exist yet, create a minimal inline implementation or skip\n"
-            "   the store import entirely — do NOT guess file names.\n\n"
-
-            "FUNCTION CALL RULES — MATCH ARGUMENT COUNT EXACTLY:\n"
-            "- Before calling any imported function, check its EXACT signature (parameter count and types).\n"
-            "- If a store function is defined as `login(token: string)` (1 parameter), you MUST call\n"
-            "  it with exactly 1 argument: `login(token)`. Do NOT call `login(user, token)`.\n"
-            "- If a function takes `(data: { user: User; token: string })`, pass a single object.\n"
-            "- 'Expected N arguments, but got M' errors are caused by mismatched argument counts.\n"
-            "- When STORE FUNCTION SIGNATURES are listed in the prompt, those are the authoritative\n"
-            "  source of truth for argument counts. Match them exactly."
+            "TYPE SAFETY:\n"
+            "- If API CONTRACT SCHEMAS are listed in the prompt, your TypeScript types\n"
+            "  MUST match them exactly — same field names, same types.\n"
+            "- If COMPONENT DEPENDENCY SIGNATURES list prop types (e.g. variant: \"primary\" |\n"
+            "  \"secondary\"), use ONLY those values — do NOT invent new variants.\n"
+            "- Match function argument counts exactly as shown in STORE SIGNATURES."
         )
+
+    @staticmethod
+    def _framework_rules(framework: str) -> str:
+        """Return framework-specific generation rules for the user prompt."""
+        fw = (framework or "").lower()
+        if "vue" in fw:
+            return (
+                "FRAMEWORK: Vue 3 (Composition API)\n"
+                "- Use <script setup lang='ts'> for all components (.vue SFC).\n"
+                "- Use defineProps<T>() and defineEmits<T>() for typed props / events.\n"
+                "- Use ref()/reactive() for local state, computed() for derived state.\n"
+                "- Use Pinia stores for cross-cutting state (import from '../../store/...').\n"
+                "- Use Vue Router composables (useRouter, useRoute) for navigation.\n"
+                "- Use named exports for reusable composable functions.\n"
+                "- File extension: .vue for components, .ts for composables/stores.\n\n"
+            )
+        if "angular" in fw:
+            return (
+                "FRAMEWORK: Angular\n"
+                "- Use standalone components with @Component decorator.\n"
+                "- Use TypeScript strict mode throughout.\n"
+                "- Use Angular signals or RxJS for state management.\n"
+                "- File extension: .component.ts for components.\n\n"
+            )
+        # React / Next.js (default)
+        rules = (
+            "FRAMEWORK: React + TypeScript\n"
+            "- Use TypeScript throughout (.tsx files).\n"
+            "- Use named exports for reusable components and types.\n"
+            "- Use Zustand/Redux for cross-cutting state; useState for local state.\n"
+        )
+        if "next" in fw or fw == "":
+            rules += (
+                "\nNEXT.JS APP ROUTER:\n"
+                "- Files in src/app/ or app/ (page.tsx, layout.tsx) MUST use 'export default function'.\n"
+                "- Components using React hooks, event handlers, useRouter, usePathname, or\n"
+                '  browser APIs MUST have "use client"; as the VERY FIRST LINE (before imports).\n'
+                "- If in doubt, add 'use client'; — it's acceptable; missing it is a build error.\n"
+            )
+        return rules + "\n"
 
     def _build_prompt(self, context: AgentContext) -> str:
         component: UIComponent | None = context.task.metadata.get("component")
@@ -323,52 +318,63 @@ class ComponentGeneratorAgent(BaseAgent):
                 schema_lines.append("")
                 contract_text += "\n".join(schema_lines) + "\n"
 
-        # Build dependency reading instructions
+        # Build dependency import guidance
         dep_instructions = ""
         if component and component.depends_on:
-            dep_instructions = (
-                "\nBEFORE generating code:\n"
-                f"1. Use read_file to read each dependency: {', '.join(component.depends_on)}\n"
-                "2. Check what each dependency ACTUALLY exports (exact names)\n"
-                "3. Only import exports that actually exist in the file\n"
-                "4. Do NOT assume a component exports sub-components (e.g. Card does NOT\n"
-                "   export CardHeader/CardTitle/CardContent unless you verify it does)\n\n"
-            )
+            # Check which deps are already pre-loaded in related_files.
+            # Match on filename stem to avoid false positives (e.g. "Card"
+            # matching "useDiscardStore.ts" because "card" is in "discard").
+            preloaded_deps = set()
+            missing_deps = []
+            related_stems = {
+                p.rsplit("/", 1)[-1].split(".")[0].lower(): p
+                for p in (context.related_files or {})
+            }
+            for dep_name in component.depends_on:
+                found = (
+                    dep_name.lower() in related_stems
+                    or any(dep_name.lower() == stem for stem in related_stems)
+                    or any(dep_name.lower() in p.lower().rsplit("/", 1)[-1]
+                           for p in (context.related_files or {}))
+                )
+                if found:
+                    preloaded_deps.add(dep_name)
+                else:
+                    missing_deps.append(dep_name)
 
-        # Force store/lib discovery when the component uses shared state or APIs
+            dep_instructions = (
+                "\nDEPENDENCY RULES:\n"
+                "- Only import exports that exist in the SIGNATURES sections above.\n"
+                "- Do NOT assume a component exports sub-components (e.g. Card does NOT\n"
+                "  export CardHeader/CardTitle/CardContent unless shown in signatures).\n"
+            )
+            if preloaded_deps:
+                dep_instructions += (
+                    f"- Dependencies already in prompt (do NOT read_file): "
+                    f"{', '.join(sorted(preloaded_deps))}\n"
+                )
+            if missing_deps:
+                dep_instructions += (
+                    f"- Use read_file ONLY for these missing deps: {', '.join(missing_deps)}\n"
+                )
+            dep_instructions += "\n"
+
+        # Store/lib usage guidance — files are pre-loaded by _inject_store_context
         store_discovery = ""
         if component and (component.state_needs or component.api_calls):
-            # Check if store/lib files were pre-loaded into related_files
             preloaded = [
                 p for p in (context.related_files or {})
                 if any(seg in p for seg in ("store", "lib", "hooks"))
             ]
             if preloaded:
                 store_discovery = (
-                    "\n⚠️  IMPORTANT — The following store/lib/hook files have been pre-loaded\n"
-                    "into the Related Files section below. You MUST:\n"
-                    "1. Check the EXACT file names and export names from these files.\n"
-                    "2. Use the EXACT file name in your import path (e.g. if the file is\n"
-                    "   'src/store/useAuthStore.ts', import from '../../store/useAuthStore').\n"
-                    "3. Use ONLY properties/methods that actually exist in the exports.\n"
-                    "   NEVER invent property names.\n"
-                    f"Pre-loaded files: {', '.join(preloaded)}\n\n"
+                    "\nSTORE/LIB FILES (already pre-loaded — do NOT read_file for these):\n"
+                    f"Files: {', '.join(preloaded)}\n"
+                    "- Use EXACT file names in import paths (e.g. '../../store/useAuthStore').\n"
+                    "- Use ONLY properties/methods shown in STORE SIGNATURES above.\n\n"
                 )
-            else:
-                dirs_to_scan = []
-                if component.state_needs:
-                    dirs_to_scan.append("src/store")
-                if component.api_calls:
-                    dirs_to_scan.extend(["src/lib", "src/hooks"])
-                store_discovery = (
-                    "\n⚠️  MANDATORY — Do these steps FIRST, before writing any code:\n"
-                    f"1. Call list_files for each directory: {', '.join(dirs_to_scan)}\n"
-                    "2. Call read_file on every store/hook/lib file found to learn the\n"
-                    "   exact export names and types.\n"
-                    "3. Use ONLY the real file names and export names in your imports.\n"
-                    "   Do NOT guess — if a store file is named useAuthStore.ts, import\n"
-                    "   from '../../store/useAuthStore', not '../../store/authStore'.\n\n"
-                )
+            # No else branch — _inject_store_context always pre-loads these.
+            # If somehow missing, the LLM still has signatures from the prompt.
 
         # Extract and prominently display function signatures from pre-loaded
         # store/lib/hook files so the LLM sees exact parameter counts.
@@ -376,13 +382,24 @@ class ComponentGeneratorAgent(BaseAgent):
         # Extract prop types from component dependencies (Button, Card, etc.)
         dep_sigs = self._extract_dep_signatures(context.related_files or {})
 
+        # Figma instruction — only when a node ID is actually present
+        figma_hint = ""
+        if component and getattr(component, "figma_node_id", None):
+            figma_hint = (
+                "A Figma Node ID is provided. Use your tools to fetch the structural "
+                "code skeleton, then hydrate it with the described API and state handlers. "
+            )
+
+        # Framework-specific rules injected into the user prompt
+        fw_rules = self._framework_rules(plan.framework if plan else "")
+
         return (
             f"{req_text}{comp_text}\n{plan_text}\n{design_text}\n{contract_text}\n"
+            f"{fw_rules}"
             f"{store_sigs}{dep_sigs}"
             f"{store_discovery}{dep_instructions}"
-            "If a Figma Node ID is provided, use your tools to fetch the structural code skeleton FIRST. "
-            "Hydrate the skeleton with the described API and state handlers, then generate "
-            "the complete component source code and write it to disk using write_file."
+            f"{figma_hint}"
+            "Generate the complete component source code and write it to disk using write_file."
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
@@ -767,7 +784,7 @@ class ComponentGeneratorAgent(BaseAgent):
                 scan_dir = workspace / prefix / sub if prefix else workspace / sub
                 if not scan_dir.is_dir():
                     continue
-                for ext in (".ts", ".tsx", ".js", ".jsx"):
+                for ext in (".ts", ".tsx", ".js", ".jsx", ".vue"):
                     for fpath in scan_dir.rglob(f"*{ext}"):
                         if not fpath.is_file():
                             continue

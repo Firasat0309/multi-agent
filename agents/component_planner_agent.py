@@ -70,12 +70,29 @@ class ComponentPlannerAgent(BaseAgent):
             "Rules:\n"
             "- Every page from the design spec must map to at least one 'pages' component.\n"
             "- Preserve exact `figma_node_id` strings if the spec lists them, otherwise null.\n"
-            "- All components must have explicit file_path with correct extension (.tsx/.vue).\n"
-            "- Use TypeScript for React/Next.js/Angular; use <script setup lang='ts'> for Vue.\n"
             "- api_calls must ONLY use endpoint paths from the provided API contract.\n"
             "  Do NOT invent or guess endpoint paths. Copy them exactly as given.\n"
-            "- state_needs should reference the Zustand/Redux store slice names.\n"
-            "- Output ONLY the JSON object — no markdown code fences."
+            "- Output ONLY the JSON object — no markdown code fences.\n\n"
+
+            "FRAMEWORK-SPECIFIC RULES — these are MANDATORY based on the Framework field:\n"
+            "- If framework=vue:\n"
+            "    file_path extension MUST be .vue for components\n"
+            "    state_solution MUST be 'pinia'\n"
+            "    routing_solution MUST be 'vue-router'\n"
+            "    state_needs should reference Pinia store names (e.g. 'useAuthStore')\n"
+            "- If framework=nextjs:\n"
+            "    file_path extension MUST be .tsx\n"
+            "    state_solution should be 'zustand' (preferred) or 'redux'\n"
+            "    routing_solution MUST be 'nextjs'\n"
+            "    pages use src/app/ directory with page.tsx/layout.tsx conventions\n"
+            "- If framework=react:\n"
+            "    file_path extension MUST be .tsx\n"
+            "    state_solution should be 'zustand' or 'redux'\n"
+            "    routing_solution MUST be 'react-router'\n"
+            "- If framework=angular:\n"
+            "    file_path extension MUST be .ts (e.g. user-list.component.ts)\n"
+            "    routing_solution MUST be 'angular'\n"
+            "- Store/lib/composable files always use .ts extension (never .vue)."
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
@@ -258,10 +275,26 @@ class ComponentPlannerAgent(BaseAgent):
             comp.api_calls[:] = corrected
 
     def _parse_plan(self, raw: dict[str, Any]) -> ComponentPlan:
+        framework = str(raw.get("framework", "nextjs")).lower()
+
+        # Derive correct defaults based on framework
+        if "vue" in framework:
+            default_state = "pinia"
+            default_routing = "vue-router"
+        elif "angular" in framework:
+            default_state = str(raw.get("state_solution", "ngrx"))
+            default_routing = "angular"
+        elif "next" in framework:
+            default_state = "zustand"
+            default_routing = "nextjs"
+        else:
+            default_state = "zustand"
+            default_routing = "react-router"
+
         components = [
             UIComponent(
                 name=str(c.get("name", "Component")),
-                file_path=str(c.get("file_path", "")),
+                file_path=self._fix_extension(str(c.get("file_path", "")), framework),
                 component_type=str(c.get("component_type", "ui")),
                 description=str(c.get("description", "")),
                 figma_node_id=str(c.get("figma_node_id", "")) if c.get("figma_node_id") else None,
@@ -277,9 +310,33 @@ class ComponentPlannerAgent(BaseAgent):
         ]
         return ComponentPlan(
             components=components,
-            framework=str(raw.get("framework", "nextjs")),
-            state_solution=str(raw.get("state_solution", "zustand")),
+            framework=framework,
+            state_solution=str(raw.get("state_solution", default_state)),
             api_base_url=str(raw.get("api_base_url", "/api/v1")),
-            routing_solution=str(raw.get("routing_solution", "")),
+            routing_solution=str(raw.get("routing_solution", default_routing)),
             package_json=raw.get("package_json", {}),
         )
+
+    @staticmethod
+    def _fix_extension(file_path: str, framework: str) -> str:
+        """Ensure file extension matches framework conventions.
+
+        Vue components must use .vue; store/lib/hooks stay as .ts.
+        React/Next.js/Angular components must use .tsx/.ts (not .vue).
+        """
+        if not file_path:
+            return file_path
+        # Store, lib, hooks, composables are always .ts regardless of framework
+        if any(seg in file_path for seg in ("/store/", "/stores/", "/lib/", "/hooks/", "/composables/")):
+            return file_path
+        if "vue" in framework:
+            # Component files should be .vue; fix .tsx → .vue
+            for wrong_ext in (".tsx", ".jsx"):
+                if file_path.endswith(wrong_ext):
+                    file_path = file_path[: -len(wrong_ext)] + ".vue"
+                    break
+        else:
+            # React/Next/Angular: fix .vue → .tsx
+            if file_path.endswith(".vue"):
+                file_path = file_path[:-4] + ".tsx"
+        return file_path

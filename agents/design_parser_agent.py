@@ -303,16 +303,18 @@ class DesignParserAgent(BaseAgent):
         requirements: ProductRequirements | None,
         figma_url: str,
     ) -> UIDesignSpec:
-        # Derive framework from requirements if available and not in raw
+        # Derive framework: tech_preferences always wins when explicitly set.
         framework = str(raw.get("framework", "nextjs")).lower()
         if requirements:
             pref = requirements.tech_preferences.get("frontend", "").lower()
-            if pref and framework == "nextjs":
+            if pref:
                 if "vue" in pref:
                     framework = "vue"
                 elif "angular" in pref:
                     framework = "angular"
-                elif "react" in pref and "next" not in pref:
+                elif "next" in pref:
+                    framework = "nextjs"
+                elif "react" in pref:
                     framework = "react"
 
         return UIDesignSpec(

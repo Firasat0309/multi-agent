@@ -404,6 +404,116 @@ class FrontendPipeline:
             metrics["components_generated"] = len(ordered_components) - len(gen_errors)
             self._complete_phase("FE: Component Generation")
 
+            # ── Phase 4a: Pre-build file verification ─────────────────────────────
+            # Check which planned files are missing on disk.  Components can
+            # fail silently (LLM timeout, parse errors, etc.) — catching them
+            # here avoids wasting the build/fix-retry budget on import errors
+            # for files that were never written.
+            missing = [
+                c for c in ordered_components
+                if c.file_path and not (workspace / c.file_path).exists()
+            ]
+            if missing:
+                logger.warning(
+                    "[FE Phase 4a] %d planned file(s) missing — re-generating: %s",
+                    len(missing),
+                    ", ".join(c.file_path for c in missing),
+                )
+                self._phase("FE: Missing File Recovery", "running")
+
+                # Collect dependency files for the missing components
+                recovery_dep_files: dict[str, str] = {}
+                for comp in missing:
+                    for dep_name in (comp.depends_on or []):
+                        dep_comp = next(
+                            (c for c in ordered_components if c.name == dep_name),
+                            None,
+                        )
+                        if dep_comp and dep_comp.file_path:
+                            dep_abs = workspace / dep_comp.file_path
+                            if dep_abs.exists() and dep_comp.file_path not in recovery_dep_files:
+                                try:
+                                    recovery_dep_files[dep_comp.file_path] = dep_abs.read_text(
+                                        encoding="utf-8", errors="replace"
+                                    )[:6000]
+                                except OSError:
+                                    pass
+
+                recovery_coros = [
+                    generator.execute(
+                        AgentContext(
+                            task=Task(
+                                task_id=900 + i,
+                                task_type=TaskType.GENERATE_COMPONENT,
+                                file=comp.file_path,
+                                description=f"Recovery: generate {comp.name}",
+                                metadata={
+                                    "component": comp,
+                                    "component_plan": component_plan,
+                                    "api_contract": api_contract,
+                                    "design_spec": design_spec,
+                                    "requirements": requirements,
+                                },
+                            ),
+                            blueprint=frontend_blueprint,
+                            related_files=recovery_dep_files,
+                        )
+                    )
+                    for i, comp in enumerate(missing)
+                ]
+                recovery_results = await asyncio.gather(*recovery_coros, return_exceptions=True)
+                recovered = 0
+                for comp, res in zip(missing, recovery_results):
+                    if isinstance(res, Exception) or (hasattr(res, "success") and not res.success):
+                        logger.error(
+                            "[FE Phase 4a] Recovery failed for %s: %s",
+                            comp.file_path,
+                            res if isinstance(res, Exception) else "; ".join(res.errors),
+                        )
+                    elif (workspace / comp.file_path).exists():
+                        recovered += 1
+                        logger.info("[FE Phase 4a] Recovered %s", comp.file_path)
+
+                # Final check — emit stubs for anything still missing so the
+                # build doesn't crash on "Cannot find module" errors.
+                still_missing = [
+                    c for c in missing
+                    if not (workspace / c.file_path).exists()
+                ]
+                is_vue = "vue" in (component_plan.framework or "").lower()
+                for comp in still_missing:
+                    stub_path = workspace / comp.file_path
+                    stub_path.parent.mkdir(parents=True, exist_ok=True)
+                    stub_name = comp.name or Path(comp.file_path).stem
+                    if is_vue and comp.file_path.endswith(".vue"):
+                        stub = (
+                            f"<!-- AUTO-STUB: generation failed for {comp.name} -->\n"
+                            f"<!-- TODO: implement {comp.description or comp.name} -->\n"
+                            "<template>\n"
+                            f"  <div>{stub_name} — not yet implemented</div>\n"
+                            "</template>\n\n"
+                            "<script setup lang=\"ts\">\n"
+                            f"// {stub_name} stub\n"
+                            "</script>\n"
+                        )
+                    else:
+                        stub = (
+                            f"// AUTO-STUB: generation failed for {comp.name}\n"
+                            f"// TODO: implement {comp.description or comp.name}\n"
+                            f"export default function {stub_name}() {{\n"
+                            f"  return <div>{stub_name} — not yet implemented</div>;\n"
+                            f"}}\n"
+                        )
+                    stub_path.write_text(stub, encoding="utf-8")
+                    logger.warning(
+                        "[FE Phase 4a] Wrote stub for %s — build may pass but component is incomplete",
+                        comp.file_path,
+                    )
+
+                metrics["files_recovered"] = recovered
+                metrics["files_stubbed"] = len(still_missing)
+                self._complete_phase("FE: Missing File Recovery")
+
             # ── Phase 4.5: TSX Compilation Check with Fix-Retry ───────────────────
             self._phase("FE: TypeScript Compilation", "running")
             logger.info("[FE Phase 4.5] Running TypeScript compilation check...")
