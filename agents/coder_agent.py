@@ -1314,6 +1314,16 @@ class CoderAgent(BaseAgent):
             metrics=self.get_metrics(),
         )
 
+    # Map fence language names to file extensions for prose stripping.
+    _FENCE_TO_EXT: dict[str, str] = {
+        "java": ".java", "python": ".py", "py": ".py",
+        "typescript": ".ts", "ts": ".ts", "tsx": ".tsx",
+        "javascript": ".js", "js": ".js", "jsx": ".jsx",
+        "go": ".go", "csharp": ".cs", "cs": ".cs",
+        "rust": ".rs", "rs": ".rs", "kotlin": ".kt", "kt": ".kt",
+        "xml": ".xml", "html": ".html",
+    }
+
     def _clean_fences(self, content: str, lang_fence: str) -> str:
         """Strip any markdown code fences the LLM may have added."""
         content = content.strip()
@@ -1326,4 +1336,8 @@ class CoderAgent(BaseAgent):
         content = content.strip() + "\n"
         # Remove duplicated content blocks caused by LLM continuation failures
         content = self._deduplicate_content(content)
+        # Strip any LLM chain-of-thought prose preceding the actual code
+        ext = self._FENCE_TO_EXT.get(lang_fence.lower(), "")
+        if ext:
+            content = self._strip_leading_prose(content, f"file{ext}")
         return content

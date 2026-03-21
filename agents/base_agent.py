@@ -679,6 +679,9 @@ class BaseAgent(ABC):
         content = inp.get("content", "")
         if not path:
             return "Error: 'path' is required"
+        # Strip LLM chain-of-thought / deliberation text that may precede
+        # the actual source code in the tool call content.
+        content = self._strip_leading_prose(content, path)
         # Deduplicate content before writing — LLMs sometimes pass the
         # full file content with the class repeated multiple times.
         content = self._deduplicate_content(content)
@@ -941,6 +944,104 @@ class BaseAgent(ABC):
         # class/file repeated multiple times (LLM continuation failure).
         if continuation_count > 0:
             content = self._deduplicate_content(content)
+
+        return content
+
+    @staticmethod
+    def _strip_leading_prose(content: str, path: str) -> str:
+        """Strip LLM chain-of-thought text that precedes actual source code.
+
+        Some models (especially during extended thinking or tool-call generation)
+        emit deliberation / reasoning text before the actual source code in the
+        ``write_file`` content argument.  This detects recognised language-specific
+        code-start markers and, when the preceding text contains clear LLM-prose
+        indicators (backtick spans, "I'll …", bullet points, etc.), strips the
+        prose and keeps only the code.
+        """
+        import re as _re
+        from pathlib import Path as _Path
+
+        if not content or len(content) < 30:
+            return content
+
+        ext = _Path(path).suffix.lower() if path else ""
+
+        # Patterns that identify the very first valid line of a source file.
+        _FIRST_CODE_LINE: dict[str, _re.Pattern[str]] = {
+            ".java": _re.compile(
+                r"^(?:package\s|import\s|/\*|//|@\w|public\s|private\s|protected\s|abstract\s|final\s)",
+                _re.MULTILINE,
+            ),
+            ".py": _re.compile(
+                r'^(?:#!|\"\"\"|from\s+\S|import\s+\S|class\s+\w|def\s+\w|async\s+def\s|@\w|#\s)',
+                _re.MULTILINE,
+            ),
+            ".ts": _re.compile(
+                r"^(?:import\s|export\s|class\s|interface\s|type\s|const\s|let\s|var\s|function\s|//|/\*|enum\s|declare\s|namespace\s|'use |\"use )",
+                _re.MULTILINE,
+            ),
+            ".tsx": _re.compile(
+                r"^(?:import\s|export\s|class\s|interface\s|type\s|const\s|let\s|var\s|function\s|//|/\*|enum\s|declare\s|namespace\s|'use |\"use )",
+                _re.MULTILINE,
+            ),
+            ".js": _re.compile(
+                r"^(?:import\s|export\s|class\s|const\s|let\s|var\s|function\s|//|/\*|module\.|'use |\"use )",
+                _re.MULTILINE,
+            ),
+            ".jsx": _re.compile(
+                r"^(?:import\s|export\s|class\s|const\s|let\s|var\s|function\s|//|/\*|module\.|'use |\"use )",
+                _re.MULTILINE,
+            ),
+            ".go": _re.compile(
+                r"^(?:package\s+\w|import\s|//|/\*|func\s|type\s|var\s|const\s)",
+                _re.MULTILINE,
+            ),
+            ".cs": _re.compile(
+                r"^(?:using\s+\w|namespace\s|//|/\*|\[\w|public\s|private\s|protected\s|internal\s|class\s|interface\s|global\s)",
+                _re.MULTILINE,
+            ),
+            ".rs": _re.compile(
+                r"^(?:use\s|mod\s|//|/\*|pub\s|fn\s|struct\s|enum\s|trait\s|impl\s|#\[|extern\s|#!\[)",
+                _re.MULTILINE,
+            ),
+            ".kt": _re.compile(
+                r"^(?:package\s|import\s|//|/\*|@\w|class\s|interface\s|fun\s|val\s|var\s|object\s|data\s|sealed\s|abstract\s|open\s)",
+                _re.MULTILINE,
+            ),
+            ".xml": _re.compile(r"^(?:<\?xml|<!--|<\w)", _re.MULTILINE),
+            ".html": _re.compile(r"^(?:<!DOCTYPE|<html|<!--|<\w)", _re.MULTILINE | _re.IGNORECASE),
+        }
+
+        pattern = _FIRST_CODE_LINE.get(ext)
+        if not pattern:
+            return content
+
+        m = pattern.search(content)
+        if not m or m.start() == 0:
+            # Code starts at the very beginning — nothing to strip.
+            return content
+
+        leading = content[:m.start()]
+
+        # Only strip if the leading text contains clear LLM deliberation markers.
+        _PROSE_INDICATORS = _re.compile(
+            r"(?:"
+            r"\bI'll\b|\bI will\b|\bWait[,!]|\bLet me\b|\bOkay[,.]"
+            r"|\bI need to\b|\bI should\b|\bI'm\b|\bHmm\b"
+            r"|\*\s{2,}"       # markdown bullet points
+            r"|`[^`]+`"        # inline backtick code spans
+            r"|\bcheck\b.*\brule\b"
+            r"|\bready\b"
+            r")",
+            _re.IGNORECASE,
+        )
+
+        if _PROSE_INDICATORS.search(leading):
+            logger.warning(
+                "Stripped %d chars of LLM deliberation prose before code in %s",
+                len(leading), path,
+            )
+            return content[m.start():]
 
         return content
 

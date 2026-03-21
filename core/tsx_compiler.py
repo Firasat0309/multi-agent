@@ -19,9 +19,15 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Matches: src/components/Button.tsx(10,5): error TS2304: Cannot find name 'x'.
+# tsc --pretty false format:
+#   src/components/Button.tsx(10,5): error TS2304: Cannot find name 'x'.
+# vue-tsc format (2.x+, even with --pretty false):
+#   src/components/Button.vue:10:5 - error TS2304: Cannot find name 'x'.
 _TSC_ERROR_RE = re.compile(
     r"^(?P<file>[^(\n]+)\((?P<line>\d+),(?P<col>\d+)\):\s*error\s+(?P<code>TS\d+):\s*(?P<message>.+)$"
+)
+_VUE_TSC_ERROR_RE = re.compile(
+    r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+)\s+-\s+error\s+(?P<code>TS\d+):\s*(?P<message>.+)$"
 )
 
 _DEFAULT_TSCONFIG = """{
@@ -90,6 +96,35 @@ class TSXCompiler:
                 pass
         return False
 
+    @staticmethod
+    def _resolve_compiler(workspace: Path, use_vue_tsc: bool) -> list[str]:
+        """Resolve the compiler command, returning args list for subprocess.
+
+        Resolution order:
+        1. Local ``node_modules/.bin/<compiler>`` (most reliable after npm install)
+        2. ``npx <compiler>`` (resolves from node_modules automatically)
+        3. Bare ``<compiler>`` command (requires global install on PATH)
+        """
+        import platform
+        is_win = platform.system() == "Windows"
+        ext = ".cmd" if is_win else ""
+
+        preferred = "vue-tsc" if use_vue_tsc else "tsc"
+        fallback = "tsc" if use_vue_tsc else None
+
+        for name in (preferred, fallback):
+            if name is None:
+                continue
+            local_bin = workspace / "node_modules" / ".bin" / f"{name}{ext}"
+            if local_bin.exists():
+                logger.debug("Using local compiler: %s", local_bin)
+                return [str(local_bin)]
+
+        # No local binary — use npx which resolves from node_modules
+        # automatically and works even when .bin isn't on PATH.
+        npx = "npx.cmd" if is_win else "npx"
+        return [npx, preferred]
+
     async def check(self, workspace: Path) -> TSXCompileResult:
         """Run ``tsc --noEmit`` (or ``vue-tsc --noEmit`` for Vue) in *workspace*.
 
@@ -104,11 +139,15 @@ class TSXCompiler:
         # For Vue projects, prefer vue-tsc which understands .vue SFCs.
         # Fall back to plain tsc if vue-tsc is not available.
         use_vue_tsc = self._is_vue_project(workspace)
-        compiler = "vue-tsc" if use_vue_tsc else "tsc"
+
+        # Resolve the compiler command — prefers local node_modules/.bin/,
+        # falls back to npx which resolves from node_modules automatically.
+        compiler_cmd = self._resolve_compiler(workspace, use_vue_tsc)
+        logger.debug("TypeScript check command: %s", compiler_cmd)
 
         try:
             proc = await asyncio.create_subprocess_exec(
-                compiler,
+                *compiler_cmd,
                 "--noEmit",
                 "--pretty",
                 "false",
@@ -118,11 +157,15 @@ class TSXCompiler:
             )
         except FileNotFoundError:
             if use_vue_tsc:
-                # vue-tsc not installed — fall back to tsc
-                logger.info("vue-tsc not on PATH — falling back to tsc")
+                # vue-tsc not found even via npx — fall back to tsc
+                fallback_cmd = self._resolve_compiler(workspace, use_vue_tsc=False)
+                logger.info(
+                    "%s not found — falling back to %s",
+                    " ".join(compiler_cmd), " ".join(fallback_cmd),
+                )
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        "tsc",
+                        *fallback_cmd,
                         "--noEmit",
                         "--pretty",
                         "false",
@@ -132,12 +175,14 @@ class TSXCompiler:
                     )
                 except FileNotFoundError:
                     logger.warning(
-                        "Neither vue-tsc nor tsc found on PATH — skipping compilation check"
+                        "Neither vue-tsc nor tsc found (local, npx, or PATH) — "
+                        "skipping compilation check"
                     )
                     return TSXCompileResult(tsc_available=False)
             else:
                 logger.warning(
-                    "tsc not found on PATH — skipping TypeScript compilation check"
+                    "tsc not found (local, npx, or PATH) — "
+                    "skipping TypeScript compilation check"
                 )
                 return TSXCompileResult(tsc_available=False)
 
@@ -157,7 +202,8 @@ class TSXCompiler:
     def _parse_output(self, raw: str, workspace: Path) -> list[TSXError]:
         errors: list[TSXError] = []
         for line in raw.splitlines():
-            m = _TSC_ERROR_RE.match(line.strip())
+            stripped = line.strip()
+            m = _TSC_ERROR_RE.match(stripped) or _VUE_TSC_ERROR_RE.match(stripped)
             if not m:
                 continue
             rel_file = m.group("file").strip()
