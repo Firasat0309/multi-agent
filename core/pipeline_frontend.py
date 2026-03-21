@@ -31,6 +31,7 @@ from core.models import (
     Task,
     TaskType,
     TokenCost,
+    UIComponent,
     UIDesignSpec,
     AgentContext,
 )
@@ -305,6 +306,48 @@ class FrontendPipeline:
                 frontend_blueprint = self._make_frontend_blueprint(
                     requirements, component_plan, extra_components=ghost_components,
                 )
+            # ── Vue mandatory root: ensure App.vue is in ordered_components ────
+            if "vue" in component_plan.framework.lower():
+                has_app = any(
+                    c.file_path and c.file_path.replace("\\", "/").endswith("src/App.vue")
+                    for c in ordered_components
+                )
+                if not has_app:
+                    page_names = [
+                        c.name for c in ordered_components
+                        if getattr(c, "component_type", "") == "page"
+                    ]
+                    layout_names = [
+                        c.name for c in ordered_components
+                        if getattr(c, "component_type", "") in ("layout", "shared")
+                        and c.name != "App"
+                    ]
+                    app_component = UIComponent(
+                        name="App",
+                        file_path="src/App.vue",
+                        component_type="layout",
+                        description=(
+                            "Root Vue application shell. Wraps <RouterView /> and provides "
+                            "global layout, navigation, and Pinia/router providers. "
+                            "Must import and render pages via vue-router."
+                        ),
+                        depends_on=layout_names[:5],  # depend on layouts so it renders last
+                        children=page_names,
+                        layer="",  # root-level src/App.vue, not in a layer folder
+                    )
+                    # Place App in the highest tier (renders after all deps)
+                    app_tier = (max(tier_map.values()) + 1) if tier_map else 1
+                    tier_map["App"] = app_tier
+                    ordered_components = list(ordered_components) + [app_component]
+                    logger.info(
+                        "[FE Phase 4] Injected mandatory App.vue (tier %d, depends_on=%s)",
+                        app_tier,
+                        app_component.depends_on,
+                    )
+                    frontend_blueprint = self._make_frontend_blueprint(
+                        requirements, component_plan, extra_components=[app_component],
+                    )
+
             max_tier = max(tier_map.values()) + 1 if tier_map else 1
 
             logger.info("[FE Phase 4] Generating %d components...", len(ordered_components))
@@ -2207,6 +2250,83 @@ class FrontendPipeline:
             )
             (src_dir / "main.ts").write_text(main_ts, encoding="utf-8")
             logger.info("Wrote src/main.ts")
+
+            # App.vue stub — main.ts imports './App.vue'; without it the
+            # Vite build fails immediately.  The CoderAgent will overwrite
+            # this if the component planner includes an App component.
+            app_vue_path = src_dir / "App.vue"
+            if not app_vue_path.exists():
+                app_vue_stub = (
+                    "<script setup lang=\"ts\">\n"
+                    "import { RouterView } from 'vue-router';\n"
+                    "</script>\n\n"
+                    "<template>\n"
+                    "  <RouterView />\n"
+                    "</template>\n"
+                )
+                app_vue_path.write_text(app_vue_stub, encoding="utf-8")
+                logger.info("Wrote src/App.vue (stub)")
+
+            # router/index.ts stub — main.ts imports './router'.
+            # Build page routes from the component plan when available.
+            router_dir = src_dir / "router"
+            router_dir.mkdir(parents=True, exist_ok=True)
+            router_index_path = router_dir / "index.ts"
+            if not router_index_path.exists():
+                page_components = [
+                    c for c in plan.components
+                    if getattr(c, "component_type", "") == "page" and c.file_path
+                ]
+                route_entries: list[str] = []
+                for pc in page_components:
+                    fp = pc.file_path.replace("\\", "/")
+                    # Derive route path from file name (e.g. "src/views/Home.vue" → "/")
+                    name = Path(fp).stem  # "HomeView", "AboutView", etc.
+                    # Strip common suffixes to derive the route segment
+                    base = re.sub(r'(?i)(view|page)$', '', name) or name
+                    route_path = "/" if base.lower() in ("home", "index") else f"/{base.lower()}"
+                    # Import path relative to src/router/
+                    try:
+                        rel = str(
+                            Path(workspace / fp).relative_to(router_dir)
+                        ).replace("\\", "/")
+                        rel = f"./{rel}" if not rel.startswith(".") else rel
+                    except ValueError:
+                        # file is outside router_dir — use ../ prefix
+                        rel = str(
+                            Path("..") / Path(fp).relative_to("src")
+                        ).replace("\\", "/")
+                    route_entries.append(
+                        f"  {{ path: '{route_path}', name: '{name}', "
+                        f"component: () => import('{rel}') }},\n"
+                    )
+                routes_block = "".join(route_entries) if route_entries else (
+                    "  { path: '/', name: 'Home', component: () => import('../views/HomeView.vue') },\n"
+                )
+                router_stub = (
+                    "import { createRouter, createWebHistory } from 'vue-router';\n\n"
+                    "const routes = [\n"
+                    f"{routes_block}"
+                    "];\n\n"
+                    "const router = createRouter({\n"
+                    "  history: createWebHistory(import.meta.env.BASE_URL),\n"
+                    "  routes,\n"
+                    "});\n\n"
+                    "export default router;\n"
+                )
+                router_index_path.write_text(router_stub, encoding="utf-8")
+                logger.info("Wrote src/router/index.ts (stub with %d routes)", len(route_entries))
+
+            # assets/main.css — main.ts imports './assets/main.css'
+            assets_dir = src_dir / "assets"
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            main_css_path = assets_dir / "main.css"
+            if not main_css_path.exists():
+                main_css_path.write_text(
+                    "/* Auto-generated — add global styles here */\n",
+                    encoding="utf-8",
+                )
+                logger.info("Wrote src/assets/main.css (stub)")
 
         # ── tailwind.config.js + postcss.config.js ────────────────────────
         if "tailwind" in styling:

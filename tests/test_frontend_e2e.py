@@ -1289,3 +1289,158 @@ class TestPreBuildFileVerification:
         ]
         assert len(missing) == 1
         assert missing[0].name == "Card"
+
+
+class TestVueEntryStubGeneration:
+    """Verify that _write_config_files creates the mandatory Vue entry stubs."""
+
+    def _make_vue_plan(self, components=None):
+        return ComponentPlan(
+            components=components or [],
+            framework="vue",
+            state_solution="pinia",
+            api_base_url="/api/v1",
+            routing_solution="vue-router",
+        )
+
+    def _make_req(self, styling="css"):
+        return ProductRequirements(
+            title="Vue App",
+            description="Test",
+            tech_preferences={"styling": styling},
+        )
+
+    def test_app_vue_stub_created(self, tmp_path):
+        """src/App.vue stub must be created alongside main.ts."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        FrontendPipeline._write_config_files(ws, self._make_vue_plan(), self._make_req())
+
+        app_vue = ws / "src" / "App.vue"
+        assert app_vue.exists(), "App.vue stub was not generated"
+        content = app_vue.read_text()
+        assert "<RouterView" in content
+        assert "<template>" in content
+
+    def test_router_index_stub_created(self, tmp_path):
+        """src/router/index.ts stub must be created alongside main.ts."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        FrontendPipeline._write_config_files(ws, self._make_vue_plan(), self._make_req())
+
+        router = ws / "src" / "router" / "index.ts"
+        assert router.exists(), "router/index.ts stub was not generated"
+        content = router.read_text()
+        assert "createRouter" in content
+        assert "createWebHistory" in content
+        assert "export default router" in content
+
+    def test_main_css_stub_created(self, tmp_path):
+        """src/assets/main.css stub must be created alongside main.ts."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        FrontendPipeline._write_config_files(ws, self._make_vue_plan(), self._make_req())
+
+        css = ws / "src" / "assets" / "main.css"
+        assert css.exists(), "main.css stub was not generated"
+
+    def test_stubs_not_overwritten_if_exist(self, tmp_path):
+        """Pre-existing files must not be overwritten by stubs."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        src = ws / "src"
+        src.mkdir()
+        (src / "App.vue").write_text("<template>Custom</template>", encoding="utf-8")
+        (src / "router").mkdir()
+        (src / "router" / "index.ts").write_text("// custom", encoding="utf-8")
+        (src / "assets").mkdir()
+        (src / "assets" / "main.css").write_text("body{}", encoding="utf-8")
+
+        FrontendPipeline._write_config_files(ws, self._make_vue_plan(), self._make_req())
+
+        assert (src / "App.vue").read_text() == "<template>Custom</template>"
+        assert (src / "router" / "index.ts").read_text() == "// custom"
+        # Note: main.css is always overwritten by the globals CSS section
+        # which runs before the stub check — so we only check App.vue and router.
+
+    def test_router_includes_page_routes(self, tmp_path):
+        """Page components should be wired into the router stub."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        plan = self._make_vue_plan([
+            UIComponent(
+                name="HomeView",
+                file_path="src/views/HomeView.vue",
+                component_type="page",
+                description="Home page",
+            ),
+            UIComponent(
+                name="AboutView",
+                file_path="src/views/AboutView.vue",
+                component_type="page",
+                description="About page",
+            ),
+            UIComponent(
+                name="Navbar",
+                file_path="src/components/Navbar.vue",
+                component_type="ui",
+                description="Navigation bar",
+            ),
+        ])
+        FrontendPipeline._write_config_files(ws, plan, self._make_req())
+
+        content = (ws / "src" / "router" / "index.ts").read_text()
+        assert "HomeView" in content
+        assert "AboutView" in content
+        # Non-page component should NOT be in routes
+        assert "Navbar" not in content
+
+    def test_home_page_gets_root_route(self, tmp_path):
+        """A component named 'Home*' or 'Index*' should get the '/' route."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        plan = self._make_vue_plan([
+            UIComponent(
+                name="HomeView",
+                file_path="src/views/HomeView.vue",
+                component_type="page",
+                description="Home",
+            ),
+        ])
+        FrontendPipeline._write_config_files(ws, plan, self._make_req())
+
+        content = (ws / "src" / "router" / "index.ts").read_text()
+        assert "path: '/'" in content
+
+    def test_nextjs_does_not_get_vue_stubs(self, tmp_path):
+        """Next.js projects should NOT get App.vue or router/index.ts."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "next-app"
+        ws.mkdir()
+        plan = ComponentPlan(
+            components=[],
+            framework="nextjs",
+            state_solution="zustand",
+            api_base_url="/api",
+        )
+        req = ProductRequirements(
+            title="Next App", description="Test",
+            tech_preferences={"styling": "css"},
+        )
+        FrontendPipeline._write_config_files(ws, plan, req)
+
+        assert not (ws / "src" / "App.vue").exists()
+        assert not (ws / "src" / "router" / "index.ts").exists()
