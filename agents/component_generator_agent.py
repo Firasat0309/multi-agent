@@ -161,10 +161,17 @@ class ComponentGeneratorAgent(BaseAgent):
                 "FRAMEWORK: Vue 3 (Composition API)\n"
                 "- Use <script setup lang='ts'> for all components (.vue SFC).\n"
                 "- Use defineProps<T>() and defineEmits<T>() for typed props / events.\n"
-                "- Use ref()/reactive() for local state, computed() for derived state.\n"
-                "- Use Pinia stores for cross-cutting state (import from '../../store/...').\n"
+                "- Use ref()/reactive() for local state, computed() for derived values.\n"
+                "- Use onMounted(), onUnmounted(), onBeforeUnmount() for lifecycle hooks.\n"
+                "- Use watch(source, handler) or watchEffect(() => ...) for reactive side effects.\n"
+                "- Use Pinia stores for cross-cutting state (import from '../../stores/useXxxStore').\n"
+                "- When destructuring Pinia store state, use storeToRefs() to preserve reactivity:\n"
+                "    const store = useMyStore()\n"
+                "    const { count, user } = storeToRefs(store)  // reactive refs\n"
+                "    const { increment } = store                  // actions (not refs)\n"
                 "- Use Vue Router composables (useRouter, useRoute) for navigation.\n"
-                "- Use named exports for reusable composable functions.\n"
+                "- Use named exports for reusable composable functions (src/composables/useXxx.ts).\n"
+                "- Always add <style scoped> for component-level CSS to avoid global leakage.\n"
                 "- File extension: .vue for components, .ts for composables/stores.\n\n"
             )
         if "angular" in fw:
@@ -201,12 +208,14 @@ class ComponentGeneratorAgent(BaseAgent):
 
         comp_text = ""
         if component:
+            figma_line = (f"Figma Node ID: {component.figma_node_id}\n"
+                          if getattr(component, "figma_node_id", None) else "")
             comp_text = (
                 f"Component: {component.name}\n"
                 f"File path: {component.file_path}\n"
                 f"Type: {component.component_type}\n"
                 f"Description: {component.description}\n"
-                f"Figma Node ID: {getattr(component, 'figma_node_id', 'None')}\n"
+                f"{figma_line}"
                 f"Props: {component.props}\n"
                 f"State needs: {component.state_needs}\n"
                 f"API calls: {component.api_calls}\n"
@@ -622,7 +631,7 @@ class ComponentGeneratorAgent(BaseAgent):
     def _strip_fences(content: str) -> str:
         """Remove markdown code fences the LLM may have wrapped the output in."""
         content = content.strip()
-        for fence in ("```typescript", "```tsx", "```"):
+        for fence in ("```typescript", "```tsx", "```vue", "```"):
             if content.startswith(fence):
                 content = content[len(fence):]
                 break

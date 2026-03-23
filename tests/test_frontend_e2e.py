@@ -1350,6 +1350,18 @@ class TestVueEntryStubGeneration:
         css = ws / "src" / "assets" / "main.css"
         assert css.exists(), "main.css stub was not generated"
 
+    def test_vite_env_stub_created(self, tmp_path):
+        """src/vite-env.d.ts must be created for Vue TypeScript projects."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        FrontendPipeline._write_config_files(ws, self._make_vue_plan(), self._make_req())
+
+        vite_env = ws / "src" / "vite-env.d.ts"
+        assert vite_env.exists(), "vite-env.d.ts stub was not generated"
+        assert "vite/client" in vite_env.read_text()
+
     def test_stubs_not_overwritten_if_exist(self, tmp_path):
         """Pre-existing files must not be overwritten by stubs."""
         from core.pipeline_frontend import FrontendPipeline
@@ -1423,6 +1435,28 @@ class TestVueEntryStubGeneration:
 
         content = (ws / "src" / "router" / "index.ts").read_text()
         assert "path: '/'" in content
+
+    def test_router_creates_missing_view_stubs(self, tmp_path):
+        """Referenced Vue page components should get placeholder files when absent."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        plan = self._make_vue_plan([
+            UIComponent(
+                name="HomeView",
+                file_path="src/views/HomeView.vue",
+                component_type="page",
+                description="Home",
+            ),
+        ])
+
+        FrontendPipeline._write_config_files(ws, plan, self._make_req())
+
+        home_view = ws / "src" / "views" / "HomeView.vue"
+        assert home_view.exists(), "Referenced view stub was not generated"
+        content = home_view.read_text()
+        assert "<template><div>HomeView</div></template>" in content
 
     def test_nextjs_does_not_get_vue_stubs(self, tmp_path):
         """Next.js projects should NOT get App.vue or router/index.ts."""

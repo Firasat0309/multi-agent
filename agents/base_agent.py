@@ -682,6 +682,9 @@ class BaseAgent(ABC):
         # Strip LLM chain-of-thought / deliberation text that may precede
         # the actual source code in the tool call content.
         content = self._strip_leading_prose(content, path)
+        # Strip trailing markdown fences + commentary the LLM sometimes
+        # appends after the closing tag (e.g. ```Since the provided …).
+        content = self._strip_trailing_fence(content, path)
         # Deduplicate content before writing — LLMs sometimes pass the
         # full file content with the class repeated multiple times.
         content = self._deduplicate_content(content)
@@ -1010,6 +1013,7 @@ class BaseAgent(ABC):
             ),
             ".xml": _re.compile(r"^(?:<\?xml|<!--|<\w)", _re.MULTILINE),
             ".html": _re.compile(r"^(?:<!DOCTYPE|<html|<!--|<\w)", _re.MULTILINE | _re.IGNORECASE),
+            ".vue": _re.compile(r"^(?:<template|<script|<style|<!--|<\w)", _re.MULTILINE | _re.IGNORECASE),
         }
 
         pattern = _FIRST_CODE_LINE.get(ext)
@@ -1043,6 +1047,44 @@ class BaseAgent(ABC):
             )
             return content[m.start():]
 
+        return content
+
+    @staticmethod
+    def _strip_trailing_fence(content: str, path: str = "") -> str:
+        """Remove trailing markdown fences and LLM commentary appended after code.
+
+        LLMs sometimes append ```<prose> directly after the last closing tag
+        (e.g. ``</style>```Since the provided ...``).  This strips everything
+        from the final stray ``` occurrence to EOF for source/config files, but
+        leaves legitimate fenced markdown content intact.
+        """
+        import re as _re
+        from pathlib import Path as _Path
+
+        if "```" not in content:
+            return content
+
+        ext = _Path(path).suffix.lower() if path else ""
+        if ext in {".md", ".markdown", ".mdx", ".rst", ".txt"}:
+            return content
+
+        fence_pos = content.rfind("```")
+        if fence_pos <= 0:
+            return content
+
+        trailing = content[fence_pos + 3:].strip()
+        # Only strip if trailing text looks like LLM prose commentary.
+        # Empty trailing (file legitimately ends with ```) → keep as-is.
+        if not trailing or not _re.match(
+            r"^(?:since|here(?:'s| is)?|note|this|that|the|i\b|let\b|okay\b|wait\b|provided\b)",
+            trailing,
+            _re.IGNORECASE,
+        ):
+            return content
+
+        stripped = content[:fence_pos].rstrip()
+        if stripped:
+            return stripped + "\n"
         return content
 
     @staticmethod

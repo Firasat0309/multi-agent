@@ -649,6 +649,10 @@ class FrontendPipeline:
                         fix_metadata: dict = {
                             "fix_trigger": "build",
                             "build_errors": "\n".join(file_errors),
+                            "component_plan": component_plan,
+                            "api_contract": api_contract,
+                            "design_spec": design_spec,
+                            "requirements": requirements,
                         }
                         if fix_component:
                             fix_metadata["component"] = fix_component
@@ -1069,7 +1073,7 @@ class FrontendPipeline:
             # introduced by API integration, state management, and cross-file
             # type mismatches.
             self._phase("FE: Final Build Check", "running")
-            logger.info("[FE Phase 9] Running final build check (npm install + type check)...")
+            logger.info("[FE Phase 9] Running final build check (npm install + type check + npm run build)...")
             try:
                 final_build_ok = await self._run_final_build_check(
                     workspace, frontend_blueprint, agent_manager, event_bus,
@@ -1487,13 +1491,13 @@ class FrontendPipeline:
         requirements: "ProductRequirements | None" = None,
         ordered_components: "list | None" = None,
     ) -> bool:
-        """Run npm install + tsc after ALL generation phases are done.
+        """Run npm install + type-check + npm build after all FE phases.
 
         This catches type errors introduced by API integration, state management,
         and cross-file mismatches that Phase 4.5 (which runs before Phases 5-8)
         cannot detect.
 
-        Returns True if the build passes (or tools are unavailable).
+        Returns True only when type-check and npm build both pass.
         """
         # Step 1: npm install (required for tsc to resolve node_modules types)
         await self._ensure_npm_install(workspace, phase_label="FE Phase 9")
@@ -1504,11 +1508,35 @@ class FrontendPipeline:
 
         compile_result = await tsx_compiler.check(workspace)
         if not compile_result.tsc_available:
-            logger.warning("[FE Phase 9] tsc not available — skipping final type check")
+            logger.warning("[FE Phase 9] tsc not available — skipping type check; running npm build only")
+            build_ok, build_output = await self._run_npm_build(workspace, phase_label="FE Phase 9")
+            if not build_ok:
+                metrics["final_build_errors"] = max(metrics.get("final_build_errors", 0), 1)
+                errors.append(
+                    "Final build error (npm run build): "
+                    + (build_output.strip().splitlines()[-1] if build_output.strip() else "build command failed")
+                )
+                return False
             return True
 
         if not compile_result.errors:
-            logger.info("[FE Phase 9] Final build check passed — 0 errors")
+            build_ok, build_output = await self._run_npm_build(workspace, phase_label="FE Phase 9")
+            if not build_ok:
+                metrics["final_build_errors"] = max(metrics.get("final_build_errors", 0), 1)
+                errors.append(
+                    "Final build error (npm run build): "
+                    + (build_output.strip().splitlines()[-1] if build_output.strip() else "build command failed")
+                )
+                await event_bus.publish(AgentEvent(
+                    type=BusEventType.BUILD_FAILED,
+                    data={
+                        "checkpoint": "final_build",
+                        "error_count": metrics["final_build_errors"],
+                    },
+                ))
+                return False
+
+            logger.info("[FE Phase 9] Final build check passed — type-check and npm build succeeded")
             await event_bus.publish(AgentEvent(
                 type=BusEventType.BUILD_PASSED,
                 data={"checkpoint": "final_build"},
@@ -1528,6 +1556,22 @@ class FrontendPipeline:
                 )
                 compile_result = await tsx_compiler.check(workspace)
                 if not compile_result.errors:
+                    build_ok, build_output = await self._run_npm_build(workspace, phase_label="FE Phase 9")
+                    if not build_ok:
+                        metrics["final_build_errors"] = max(metrics.get("final_build_errors", 0), 1)
+                        errors.append(
+                            "Final build error (npm run build): "
+                            + (build_output.strip().splitlines()[-1] if build_output.strip() else "build command failed")
+                        )
+                        await event_bus.publish(AgentEvent(
+                            type=BusEventType.BUILD_FAILED,
+                            data={
+                                "checkpoint": "final_build",
+                                "error_count": metrics["final_build_errors"],
+                            },
+                        ))
+                        return False
+
                     logger.info("[FE Phase 9] Final build passed after import auto-fix")
                     await event_bus.publish(AgentEvent(
                         type=BusEventType.BUILD_PASSED,
@@ -1643,6 +1687,22 @@ class FrontendPipeline:
 
             compile_result = await tsx_compiler.check(workspace)
             if not compile_result.errors:
+                build_ok, build_output = await self._run_npm_build(workspace, phase_label="FE Phase 9")
+                if not build_ok:
+                    metrics["final_build_errors"] = max(metrics.get("final_build_errors", 0), 1)
+                    errors.append(
+                        "Final build error (npm run build): "
+                        + (build_output.strip().splitlines()[-1] if build_output.strip() else "build command failed")
+                    )
+                    await event_bus.publish(AgentEvent(
+                        type=BusEventType.BUILD_FAILED,
+                        data={
+                            "checkpoint": "final_build",
+                            "error_count": metrics["final_build_errors"],
+                        },
+                    ))
+                    return False
+
                 logger.info(
                     "[FE Phase 9] Final build passed after %d fix attempt(s)", retry + 1
                 )
@@ -1681,6 +1741,50 @@ class FrontendPipeline:
             },
         ))
         return False
+
+    async def _run_npm_build(self, workspace: Path, phase_label: str = "FE") -> tuple[bool, str]:
+        """Run npm build script and return (ok, combined_output)."""
+        package_json = workspace / "package.json"
+        if not package_json.exists():
+            logger.warning("[%s] No package.json found; skipping npm run build", phase_label)
+            return True, ""
+        try:
+            pkg_data = _json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+            scripts = pkg_data.get("scripts", {})
+            if "build" not in scripts:
+                logger.warning("[%s] package.json has no build script; skipping npm run build", phase_label)
+                return True, ""
+        except Exception:
+            logger.warning("[%s] Could not parse package.json; attempting npm run build anyway", phase_label)
+
+        logger.info("[%s] Running npm run build for final verification...", phase_label)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "npm",
+                "run",
+                "build",
+                cwd=str(workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=180.0)
+            output = stdout_bytes.decode(errors="replace")
+            if proc.returncode != 0:
+                logger.warning(
+                    "[%s] npm run build failed (rc=%d): %s",
+                    phase_label,
+                    proc.returncode,
+                    output[:1200],
+                )
+                return False, output
+            logger.info("[%s] npm run build completed", phase_label)
+            return True, output
+        except FileNotFoundError:
+            logger.warning("[%s] npm not found on PATH", phase_label)
+            return False, "npm not found"
+        except asyncio.TimeoutError:
+            logger.warning("[%s] npm run build timed out after 180s", phase_label)
+            return False, "build timed out"
 
     @staticmethod
     def _scan_backend_models(
@@ -2251,6 +2355,15 @@ class FrontendPipeline:
             (src_dir / "main.ts").write_text(main_ts, encoding="utf-8")
             logger.info("Wrote src/main.ts")
 
+            # vite-env.d.ts — declares import.meta.env types for vue-tsc
+            vite_env_path = src_dir / "vite-env.d.ts"
+            if not vite_env_path.exists():
+                vite_env_path.write_text(
+                    '/// <reference types="vite/client" />\n',
+                    encoding="utf-8",
+                )
+                logger.info("Wrote src/vite-env.d.ts")
+
             # App.vue stub — main.ts imports './App.vue'; without it the
             # Vite build fails immediately.  The CoderAgent will overwrite
             # this if the component planner includes an App component.
@@ -2278,6 +2391,7 @@ class FrontendPipeline:
                     if getattr(c, "component_type", "") == "page" and c.file_path
                 ]
                 route_entries: list[str] = []
+                referenced_view_paths: list[Path] = []
                 for pc in page_components:
                     fp = pc.file_path.replace("\\", "/")
                     # Derive route path from file name (e.g. "src/views/Home.vue" → "/")
@@ -2293,16 +2407,28 @@ class FrontendPipeline:
                         rel = f"./{rel}" if not rel.startswith(".") else rel
                     except ValueError:
                         # file is outside router_dir — use ../ prefix
-                        rel = str(
-                            Path("..") / Path(fp).relative_to("src")
-                        ).replace("\\", "/")
+                        try:
+                            rel = str(
+                                Path("..") / Path(fp).relative_to("src")
+                            ).replace("\\", "/")
+                        except ValueError:
+                            # fp doesn't start with src/ — use raw relative path
+                            rel = f"../{fp}"
                     route_entries.append(
                         f"  {{ path: '{route_path}', name: '{name}', "
                         f"component: () => import('{rel}') }},\n"
                     )
-                routes_block = "".join(route_entries) if route_entries else (
-                    "  { path: '/', name: 'Home', component: () => import('../views/HomeView.vue') },\n"
-                )
+                    # Track the view file so we can create a stub if it doesn't exist
+                    referenced_view_paths.append(workspace / fp)
+
+                if route_entries:
+                    routes_block = "".join(route_entries)
+                else:
+                    # Fallback: inline component — no external file reference to break
+                    routes_block = (
+                        "  { path: '/', name: 'Home', "
+                        "component: { template: '<div>Home</div>' } },\n"
+                    )
                 router_stub = (
                     "import { createRouter, createWebHistory } from 'vue-router';\n\n"
                     "const routes = [\n"
@@ -2316,6 +2442,26 @@ class FrontendPipeline:
                 )
                 router_index_path.write_text(router_stub, encoding="utf-8")
                 logger.info("Wrote src/router/index.ts (stub with %d routes)", len(route_entries))
+
+                # Create empty .vue stubs for referenced page views so Vite
+                # can resolve dynamic imports at build time.  The CoderAgent
+                # will overwrite these with real components later.
+                for view_path in referenced_view_paths:
+                    # Guard against path traversal from LLM-generated paths
+                    try:
+                        view_path.resolve().relative_to(workspace.resolve())
+                    except ValueError:
+                        logger.warning("Skipping view stub outside workspace: %s", view_path)
+                        continue
+                    if not view_path.exists():
+                        view_path.parent.mkdir(parents=True, exist_ok=True)
+                        stub_name = view_path.stem
+                        view_path.write_text(
+                            f"<template><div>{stub_name}</div></template>\n"
+                            f"<script setup lang=\"ts\"></script>\n",
+                            encoding="utf-8",
+                        )
+                        logger.info("Wrote %s (view stub for router)", view_path.name)
 
             # assets/main.css — main.ts imports './assets/main.css'
             assets_dir = src_dir / "assets"

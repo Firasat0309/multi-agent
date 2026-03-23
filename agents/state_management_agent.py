@@ -77,20 +77,29 @@ class StateManagementAgent(BaseAgent):
             "  - Create src/store/index.ts (configureStore + RootState + AppDispatch).\n"
             "  - Create src/store/hooks.ts (typed useAppSelector / useAppDispatch).\n\n"
             "When state_solution is 'pinia' (Vue 3):\n"
-            "  - Create src/stores/<entity>.ts for each domain store.\n"
-            "  - Use defineStore with setup syntax and typed state.\n\n"
+            "  - Create src/stores/<entity>.ts for each domain store (plural: stores/).\n"
+            "  - Use defineStore with setup() syntax and fully typed state:\n"
+            "      export const useAuthStore = defineStore('auth', () => {\n"
+            "        const user = ref<User | null>(null)\n"
+            "        async function login(creds) { ... }\n"
+            "        return { user, login }\n"
+            "      })\n"
+            "  - Consumers must use storeToRefs() to destructure reactive state:\n"
+            "      const { user } = storeToRefs(useAuthStore())\n"
+            "  - Write barrel: src/stores/index.ts re-exporting all stores.\n\n"
             "When state_solution is 'context' (React lightweight):\n"
             "  - Create src/context/<Entity>Context.tsx with provider + hook.\n\n"
             "Universal rules:\n"
             "- Use TypeScript throughout.\n"
-            "- Keep async operations in the store (thunks, Zustand actions, etc.).\n"
-            "- Create ONE file per state slice/store (e.g. src/store/authStore.ts,\n"
-            "  src/store/uiStore.ts). Each file should export a named hook\n"
-            "  (e.g. export const useAuthStore = create<AuthState>(...)).\n"
-            "- Also create convenience alias files so imports like\n"
-            "  'src/store/useAuthStore' resolve: either name the file useAuthStore.ts\n"
-            "  or re-export from a useAuthStore.ts barrel.\n"
-            "- Write a barrel src/store/index.ts that re-exports ALL store hooks.\n"
+            "- Keep async operations in the store (thunks, Zustand actions, Pinia actions).\n"
+            "- File locations:\n"
+            "    Vue/Pinia:       src/stores/<entity>.ts  (plural: stores/)\n"
+            "    React/Zustand:   src/store/<slice>.ts    (singular: store/)\n"
+            "    Redux:           src/store/slices/<slice>Slice.ts\n"
+            "- Each file exports a named hook (e.g. useAuthStore, useTaskStore).\n"
+            "- Write a barrel index that re-exports ALL store hooks:\n"
+            "    Vue/Pinia: src/stores/index.ts\n"
+            "    React:     src/store/index.ts\n"
             "- Write each file to disk using the write_file tool.\n"
             "- Do NOT duplicate API call logic — import from src/lib/api.ts.\n"
             "  Read the api.ts file first using read_file to see what functions are exported,\n"
@@ -135,12 +144,28 @@ class StateManagementAgent(BaseAgent):
             )
             api_text = f"Available API endpoints:\n{endpoint_lines}\n\n"
 
+        # Include API contract schemas so store TypeScript types match the API exactly
+        schema_text = ""
+        if contract and contract.schemas:
+            import json as _json
+            schema_text = (
+                "API CONTRACT SCHEMAS — define your TypeScript types to match these EXACTLY.\n"
+                "Do NOT invent field names; use only the fields listed here:\n"
+            )
+            for name, definition in contract.schemas.items():
+                try:
+                    schema_text += f"  {name}: {_json.dumps(definition)}\n"
+                except Exception:
+                    schema_text += f"  {name}: {definition}\n"
+            schema_text += "\n"
+
         return (
             f"Framework: {plan.framework}\n"
             f"State solution: {plan.state_solution}\n"
             f"API base URL: {plan.api_base_url}\n"
             f"Required state slices: {slices_text}\n\n"
             f"{api_text}"
+            f"{schema_text}"
             "IMPORTANT: Before writing store files, use read_file to read src/lib/api.ts\n"
             "to see what functions/client it exports. Import those exact exports in your stores.\n\n"
             "Generate ALL state management files and write each to disk using write_file."

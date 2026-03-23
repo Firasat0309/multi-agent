@@ -164,3 +164,35 @@ class TestStripLeadingProse:
         assert result.startswith("package com.example.auth.controller;")
         assert "I'll" not in result
         assert "Wait," not in result
+
+
+class TestStripTrailingFence:
+    def test_removes_only_trailing_llm_commentary_from_code_file(self):
+        content = (
+            "<template>\n"
+            "  <div>Hello</div>\n"
+            "</template>\n"
+            "```Since the provided component was complete already"
+        )
+
+        result = BaseAgent._strip_trailing_fence(content, "src/App.vue")
+
+        assert result == "<template>\n  <div>Hello</div>\n</template>\n"
+
+    def test_keeps_markdown_fenced_code_blocks_intact(self):
+        content = (
+            "# Usage\n\n"
+            "```python\n"
+            "print('hello')\n"
+            "```\n"
+        )
+
+        assert BaseAgent._strip_trailing_fence(content, "README.md") == content
+
+    def test_keeps_embedded_fence_text_inside_non_markdown_content(self):
+        content = (
+            "const snippet = \"```not a fence\";\n"
+            "export default snippet;\n"
+        )
+
+        assert BaseAgent._strip_trailing_fence(content, "src/snippet.ts") == content

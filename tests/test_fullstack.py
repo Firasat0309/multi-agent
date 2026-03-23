@@ -655,6 +655,262 @@ class TestAgentManagerTaskMap:
 # ── FullstackPipeline helpers tests ──────────────────────────────────────────
 
 
+class TestFullstackVueJavaE2E:
+    """End-to-end dummy flow test for Vue frontend + Java backend."""
+
+    @pytest.mark.anyio
+    async def test_fullstack_vue_java_pipeline_executes_all_phases(self, tmp_path):
+        """Verify that the fullstack pipeline calls all phases in order
+        with correct context propagation for a Vue + Java project."""
+        from core.pipeline_fullstack import FullstackPipeline
+
+        # ── Arrange: mock settings and LLM ────────────────────────────────
+        settings = MagicMock()
+        settings.workspace_dir = tmp_path
+        settings.require_architecture_approval = False
+        settings.phase_timeout_seconds = 30
+        settings.build_checkpoint_retries = 1
+        settings.memory = MagicMock()
+        settings.memory.embedding_model = "all-MiniLM-L6-v2"
+        # model_copy for backend workspace override
+        settings.model_copy = MagicMock(return_value=settings)
+
+        llm = MagicMock()
+        llm.generate_json = AsyncMock()
+        llm.generate = AsyncMock()
+
+        # ── Mock product planner ──────────────────────────────────────────
+        vue_java_requirements = ProductRequirements(
+            title="Todo App",
+            description="A fullstack Todo application with Vue frontend and Java backend",
+            user_stories=["As a user, I want to manage todos"],
+            features=["Todo CRUD", "User auth"],
+            tech_preferences={
+                "frontend": "vue",
+                "backend": "java",
+                "db": "postgresql",
+                "state": "pinia",
+            },
+            has_frontend=True,
+            has_backend=True,
+        )
+
+        # ── Mock architect ────────────────────────────────────────────────
+        java_blueprint = RepositoryBlueprint(
+            name="todo-backend",
+            description="Java Spring Boot backend",
+            architecture_style="REST",
+            tech_stack={"language": "java", "framework": "spring-boot", "build_tool": "maven"},
+            folder_structure=["src/main/java/com/todo"],
+            file_blueprints=[
+                FileBlueprint(
+                    path="src/main/java/com/todo/controller/TodoController.java",
+                    purpose="REST controller for todo CRUD",
+                    depends_on=[],
+                    language="java",
+                    layer="controller",
+                    exports=["TodoController"],
+                ),
+                FileBlueprint(
+                    path="src/main/java/com/todo/model/Todo.java",
+                    purpose="Todo entity model",
+                    depends_on=[],
+                    language="java",
+                    layer="model",
+                    exports=["Todo"],
+                ),
+            ],
+        )
+
+        # ── Mock API contract ─────────────────────────────────────────────
+        api_contract = APIContract(
+            title="Todo API",
+            version="1.0.0",
+            base_url="/api/v1",
+            endpoints=[
+                APIEndpoint(
+                    path="/todos",
+                    method="GET",
+                    description="List all todos",
+                    auth_required=False,
+                    tags=["todos"],
+                ),
+                APIEndpoint(
+                    path="/todos",
+                    method="POST",
+                    description="Create a new todo",
+                    auth_required=True,
+                    tags=["todos"],
+                    request_schema={"title": "string", "completed": "boolean"},
+                    response_schema={"id": "number", "title": "string", "completed": "boolean"},
+                ),
+            ],
+            schemas={
+                "Todo": {"type": "object", "properties": {"id": "number", "title": "string", "completed": "boolean"}},
+            },
+        )
+
+        # ── Patch agents to return mocked results ─────────────────────────
+        call_order: list[str] = []
+
+        async def mock_plan_product(prompt):
+            call_order.append("product_planner")
+            return vue_java_requirements
+
+        async def mock_design_architecture(prompt):
+            call_order.append("architect")
+            # Verify enriched prompt contains product requirements
+            assert "Todo App" in prompt
+            assert "Todo CRUD" in prompt
+            return java_blueprint
+
+        async def mock_generate_contract(req, bp):
+            call_order.append("api_contract")
+            assert req.title == "Todo App"
+            assert bp.name == "todo-backend"
+            return api_contract
+
+        # Mock BE and FE pipelines to capture their inputs
+        be_prompt_captured = []
+        fe_args_captured = []
+
+        from core.pipeline import PipelineResult as PR
+
+        async def mock_be_execute(prompt, start_time):
+            call_order.append("backend_pipeline")
+            be_prompt_captured.append(prompt)
+            # Verify BE prompt includes API contract details
+            assert "/todos" in prompt
+            assert "API Contract" in prompt
+            return PR(
+                success=True,
+                workspace_path=tmp_path / "backend",
+                task_stats={"generated": 2},
+            )
+
+        async def mock_fe_execute(req, contract, start_time, **kwargs):
+            call_order.append("frontend_pipeline")
+            fe_args_captured.append((req, contract, kwargs))
+            # Verify FE receives correct inputs
+            assert req.title == "Todo App"
+            assert contract.title == "Todo API"
+            assert "frontend_workspace" in kwargs
+            assert kwargs.get("backend_blueprint") is not None
+            return PR(
+                success=True,
+                workspace_path=tmp_path / "frontend",
+                metrics={"components_generated": 3},
+            )
+
+        with patch("core.pipeline_fullstack.ProductPlannerAgent") as MockPlanner, \
+             patch("core.pipeline_fullstack.ArchitectAgent") as MockArchitect, \
+             patch("core.pipeline_fullstack.APIContractAgent") as MockContract, \
+             patch("core.pipeline_run.RunPipeline") as MockBECls, \
+             patch("core.pipeline_frontend.FrontendPipeline") as MockFECls, \
+             patch.object(FullstackPipeline, "_verify_fe_contract_coverage", new_callable=AsyncMock):
+            MockBE = MockBECls
+            MockFE = MockFECls
+
+            MockPlanner.return_value.plan_product = mock_plan_product
+            MockArchitect.return_value.design_architecture = mock_design_architecture
+            MockContract.return_value.generate_contract = mock_generate_contract
+            MockBE.return_value.execute = mock_be_execute
+            MockFE.return_value.execute = mock_fe_execute
+
+            pipeline = FullstackPipeline(settings, llm, live=None, interactive=False)
+            result = await pipeline.execute(
+                "Build a Todo app with Vue frontend and Java Spring Boot backend",
+                start_time=0.0,
+            )
+
+        # ── Assert: all phases ran in correct order ───────────────────────
+        assert call_order == [
+            "product_planner",
+            "architect",
+            "api_contract",
+            "backend_pipeline",
+            "frontend_pipeline",
+        ], f"Phase order was: {call_order}"
+
+        # Overall result
+        assert result.success is True
+        assert result.blueprint is java_blueprint
+
+        # BE prompt includes full API contract details
+        assert len(be_prompt_captured) == 1
+        assert "Create a new todo" in be_prompt_captured[0]
+
+        # FE received api_contract and backend_blueprint
+        assert len(fe_args_captured) == 1
+        _, fe_contract, fe_kwargs = fe_args_captured[0]
+        assert fe_contract is api_contract
+        assert fe_kwargs["backend_blueprint"] is java_blueprint
+
+    @pytest.mark.anyio
+    async def test_fullstack_contract_validation_catches_bad_endpoints(self):
+        """Validate that malformed endpoints are logged as warnings."""
+        import logging
+        from core.pipeline_fullstack import FullstackPipeline
+
+        contract = APIContract(
+            title="",  # empty title
+            base_url="",  # empty base_url
+            endpoints=[
+                APIEndpoint(
+                    path="no-leading-slash",
+                    method="INVALID",
+                    description="",
+                ),
+            ],
+        )
+        with patch.object(logging.getLogger("core.pipeline_fullstack"), "warning") as mock_warn:
+            FullstackPipeline._validate_contract_fields(contract)
+            # Should have warnings for: empty title, empty base_url, malformed endpoint
+            assert mock_warn.call_count >= 3
+
+    def test_build_backend_prompt_includes_schemas(self):
+        """Backend prompt must include shared schemas for DTO generation."""
+        from core.pipeline_fullstack import FullstackPipeline
+
+        contract = APIContract(
+            title="API",
+            base_url="/api",
+            endpoints=[
+                APIEndpoint(
+                    path="/items",
+                    method="GET",
+                    description="List items",
+                    request_schema={"name": "string"},
+                    response_schema={"id": "number"},
+                ),
+            ],
+            schemas={"Item": {"type": "object", "properties": {"id": "number"}}},
+        )
+        prompt = FullstackPipeline._build_backend_prompt("base prompt", contract)
+        assert "Item" in prompt
+        assert "Request schema" in prompt
+        assert "Response schema" in prompt
+        assert "Shared schemas" in prompt
+
+    def test_fix_metadata_includes_full_context(self):
+        """Fix metadata in Phase 4.5 must include component_plan and api_contract."""
+        # This is a regression test for the bug where fix cycles lost context.
+        # We verify by inspecting the source code structure.
+        import ast
+        import inspect
+        from core.pipeline_frontend import FrontendPipeline
+
+        source = inspect.getsource(FrontendPipeline)
+        # Find the fix_metadata dict in the Phase 4.5 fix-retry loop
+        # (the first occurrence, which is the tsx compilation fix path)
+        assert "\"component_plan\": component_plan" in source, (
+            "fix_metadata must include component_plan for fix cycles"
+        )
+        assert "\"api_contract\": api_contract" in source, (
+            "fix_metadata must include api_contract for fix cycles"
+        )
+
+
 class TestFullstackPipelineHelpers:
     def test_enrich_prompt_includes_features(self):
         from core.pipeline_fullstack import FullstackPipeline

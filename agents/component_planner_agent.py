@@ -48,7 +48,7 @@ class ComponentPlannerAgent(BaseAgent):
             '  "components": [\n'
             "    {\n"
             '      "name": "UserList",\n'
-            '      "file_path": "src/components/feature/UserList.tsx",\n'
+            '      "file_path": "src/components/feature/UserList.vue",  // .vue for Vue, .tsx for React/Next\n'
             '      "component_type": "feature",\n'
             '      "description": "Displays paginated list of users",\n'
             '      "figma_node_id": "1:23",\n'
