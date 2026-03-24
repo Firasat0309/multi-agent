@@ -559,7 +559,14 @@ class ComponentGeneratorAgent(BaseAgent):
             "9. Output the COMPLETE corrected file — every line, no markdown fences.\n"
         )
 
-        fixed_code = await self._call_llm(prompt, system_override=self.system_prompt)
+        _fix_system = (
+            "You are a senior frontend engineer specialising in React/Next.js, "
+            "Vue 3 (Composition API), and TypeScript.\n\n"
+            "Your task is to fix compilation errors in a source file.\n"
+            "Return ONLY the complete corrected file content — no markdown fences, "
+            "no explanations, no tool calls."
+        )
+        fixed_code = await self._call_llm(prompt, system_override=_fix_system)
         fixed_code = self._strip_fences(fixed_code)
 
         # ── Validate ──────────────────────────────────────────────────────
