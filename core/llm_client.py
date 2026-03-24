@@ -1188,6 +1188,109 @@ class LLMClient:
             if tc:
                 return tc
 
+        # ── Strategy 4: repair truncated tool calls ──────────────────────
+        # When Gemini hits max_tokens mid-write_file, the JSON is cut off
+        # inside the "content" value.  _balanced_extract returns None
+        # because braces never balance.
+        #
+        # We apply two sub-strategies:
+        # a) Fix unescaped newlines, then close unclosed string + balance
+        #    braces manually (avoids _repair_json_text stripping the
+        #    content key-value pair as "trailing partial data").
+        # b) Direct _repair_json_text (works for already-escaped content).
+
+        def _close_and_balance(s: str) -> str:
+            """Close unclosed strings and balance braces/brackets."""
+            in_str = False
+            esc = False
+            stack: list[str] = []
+            for ch in s:
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\":
+                    if in_str:
+                        esc = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch in "{[":
+                    stack.append("}" if ch == "{" else "]")
+                elif ch in "}]" and stack:
+                    stack.pop()
+            result = s
+            if in_str:
+                result += '"'
+            result += "".join(reversed(stack))
+            return result
+
+        for candidate in candidates:
+            # Sub-strategy a): fix unescaped newlines, then close + balance
+            try:
+                content_pat = _re.compile(r'"content"\s*:\s*"', _re.DOTALL)
+                m = content_pat.search(candidate)
+                if m:
+                    val_start = m.end()
+                    fixed_parts = [candidate[:val_start]]
+                    i = val_start
+                    while i < len(candidate):
+                        ch = candidate[i]
+                        if ch == "\\" and i + 1 < len(candidate):
+                            fixed_parts.append(candidate[i:i + 2])
+                            i += 2
+                            continue
+                        if ch == '"':
+                            break
+                        if ch == "\n":
+                            fixed_parts.append("\\n")
+                        elif ch == "\t":
+                            fixed_parts.append("\\t")
+                        elif ch == "\r":
+                            fixed_parts.append("\\r")
+                        else:
+                            fixed_parts.append(ch)
+                        i += 1
+                    nl_fixed = "".join(fixed_parts) + candidate[i:]
+                    # Try close-and-balance on the newline-fixed version
+                    # (handles both: newlines actually fixed, AND already-
+                    # escaped text that's just truncated).
+                    closed = _close_and_balance(nl_fixed)
+                    tc = _try_parse(closed)
+                    if tc:
+                        tag = (
+                            "newline-fix + brace-balance"
+                            if nl_fixed != candidate
+                            else "brace-balance"
+                        )
+                        logger.warning(
+                            "Recovered truncated Gemini tool call via "
+                            "%s (tool=%s, content_len=%d)",
+                            tag,
+                            tc.name,
+                            len(tc.input.get("content", "")),
+                        )
+                        return tc
+            except Exception:
+                pass
+
+            # Sub-strategy b): direct _close_and_balance without content-field awareness
+            try:
+                closed = _close_and_balance(candidate)
+                tc = _try_parse(closed)
+                if tc:
+                    logger.warning(
+                        "Recovered truncated Gemini tool call via "
+                        "direct brace-balance (tool=%s, content_len=%d)",
+                        tc.name,
+                        len(tc.input.get("content", "")),
+                    )
+                    return tc
+            except Exception:
+                pass
+
         # Log the failure for debugging
         if '"tool_call"' in text or '"write_file"' in text:
             logger.warning(

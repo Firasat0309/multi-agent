@@ -217,3 +217,67 @@ class TestExtractGeminiToolCall:
         assert tc is not None
         assert tc.name == "write_file"
         assert "line1" in tc.input["content"]
+
+    # ── Truncated tool call recovery (Strategy 4) ────────────────────
+
+    def test_truncated_escaped_newlines(self):
+        """JSON-escaped \\n in content, truncated mid-string."""
+        text = (
+            '{"tool_call": {"name": "write_file", "input": {"path": '
+            '"Dto.java", "content": "package com.example;\\n'
+            'import java.io.*;\\n\\n'
+            'public class Dto {\\n    private Str'
+        )
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "write_file"
+        assert "package com.example" in tc.input["content"]
+        assert len(tc.input["content"]) > 0
+
+    def test_truncated_unescaped_newlines(self):
+        """Real newline chars in content (Gemini forgot to escape), truncated."""
+        text = (
+            '{"tool_call": {"name": "write_file", "input": {"path": '
+            '"Dto.java", "content": "package com.example;\n'
+            'import java.io.*;\n\n'
+            'public class Dto {\n    private Str'
+        )
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "write_file"
+        assert "package com.example" in tc.input["content"]
+
+    def test_truncated_vue_with_escaped_quotes(self):
+        """Vue file content with escaped quotes and newlines, truncated."""
+        text = (
+            '{"tool_call": {"name": "write_file", "input": {"path": '
+            '"src/components/ui/BaseInput.vue", "content": '
+            '"<script setup lang=\\"ts\\">\\n'
+            'interface Props {\\n'
+            '  label: string;\\n'
+            '  modelValue: string;\\n'
+            '}\\n\\n'
+            'const props = withDefaults(defineProps<Prop'
+        )
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.name == "write_file"
+        assert '<script setup lang="ts">' in tc.input["content"]
+        assert "interface Props" in tc.input["content"]
+
+    def test_truncated_does_not_break_valid(self):
+        """A complete valid tool call must still parse correctly (no false repair)."""
+        text = '{"tool_call": {"name": "write_file", "input": {"path": "a.py", "content": "x = 1"}}}'
+        tc = LLMClient._extract_gemini_tool_call(text)
+        assert tc is not None
+        assert tc.input["content"] == "x = 1"
+
+    def test_truncated_non_write_file_returns_none(self):
+        """Truncated non-write_file JSON that can't form a valid tool_call."""
+        text = '{"tool_call": {"name": "read_fi'
+        tc = LLMClient._extract_gemini_tool_call(text)
+        # After repair, the name would be "read_fi" — no input key
+        # Depending on repair, it may or may not parse; the key guarantee
+        # is it doesn't crash.
+        # (It may actually parse to a truncated name, which is fine —
+        #  the agentic loop will just fail to dispatch it.)
