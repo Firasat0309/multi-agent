@@ -196,7 +196,75 @@ class CoderAgent(BaseAgent):
             "- Class/interface/enum declarations open with `{` and close with `}` — no trailing semicolon\n"
             "- Annotations (@Override, @Autowired, @Entity) go on the line BEFORE the annotated element\n"
             "- Generic type parameters use angle brackets: `List<String>`, not raw `List`\n"
-            "- Before writing the file, mentally scan every line for missing or duplicate semicolons"
+            "- Before writing the file, mentally scan every line for missing or duplicate semicolons\n"
+            "\n\nCRITICAL Spring Boot 3.x rules — these APIs were REMOVED and cause compile/startup failures:\n"
+            "- NEVER extend WebSecurityConfigurerAdapter — it was removed in Spring Boot 3.x.\n"
+            "  Use a @Bean SecurityFilterChain method instead:\n"
+            "    @Bean public SecurityFilterChain filterChain(HttpSecurity http) throws Exception { ... }\n"
+            "- NEVER use antMatchers() — removed in Spring Boot 3.x. Use requestMatchers() instead.\n"
+            "- NEVER use http.authorizeRequests() — deprecated. Use http.authorizeHttpRequests() instead.\n"
+            "- Use lambda DSL for ALL Spring Security configuration (not deprecated method-chaining):\n"
+            "    http.csrf(csrf -> csrf.disable())\n"
+            "    http.cors(cors -> cors.configurationSource(corsConfigurationSource()))\n"
+            "    http.sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))\n"
+            "    http.authorizeHttpRequests(auth -> auth\n"
+            "        .requestMatchers(\"/api/v1/auth/**\").permitAll()\n"
+            "        .anyRequest().authenticated())\n"
+            "- For H2 console access: add .requestMatchers(\"/h2-console/**\").permitAll() and\n"
+            "    http.headers(h -> h.frameOptions(fo -> fo.disable()))\n"
+            "\n\nCRITICAL Spring Boot 3.x PasswordEncoder / circular-dependency rule:\n"
+            "- NEVER define the PasswordEncoder @Bean inside SecurityConfig if AuthService is also\n"
+            "  injected into SecurityConfig. This creates a circular dependency:\n"
+            "  SecurityConfig → AuthService → PasswordEncoder (defined in SecurityConfig) → CYCLE.\n"
+            "- ALWAYS define PasswordEncoder in a SEPARATE @Configuration class (e.g. AppConfig.java):\n"
+            "    @Configuration public class AppConfig {\n"
+            "        @Bean public PasswordEncoder passwordEncoder() { return new BCryptPasswordEncoder(); }\n"
+            "    }\n"
+            "- SecurityConfig should inject PasswordEncoder via constructor, NOT define it.\n"
+            "\n\nCRITICAL JWT filter registration rule:\n"
+            "- If JwtAuthenticationFilter extends OncePerRequestFilter, do NOT annotate it with\n"
+            "  @Component. Register it only inside SecurityConfig via addFilterBefore().\n"
+            "  Having BOTH @Component AND addFilterBefore() causes double execution.\n"
+            "\n\nCRITICAL JPA / Hibernate rules:\n"
+            "- Every @Entity class MUST have a no-argument constructor (public or protected).\n"
+            "  If using Lombok, add @NoArgsConstructor. Without it Hibernate throws\n"
+            "  'No default constructor for entity' at startup.\n"
+            "- Every @Entity class MUST have exactly one field annotated with @Id.\n"
+            "- Use @GeneratedValue(strategy = GenerationType.IDENTITY) for auto-increment IDs.\n"
+            "- Enum fields stored in the database MUST be annotated:\n"
+            "    @Enumerated(EnumType.STRING)\n"
+            "    @Column(nullable = false)\n"
+            "  Omitting @Enumerated stores ordinals (0,1,2) which breaks if enum order changes.\n"
+            "- Do NOT use FetchType.EAGER on @OneToMany — it causes N+1 queries and\n"
+            "  potential infinite recursion during JSON serialisation.\n"
+            "\n\nCRITICAL @SpringBootApplication package rule:\n"
+            "- @SpringBootApplication MUST be placed in the ROOT package that is the common\n"
+            "  parent of ALL sub-packages (controllers, services, repositories, models).\n"
+            "  E.g. if controllers are in com.example.auth.controller and services in\n"
+            "  com.example.auth.service, place @SpringBootApplication in com.example.auth\n"
+            "  so Spring scans all sub-packages automatically.\n"
+            "  If it is placed in a sub-package, beans in sibling packages will NOT be found.\n"
+            "\n\nCRITICAL JJWT version rule (use 0.11.x API — do NOT mix versions):\n"
+            "- Use io.jsonwebtoken:jjwt-api:0.11.5 + jjwt-impl:0.11.5 + jjwt-jackson:0.11.5\n"
+            "- Key creation: Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8))\n"
+            "- Token build: Jwts.builder().setSubject(...).setIssuedAt(...)\n"
+            "    .setExpiration(...).signWith(key).compact()\n"
+            "- Token parse: Jwts.parserBuilder().setSigningKey(key).build().parseClaimsJws(token)\n"
+            "- DO NOT use the 0.9.x API (Jwts.parser().setSigningKey(string)) — incompatible.\n"
+            "- DO NOT use the 0.12.x API (Jwts.parser().verifyWith()) — incompatible with 0.11.x.\n"
+            "\n\nCRITICAL CORS rule for Spring Boot 3.x with Spring Security:\n"
+            "- Spring Security 3.x blocks CORS by default. You MUST define a CorsConfigurationSource\n"
+            "  @Bean and wire it into the SecurityFilterChain:\n"
+            "    @Bean public CorsConfigurationSource corsConfigurationSource() {\n"
+            "        CorsConfiguration cfg = new CorsConfiguration();\n"
+            "        cfg.setAllowedOrigins(List.of(\"http://localhost:5173\", \"http://localhost:3000\"));\n"
+            "        cfg.setAllowedMethods(List.of(\"GET\",\"POST\",\"PUT\",\"DELETE\",\"OPTIONS\"));\n"
+            "        cfg.setAllowedHeaders(List.of(\"*\"));\n"
+            "        cfg.setAllowCredentials(true);\n"
+            "        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();\n"
+            "        source.registerCorsConfiguration(\"/**\", cfg);\n"
+            "        return source;\n"
+            "    }"
         ),
         "typescript": (
             "\n\nCRITICAL TypeScript syntax rules:\n"
@@ -829,29 +897,87 @@ class CoderAgent(BaseAgent):
         tech = context.blueprint.tech_stack
         logger.info(f"Generating config file ({fmt}): {fb.path}")
 
-        # For pom.xml, enforce correct Java 17 configuration with up-to-date Maven fields
+        # Scan all blueprint file paths to detect what technologies are used.
+        _all_bp_paths = " ".join(bp.path for bp in context.blueprint.file_blueprints).lower()
+        _has_jwt      = any(kw in _all_bp_paths for kw in ("jwt", "token"))
+        # Use word-boundary check for 'auth' to avoid false positives like 'AuthorController'
+        _has_security = "security" in _all_bp_paths or bool(_re.search(r'\bauth\b', _all_bp_paths))
+        _has_h2       = tech.get("db", "").lower() == "h2"
+
+        # ── pom.xml: enforce Java 17, required starters, JWT/Security deps ────
         pom_hint = ""
         if Path(fb.path).name.lower() == "pom.xml":
             db_hint = ""
-            if tech.get("db", "").lower() == "h2":
+            if _has_h2:
                 db_hint = (
-                    "\n- Include the H2 in-memory database dependency with runtime scope:\n"
+                    "\n- Include H2 in-memory database dependency (runtime scope):\n"
                     "  <dependency><groupId>com.h2database</groupId>"
                     "<artifactId>h2</artifactId><scope>runtime</scope></dependency>"
                 )
+            jwt_hint = ""
+            if _has_jwt or _has_security:
+                jwt_hint = (
+                    "\n- Include Spring Security starter:\n"
+                    "  <dependency><groupId>org.springframework.boot</groupId>"
+                    "<artifactId>spring-boot-starter-security</artifactId></dependency>\n"
+                    "- Include JJWT 0.11.5 (THREE artifacts — all required, use EXACTLY this version):\n"
+                    "  <dependency><groupId>io.jsonwebtoken</groupId>"
+                    "<artifactId>jjwt-api</artifactId><version>0.11.5</version></dependency>\n"
+                    "  <dependency><groupId>io.jsonwebtoken</groupId>"
+                    "<artifactId>jjwt-impl</artifactId><version>0.11.5</version>"
+                    "<scope>runtime</scope></dependency>\n"
+                    "  <dependency><groupId>io.jsonwebtoken</groupId>"
+                    "<artifactId>jjwt-jackson</artifactId><version>0.11.5</version>"
+                    "<scope>runtime</scope></dependency>"
+                )
+            validation_hint = (
+                "\n- Include Bean Validation (for @Valid, @NotBlank, @Email on DTOs):\n"
+                "  <dependency><groupId>org.springframework.boot</groupId>"
+                "<artifactId>spring-boot-starter-validation</artifactId></dependency>"
+            )
+            # Always include Lombok for Spring Boot projects — it's a near-universal dependency
+            lombok_hint = (
+                "\n- Include Lombok (for @Data, @Builder, @NoArgsConstructor, @Slf4j):\n"
+                "  <dependency><groupId>org.projectlombok</groupId>"
+                "<artifactId>lombok</artifactId><optional>true</optional></dependency>"
+            )
             pom_hint = (
                 "\nIMPORTANT Java 17 requirements for pom.xml:\n"
-                "- Use Spring Boot parent 3.x (e.g. 3.2.x) which targets Java 17 by default\n"
+                "- Use Spring Boot parent 3.x (e.g. 3.2.x)\n"
                 "- Set <java.version>17</java.version> in <properties>\n"
                 "- Set <maven.compiler.source>17</maven.compiler.source> and "
                 "<maven.compiler.target>17</maven.compiler.target> in <properties>\n"
-                "- In the maven-compiler-plugin configuration use <release>17</release> "
-                "(NOT <source>/<target> inside the plugin — use the properties instead)\n"
-                "- Use <maven.compiler.release>17</maven.compiler.release> as the canonical property\n"
-                "- Include all required Spring Boot starter dependencies (web, data-jpa, validation, test)"
-                + db_hint + "\n"
+                "- Use <release>17</release> in maven-compiler-plugin\n"
+                "- Include all required Spring Boot starter dependencies "
+                "(web, data-jpa, validation, test)"
+                + db_hint + jwt_hint + validation_hint + lombok_hint + "\n"
                 "- The pom.xml must be complete and valid — do not truncate it"
             )
+
+        # ── application.properties: inject all required keys so @Value fields resolve ──
+        props_hint = ""
+        if Path(fb.path).name in ("application.properties", "application.yml", "application.yaml"):
+            lines = []
+            if _has_h2:
+                lines += [
+                    "\nREQUIRED H2 datasource properties (MUST be present):",
+                    "  spring.datasource.url=jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1",
+                    "  spring.datasource.driver-class-name=org.h2.Driver",
+                    "  spring.datasource.username=sa",
+                    "  spring.datasource.password=",
+                    "  spring.jpa.database-platform=org.hibernate.dialect.H2Dialect",
+                    "  spring.jpa.hibernate.ddl-auto=create-drop",
+                    "  spring.h2.console.enabled=true",
+                    "  spring.h2.console.path=/h2-console",
+                ]
+            if _has_jwt or _has_security:
+                lines += [
+                    "\nREQUIRED JWT/Security properties (JwtUtil uses @Value — missing = startup crash):",
+                    "  jwt.secret=mySecretKeyForJWTTokenGenerationAndValidation123456",
+                    "  jwt.expiration=86400000",
+                ]
+            if lines:
+                props_hint = "\n".join(lines) + "\n"
 
         prompt = (
             f"Project: {context.blueprint.name}\n"
@@ -860,7 +986,8 @@ class CoderAgent(BaseAgent):
             f"Generate the file: {fb.path}\n"
             f"Purpose: {fb.purpose}\n"
             f"Format: {fmt}\n"
-            f"{pom_hint}\n"
+            f"{pom_hint}"
+            f"{props_hint}\n"
             f"Output only the {fmt} content. No code, no markdown, no explanations."
         )
 
