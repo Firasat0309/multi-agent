@@ -50,13 +50,47 @@ class Pipeline:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    async def run(self, user_prompt: str, *, resume: bool = False) -> PipelineResult:
+    async def run(
+        self,
+        user_prompt: str,
+        *,
+        resume: bool = False,
+        api_contract_path: "str | Path | None" = None,
+    ) -> PipelineResult:
         """Generate a new project from *user_prompt*.
 
-        If *resume* is True, load the lifecycle state from the previous run
-        and skip files that already PASSED.
+        Args:
+            user_prompt: natural-language description of the project.
+            resume: if True, skip files that already PASSED in a previous run.
+            api_contract_path: optional path to an ``api_contract.json`` file.
+                When provided the contract is loaded and injected into every
+                code-generation agent, giving them exact endpoint/schema
+                context instead of relying solely on the LLM-generated
+                architecture description.  If ``None`` the pipeline checks
+                whether ``<workspace>/api_contract.json`` already exists and
+                loads it automatically.
         """
         from core.pipeline_run import RunPipeline
+        from agents.api_contract_agent import APIContractAgent
+
+        # Resolve contract: explicit path → workspace auto-detect → None
+        api_contract = None
+        _contract_file = (
+            Path(api_contract_path) if api_contract_path
+            else self.settings.workspace_dir / "api_contract.json"
+        )
+        if _contract_file.exists():
+            if not api_contract_path:
+                logger.warning(
+                    "Auto-detected api_contract.json at %s from a previous run — "
+                    "pass --contract explicitly or delete the file to regenerate",
+                    _contract_file,
+                )
+            try:
+                api_contract = APIContractAgent.load_from_file(_contract_file)
+                logger.info("Using api_contract from %s", _contract_file)
+            except Exception as exc:
+                logger.warning("Could not load api_contract.json: %s — proceeding without it", exc)
 
         start_time = time.monotonic()
         self._start_live()
@@ -65,6 +99,7 @@ class Pipeline:
             return await RunPipeline(
                 self.settings, self.llm, self._live,
                 interactive=self.interactive,
+                api_contract=api_contract,
             ).execute(
                 user_prompt, start_time, resume=resume,
             )
@@ -91,6 +126,7 @@ class Pipeline:
         self,
         user_prompt: str,
         figma_url: str = "",
+        api_contract_path: "str | Path | None" = None,
     ) -> PipelineResult:
         """Generate a complete fullstack project (backend + frontend) from *user_prompt*.
 
@@ -101,14 +137,40 @@ class Pipeline:
         with a shared OpenAPI contract as the handshake between the two.
         """
         from core.pipeline_fullstack import FullstackPipeline
+        from agents.api_contract_agent import APIContractAgent
+
+        # Resolve contract: explicit path → workspace auto-detect → None
+        # (Done before _start_live so failures don't leak console/file-handler.)
+        preloaded_contract = None
+        _contract_file = (
+            Path(api_contract_path) if api_contract_path
+            else self.settings.workspace_dir / "api_contract.json"
+        )
+        if _contract_file.exists():
+            if not api_contract_path:
+                logger.warning(
+                    "Auto-detected api_contract.json at %s from a previous run — "
+                    "pass --contract explicitly or delete the file to regenerate",
+                    _contract_file,
+                )
+            try:
+                preloaded_contract = APIContractAgent.load_from_file(_contract_file)
+                logger.info("Using pre-supplied api_contract from %s", _contract_file)
+            except Exception as exc:
+                logger.warning("Could not load api_contract.json: %s — will generate it", exc)
 
         start_time = time.monotonic()
         self._start_live()
         fh = self._start_file_logging(self.settings.workspace_dir)
+
         try:
             return await FullstackPipeline(
                 self.settings, self.llm, self._live, self.interactive,
-            ).execute(user_prompt, start_time, figma_url=figma_url)
+            ).execute(
+                user_prompt, start_time,
+                figma_url=figma_url,
+                preloaded_contract=preloaded_contract,
+            )
         finally:
             self._stop_live()
             self._stop_file_logging(fh)

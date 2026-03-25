@@ -56,6 +56,13 @@ def cli(verbose: bool) -> None:
 @click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
 @click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
 @click.option("--resume", is_flag=True, default=False, help="Resume from last checkpoint — skip files that already PASSED")
+@click.option(
+    "--contract", "contract_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Path to an api_contract.json file. Skips LLM contract generation and injects "
+         "the provided contract directly into every code-generation agent.",
+)
 def generate(
     prompt: str,
     workspace: str,
@@ -70,6 +77,7 @@ def generate(
     skip_security: bool,
     skip_integration: bool,
     resume: bool,
+    contract_path: str | None,
 ) -> None:
     """Generate a backend project from a natural language prompt."""
     try:
@@ -115,7 +123,7 @@ def generate(
         ))
         sys.exit(1)
 
-    result = asyncio.run(pipeline.run(prompt, resume=resume))
+    result = asyncio.run(pipeline.run(prompt, resume=resume, api_contract_path=contract_path))
     _display_result(result)
 
     sys.exit(0 if result.success else 1)
@@ -266,6 +274,13 @@ def enhance(
 @click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent")
 @click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
 @click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
+@click.option(
+    "--contract", "contract_path",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    help="Path to an api_contract.json file. Skips LLM contract generation and uses "
+         "the provided contract as the FE/BE handshake.",
+)
 def fullstack(
     prompt: str,
     workspace: str,
@@ -280,6 +295,7 @@ def fullstack(
     skip_reviewer: bool,
     skip_security: bool,
     skip_integration: bool,
+    contract_path: str | None,
 ) -> None:
     """Generate a complete fullstack project (backend + frontend) from a prompt.
 
@@ -336,7 +352,7 @@ def fullstack(
         ))
         sys.exit(1)
 
-    result = asyncio.run(pipeline.run_fullstack(prompt, figma_url=figma_url))
+    result = asyncio.run(pipeline.run_fullstack(prompt, figma_url=figma_url, api_contract_path=contract_path))
     _display_fullstack_result(result)
 
     sys.exit(0 if result.success else 1)

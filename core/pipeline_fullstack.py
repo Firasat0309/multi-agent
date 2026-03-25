@@ -73,6 +73,43 @@ class FullstackPipeline:
         # (e.g. docker-compose.yml, .gitignore) from the parallel BE+FE pipelines.
         self._root_write_lock: asyncio.Lock = asyncio.Lock()
 
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _write_contract_json(self, contract: APIContract) -> None:
+        """Persist *contract* to ``<workspace>/api_contract.json``.
+
+        Includes request/response schemas and openapi_spec so that reloading
+        the file with ``APIContractAgent.load_from_file`` is lossless.
+        """
+        contract_path = self._settings.workspace_dir / "api_contract.json"
+        try:
+            contract_data = {
+                "title": contract.title,
+                "version": contract.version,
+                "base_url": contract.base_url,
+                "contract_format": contract.contract_format,
+                "endpoints": [
+                    {
+                        "path": ep.path,
+                        "method": ep.method,
+                        "description": ep.description,
+                        "request_schema": ep.request_schema,
+                        "response_schema": ep.response_schema,
+                        "auth_required": ep.auth_required,
+                        "tags": ep.tags,
+                    }
+                    for ep in contract.endpoints
+                ],
+                "schemas": contract.schemas,
+                "openapi_spec": contract.openapi_spec,
+            }
+            contract_path.write_text(
+                _json.dumps(contract_data, indent=2), encoding="utf-8"
+            )
+            logger.info("Wrote api_contract.json (%d endpoints)", len(contract.endpoints))
+        except Exception:
+            logger.warning("Failed to write api_contract.json", exc_info=True)
+
     # ── Public entry point ────────────────────────────────────────────────────
 
     async def execute(
@@ -80,6 +117,7 @@ class FullstackPipeline:
         user_prompt: str,
         start_time: float,
         figma_url: str = "",
+        preloaded_contract: "APIContract | None" = None,
     ) -> PipelineResult:
         """Run the complete fullstack pipeline."""
         from core.pipeline import PipelineResult
@@ -253,65 +291,55 @@ class FullstackPipeline:
                         elapsed_seconds=time.monotonic() - start_time,
                     )
 
-        # ── Phase 3: API Contract Generation ─────────────────────────────────
+        # ── Phase 3: API Contract ─────────────────────────────────────────────
+        # Either use a pre-supplied contract (--contract flag or auto-detected
+        # api_contract.json in the workspace) or generate one via the LLM.
         self._phase("API Contract Generation", "running")
-        logger.info("[FS Phase 3] Generating API contract...")
-
         api_contract: APIContract | None = None
-        try:
-            contract_agent = APIContractAgent(
-                llm_client=self._llm, repo_manager=shared_repo_manager
-            )
-            api_contract = await contract_agent.generate_contract(
-                requirements, backend_blueprint
-            )
-            if not api_contract.endpoints:
-                raise ValueError(
-                    "API contract generation returned 0 endpoints "
-                    "(likely truncated/unparseable LLM response)"
-                )
+
+        if preloaded_contract is not None:
+            api_contract = preloaded_contract
             fullstack_blueprint.api_contract = api_contract
             logger.info(
-                "API contract: %s (%d endpoints)",
+                "[FS Phase 3] Using pre-supplied API contract: %s (%d endpoints)",
                 api_contract.title, len(api_contract.endpoints),
             )
-            # Persist the contract to disk for inspection and downstream use
-            contract_path = self._settings.workspace_dir / "api_contract.json"
-            try:
-                contract_data = {
-                    "title": api_contract.title,
-                    "version": api_contract.version,
-                    "base_url": api_contract.base_url,
-                    "contract_format": api_contract.contract_format,
-                    "endpoints": [
-                        {
-                            "path": ep.path,
-                            "method": ep.method,
-                            "description": ep.description,
-                            "auth_required": ep.auth_required,
-                            "tags": ep.tags,
-                        }
-                        for ep in api_contract.endpoints
-                    ],
-                    "schemas": api_contract.schemas,
-                }
-                contract_path.write_text(
-                    _json.dumps(contract_data, indent=2), encoding="utf-8"
-                )
-                logger.info("Wrote api_contract.json (%d endpoints)", len(api_contract.endpoints))
-            except Exception:
-                logger.warning("Failed to write api_contract.json", exc_info=True)
+            # Persist the pre-supplied contract into the workspace so downstream
+            # tools and a subsequent --resume run can find it.
+            self._write_contract_json(api_contract)
             self._complete_phase("API Contract Generation")
-        except Exception as exc:
-            logger.exception("API contract generation failed")
-            errors.append(f"API contract generation failed: {exc}")
-            self._fail_phase("API Contract Generation", str(exc))
-            return PipelineResult(
-                success=False,
-                workspace_path=self._settings.workspace_dir,
-                errors=errors,
-                elapsed_seconds=time.monotonic() - start_time,
-            )
+        else:
+            logger.info("[FS Phase 3] Generating API contract from blueprint...")
+            try:
+                contract_agent = APIContractAgent(
+                    llm_client=self._llm, repo_manager=shared_repo_manager
+                )
+                api_contract = await contract_agent.generate_contract(
+                    requirements, backend_blueprint
+                )
+                if not api_contract.endpoints:
+                    raise ValueError(
+                        "API contract generation returned 0 endpoints "
+                        "(likely truncated/unparseable LLM response)"
+                    )
+                fullstack_blueprint.api_contract = api_contract
+                logger.info(
+                    "API contract: %s (%d endpoints)",
+                    api_contract.title, len(api_contract.endpoints),
+                )
+                # Persist for inspection and reuse on the next run
+                self._write_contract_json(api_contract)
+                self._complete_phase("API Contract Generation")
+            except Exception as exc:
+                logger.exception("API contract generation failed")
+                errors.append(f"API contract generation failed: {exc}")
+                self._fail_phase("API Contract Generation", str(exc))
+                return PipelineResult(
+                    success=False,
+                    workspace_path=self._settings.workspace_dir,
+                    errors=errors,
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
 
         # ── Phase 4: Parallel Backend + Frontend ──────────────────────────────
         self._phase("Parallel BE+FE Generation", "running")

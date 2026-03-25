@@ -190,6 +190,8 @@ class BaseAgent(ABC):
         _end_turn_reminders = 0  # track end_turn recovery attempts
         _MAX_END_TURN_REMINDERS = 2  # cap end_turn reminders to avoid loops
         _MAX_CONSECUTIVE_NUDGES = 2  # cap budget-guard nudges before letting tools run
+        _stagnant_iterations = 0    # consecutive iters with no new file writes (multi-file agents)
+        _MAX_STAGNANT_ITERATIONS = 2  # exit multi-file agent after this many stagnant iters
 
         target_file = context.file_blueprint.path if context.file_blueprint else None
 
@@ -389,6 +391,25 @@ class BaseAgent(ABC):
                     "content": result,
                 })
 
+            # ── Multi-file budget nudge (target_file is None agents) ─────
+            # When no single target file is set (e.g. StateManagementAgent,
+            # APIIntegrationAgent), the standard budget guard never fires.
+            # Inject a wrap-up nudge past halfway to avoid exhausting all
+            # iterations without the LLM signalling end_turn.
+            if (
+                target_file is None
+                and files_written
+                and iteration >= max_iterations // 2
+                and not nudge_text
+            ):
+                nudge_text = (
+                    f"You have written {len(files_written)} file(s) so far: "
+                    f"{', '.join(files_written[-5:])}. "
+                    f"You have used {iteration + 1} of {max_iterations} iterations. "
+                    "If you still have files to write, write them NOW using write_file. "
+                    "When ALL files are written, stop — do not call any more tools."
+                )
+
             # Append nudge as a text block inside the same user message
             # to maintain strict assistant/user role alternation.
             if nudge_text:
@@ -409,6 +430,33 @@ class BaseAgent(ABC):
             )
             if target_file and self._path_in_written(target_file, files_written) and not has_quality_issue:
                 return self._parse_agentic_result(context, response.content, files_written)
+
+            # ── Stagnation detection for multi-file agents ────────────────
+            # When target_file is None, the loop only exits on end_turn (which
+            # Gemini may not emit after many writes).  If no new file was written
+            # this iteration AND at least one file exists, count it as stagnant.
+            # After _MAX_STAGNANT_ITERATIONS consecutive stagnant iters, treat
+            # the agent as done rather than raising RuntimeError.
+            if target_file is None and files_written:
+                _this_iter_wrote = any(
+                    tc.name == "write_file" and not result.startswith("Error")
+                    for tc, result in zip(response.tool_calls or [], results if response.tool_calls else [])
+                )
+                if _this_iter_wrote:
+                    _stagnant_iterations = 0
+                else:
+                    _stagnant_iterations += 1
+                    logger.warning(
+                        "%s: no new file written this iteration (%d/%d stagnant, %d files so far)",
+                        self.__class__.__name__, _stagnant_iterations,
+                        _MAX_STAGNANT_ITERATIONS, len(files_written),
+                    )
+                    if _stagnant_iterations >= _MAX_STAGNANT_ITERATIONS:
+                        logger.info(
+                            "%s: stagnation limit reached — treating %d written file(s) as complete",
+                            self.__class__.__name__, len(files_written),
+                        )
+                        return self._parse_agentic_result(context, response.content, files_written)
 
         raise RuntimeError(
             f"{self.__class__.__name__} exceeded max_iterations ({max_iterations}) "

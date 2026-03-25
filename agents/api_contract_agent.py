@@ -131,7 +131,41 @@ class APIContractAgent(BaseAgent):
 
     # ─────────────────────────────────────────────────────────────────────────
 
-    def _parse_contract(self, raw: dict[str, Any]) -> APIContract:
+    # NOTE: _parse_contract is intentionally a @staticmethod so that
+    # load_from_file (a classmethod) can call it without instantiating
+    # the agent (which requires llm_client and repo_manager).
+
+    @classmethod
+    def load_from_file(cls, path: "str | Path") -> APIContract:
+        """Load and parse an api_contract.json file into an APIContract object.
+
+        Accepts the same JSON format that the agent writes to disk, so a
+        user-supplied contract file works as a direct pipeline input.
+
+        Raises:
+            FileNotFoundError: if the path does not exist.
+            json.JSONDecodeError: if the file is not valid JSON.
+            ValueError: if the file has no endpoints.
+        """
+        from pathlib import Path as _Path
+        p = _Path(path)
+        if not p.exists():
+            raise FileNotFoundError(f"api_contract.json not found: {p}")
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        parsed = cls._parse_contract(raw)
+        if not parsed.endpoints:
+            raise ValueError(
+                f"api_contract.json at {p} has 0 endpoints — "
+                "check that 'endpoints' array is populated."
+            )
+        logger.info(
+            "Loaded api_contract.json: %s (%d endpoints, %d schemas)",
+            parsed.title, len(parsed.endpoints), len(parsed.schemas),
+        )
+        return parsed
+
+    @staticmethod
+    def _parse_contract(raw: dict[str, Any]) -> APIContract:
         endpoints = [
             APIEndpoint(
                 path=str(ep.get("path", "/")),
