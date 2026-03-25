@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from agents.base_agent import BaseAgent
@@ -129,6 +130,97 @@ class APIContractAgent(BaseAgent):
         self._metrics["llm_calls"] += 1
         return self._parse_contract(raw)
 
+    async def extract_from_plan(
+        self,
+        plan_md: str,
+        requirements: ProductRequirements,
+        blueprint: RepositoryBlueprint,
+    ) -> APIContract:
+        """Extract APIContract from PHASE 1 of plan.md.
+
+        The plan is authoritative — endpoints defined in PHASE 1 are exactly
+        what gets generated.  The blueprint provides context for schema inference.
+        """
+        logger.info("APIContractAgent: extracting API contract from PHASE 1 of plan.md")
+
+        # Extract PHASE 1 section
+        phase1 = self._extract_phase(plan_md, "PHASE 1")
+        if not phase1:
+            logger.warning(
+                "extract_from_plan: PHASE 1 section not found in plan.md — "
+                "falling back to full plan as context"
+            )
+            phase1 = plan_md
+
+        # Build blueprint context for schema inference
+        file_details = "\n".join(
+            f"  - {fb.path} [{fb.layer}]: {fb.purpose}"
+            + (f"  exports: {', '.join(fb.exports[:4])}" if fb.exports else "")
+            for fb in blueprint.file_blueprints
+        )
+        bp_context = (
+            f"Backend: {blueprint.name}\n"
+            f"Style: {blueprint.architecture_style}\n"
+            f"Tech stack: {json.dumps(blueprint.tech_stack)}\n"
+            f"Files:\n{file_details}\n"
+        )
+
+        req_context = (
+            f"Product: {requirements.title}\n"
+            f"Description: {requirements.description}\n"
+        )
+        if requirements.features:
+            req_context += f"Features: {', '.join(requirements.features)}\n"
+
+        extraction_prompt = (
+            f"{req_context}\n"
+            f"{bp_context}\n"
+            "The following is the authoritative PHASE 1 — API CONTRACT from the "
+            "pre-approved plan.md document. Convert it into the API contract JSON format.\n\n"
+            "PHASE 1 API CONTRACT:\n"
+            f"{phase1}\n\n"
+            "Convert every endpoint defined above into the required JSON format. "
+            "For each endpoint: set path, method, description, request_schema (field:type pairs), "
+            "response_schema (field:type pairs), auth_required (true for any mutation or "
+            "protected resource), and tags (resource name from path). "
+            "Populate the top-level 'schemas' object with reusable entity models inferred "
+            "from the request/response bodies. "
+            "The plan is authoritative — do NOT add or remove endpoints. "
+            "Output ONLY the JSON object — no markdown fences."
+        )
+
+        try:
+            raw = await self._call_llm_json(extraction_prompt)
+            self._metrics["llm_calls"] += 1
+            contract = self._parse_contract(raw)
+        except Exception as first_err:
+            logger.warning(
+                "APIContractAgent.extract_from_plan: first attempt failed (%s) — retrying",
+                first_err,
+            )
+            corrective = (
+                "Your previous response was not valid JSON. The parser returned:\n"
+                f"  {first_err}\n\n"
+                f"PHASE 1 CONTRACT (first 3000 chars):\n{phase1[:3000]}\n\n"
+                "Please return ONLY the corrected API contract JSON object — "
+                "no explanation, no markdown fences."
+            )
+            raw = await self._call_llm_json(corrective)
+            self._metrics["llm_calls"] += 1
+            contract = self._parse_contract(raw)
+
+        if not contract.endpoints:
+            raise ValueError(
+                "extract_from_plan returned 0 endpoints — "
+                "PHASE 1 of plan.md may be malformed or empty."
+            )
+
+        logger.info(
+            "APIContractAgent: extracted %d endpoints, %d schemas from plan.md",
+            len(contract.endpoints), len(contract.schemas),
+        )
+        return contract
+
     # ─────────────────────────────────────────────────────────────────────────
 
     # NOTE: _parse_contract is intentionally a @staticmethod so that
@@ -163,6 +255,19 @@ class APIContractAgent(BaseAgent):
             parsed.title, len(parsed.endpoints), len(parsed.schemas),
         )
         return parsed
+
+    @staticmethod
+    def _extract_phase(plan_md: str, phase_header: str) -> str:
+        """Extract a single PHASE section from plan.md content.
+
+        Returns the text from the phase header up to (but not including)
+        the next PHASE header, or an empty string if not found.
+        """
+        pattern = rf"(#\s+{re.escape(phase_header)}\s*[—\-].*?)(?=\n#\s+PHASE\s+\d|\Z)"
+        match = re.search(pattern, plan_md, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        return ""
 
     @staticmethod
     def _parse_contract(raw: dict[str, Any]) -> APIContract:

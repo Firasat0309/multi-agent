@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from agents.architect_agent import ArchitectAgent
 from agents.api_contract_agent import APIContractAgent
+from agents.plan_generator_agent import PlanGeneratorAgent
 from agents.product_planner_agent import ProductPlannerAgent
 from config.settings import Settings
 from core.llm_client import LLMClient
@@ -127,29 +128,25 @@ class FullstackPipeline:
         errors: list[str] = []
         fullstack_blueprint = FullstackBlueprint()
 
-        # ── Phase 1: Product Planning ─────────────────────────────────────────
-        self._phase("Product Planning", "running")
-        logger.info("[FS Phase 1] Planning product requirements...")
-
         root_workspace = self._settings.workspace_dir
         shared_repo_manager = RepositoryManager(root_workspace)
 
-        requirements: ProductRequirements | None = None
+        # ── Phase 1: Plan Generation ──────────────────────────────────────────
+        self._phase("Plan Generation", "running")
+        logger.info("[FS Phase 1] Generating plan.md from user prompt...")
+
+        plan_md: str = ""
+        plan_generator = PlanGeneratorAgent(
+            llm_client=self._llm, repo_manager=shared_repo_manager
+        )
         try:
-            planner = ProductPlannerAgent(
-                llm_client=self._llm, repo_manager=shared_repo_manager
-            )
-            requirements = await planner.plan_product(user_prompt)
-            fullstack_blueprint.product_requirements = requirements
-            logger.info(
-                "Product planned: %s (FE=%s, BE=%s)",
-                requirements.title, requirements.has_frontend, requirements.has_backend,
-            )
-            self._complete_phase("Product Planning")
+            plan_md = await plan_generator.generate_plan(user_prompt)
+            logger.info("Plan generated (%d chars)", len(plan_md))
+            self._complete_phase("Plan Generation")
         except Exception as exc:
-            logger.exception("Product planning failed")
-            errors.append(f"Product planning failed: {exc}")
-            self._fail_phase("Product Planning", str(exc))
+            logger.exception("Plan generation failed")
+            errors.append(f"Plan generation failed: {exc}")
+            self._fail_phase("Plan Generation", str(exc))
             return PipelineResult(
                 success=False,
                 workspace_path=root_workspace,
@@ -157,7 +154,7 @@ class FullstackPipeline:
                 elapsed_seconds=time.monotonic() - start_time,
             )
 
-        # ── Approval Gate 1: Product Plan ────────────────────────────────────
+        # ── Approval Gate 1: plan.md ──────────────────────────────────────────
         if self._settings.require_architecture_approval:
             from core.architecture_approver import (
                 ArchitectureApprover,
@@ -170,9 +167,9 @@ class FullstackPipeline:
             )
             while True:
                 try:
-                    result = approver.approve_product_plan(requirements)
+                    result = approver.approve_plan_md(plan_md)
                 except ArchitecturePendingApprovalError as e:
-                    logger.info("Product plan pending human approval: %s", e)
+                    logger.info("plan.md pending human approval: %s", e)
                     return PipelineResult(
                         success=False,
                         workspace_path=root_workspace,
@@ -180,27 +177,24 @@ class FullstackPipeline:
                         elapsed_seconds=time.monotonic() - start_time,
                     )
                 if result is True:
-                    logger.info("Product plan approved by user")
+                    logger.info("plan.md approved by user")
                     break
                 if result is False:
-                    logger.info("Product plan rejected by user")
+                    logger.info("plan.md rejected by user")
                     return PipelineResult(
                         success=False,
                         workspace_path=root_workspace,
-                        errors=["Product plan rejected by user"],
+                        errors=["plan.md rejected by user"],
                         elapsed_seconds=time.monotonic() - start_time,
                     )
                 # result is a str — user feedback for revision
-                logger.info("User requested product plan revision: %s", result)
+                logger.info("User requested plan.md revision: %s", result)
                 try:
-                    requirements = await planner.revise_product(
-                        user_prompt, requirements, result,
-                    )
-                    fullstack_blueprint.product_requirements = requirements
-                    logger.info("Product plan revised: %s", requirements.title)
+                    plan_md = await plan_generator.revise_plan(user_prompt, plan_md, result)
+                    logger.info("plan.md revised (%d chars)", len(plan_md))
                 except Exception as exc:
-                    logger.exception("Product plan revision failed")
-                    errors.append(f"Product plan revision failed: {exc}")
+                    logger.exception("plan.md revision failed")
+                    errors.append(f"plan.md revision failed: {exc}")
                     return PipelineResult(
                         success=False,
                         workspace_path=root_workspace,
@@ -208,18 +202,48 @@ class FullstackPipeline:
                         elapsed_seconds=time.monotonic() - start_time,
                     )
 
-        # ── Phase 2: Backend Architecture Design ──────────────────────────────
+        # ── Phase 2: Product Requirements Extraction ──────────────────────────
+        self._phase("Product Planning", "running")
+        logger.info("[FS Phase 2] Extracting product requirements from plan.md...")
+
+        requirements: ProductRequirements | None = None
+        planner = ProductPlannerAgent(
+            llm_client=self._llm, repo_manager=shared_repo_manager
+        )
+        try:
+            requirements = await planner.parse_from_plan(plan_md)
+            fullstack_blueprint.product_requirements = requirements
+            logger.info(
+                "Requirements extracted: %s (FE=%s, BE=%s)",
+                requirements.title, requirements.has_frontend, requirements.has_backend,
+            )
+            self._complete_phase("Product Planning")
+        except Exception as exc:
+            logger.exception("Product requirements extraction failed")
+            errors.append(f"Product planning failed: {exc}")
+            self._fail_phase("Product Planning", str(exc))
+            return PipelineResult(
+                success=False,
+                workspace_path=root_workspace,
+                errors=errors,
+                elapsed_seconds=time.monotonic() - start_time,
+            )
+
+        # ── Phase 3: Backend Architecture Design ──────────────────────────────
         self._phase("Backend Architecture", "running")
-        logger.info("[FS Phase 2] Designing backend architecture...")
+        logger.info("[FS Phase 3] Designing backend architecture from plan.md...")
 
         backend_blueprint: RepositoryBlueprint | None = None
+        architect = ArchitectAgent(
+            llm_client=self._llm, repo_manager=shared_repo_manager
+        )
+        # enriched_prompt is still built for use in backend generation prompt later
+        enriched_prompt = self._enrich_prompt(user_prompt, requirements)
+        # Inject plan.md context so the backend prompt carries the full specification
+        enriched_prompt_with_plan = self._enrich_prompt_with_plan(enriched_prompt, plan_md)
+
         try:
-            # Enrich the user prompt with the structured requirements
-            enriched_prompt = self._enrich_prompt(user_prompt, requirements)
-            architect = ArchitectAgent(
-                llm_client=self._llm, repo_manager=shared_repo_manager
-            )
-            backend_blueprint = await architect.design_architecture(enriched_prompt)
+            backend_blueprint = await architect.design_from_plan(plan_md, requirements)
             fullstack_blueprint.backend_blueprint = backend_blueprint
             logger.info(
                 "Backend blueprint: %s (%d files)",
@@ -237,7 +261,7 @@ class FullstackPipeline:
                 elapsed_seconds=time.monotonic() - start_time,
             )
 
-        # ── Approval Gate 2: Backend Architecture ────────────────────────────
+        # ── Approval Gate 2: Backend Architecture ─────────────────────────────
         if self._settings.require_architecture_approval:
             from core.architecture_approver import (
                 ArchitectureApprover,
@@ -274,7 +298,7 @@ class FullstackPipeline:
                 logger.info("User requested architecture revision: %s", result)
                 try:
                     backend_blueprint = await architect.revise_architecture(
-                        enriched_prompt, backend_blueprint, result,
+                        enriched_prompt_with_plan, backend_blueprint, result,
                     )
                     fullstack_blueprint.backend_blueprint = backend_blueprint
                     logger.info(
@@ -291,9 +315,9 @@ class FullstackPipeline:
                         elapsed_seconds=time.monotonic() - start_time,
                     )
 
-        # ── Phase 3: API Contract ─────────────────────────────────────────────
+        # ── Phase 4: API Contract ──────────────────────────────────────────────
         # Either use a pre-supplied contract (--contract flag or auto-detected
-        # api_contract.json in the workspace) or generate one via the LLM.
+        # api_contract.json in the workspace) or extract one from plan.md.
         self._phase("API Contract Generation", "running")
         api_contract: APIContract | None = None
 
@@ -301,7 +325,7 @@ class FullstackPipeline:
             api_contract = preloaded_contract
             fullstack_blueprint.api_contract = api_contract
             logger.info(
-                "[FS Phase 3] Using pre-supplied API contract: %s (%d endpoints)",
+                "[FS Phase 4] Using pre-supplied API contract: %s (%d endpoints)",
                 api_contract.title, len(api_contract.endpoints),
             )
             # Persist the pre-supplied contract into the workspace so downstream
@@ -309,18 +333,18 @@ class FullstackPipeline:
             self._write_contract_json(api_contract)
             self._complete_phase("API Contract Generation")
         else:
-            logger.info("[FS Phase 3] Generating API contract from blueprint...")
+            logger.info("[FS Phase 4] Extracting API contract from plan.md...")
             try:
                 contract_agent = APIContractAgent(
                     llm_client=self._llm, repo_manager=shared_repo_manager
                 )
-                api_contract = await contract_agent.generate_contract(
-                    requirements, backend_blueprint
+                api_contract = await contract_agent.extract_from_plan(
+                    plan_md, requirements, backend_blueprint
                 )
                 if not api_contract.endpoints:
                     raise ValueError(
-                        "API contract generation returned 0 endpoints "
-                        "(likely truncated/unparseable LLM response)"
+                        "API contract extraction returned 0 endpoints "
+                        "(PHASE 1 of plan.md may be malformed or empty)"
                     )
                 fullstack_blueprint.api_contract = api_contract
                 logger.info(
@@ -331,7 +355,7 @@ class FullstackPipeline:
                 self._write_contract_json(api_contract)
                 self._complete_phase("API Contract Generation")
             except Exception as exc:
-                logger.exception("API contract generation failed")
+                logger.exception("API contract extraction failed")
                 errors.append(f"API contract generation failed: {exc}")
                 self._fail_phase("API Contract Generation", str(exc))
                 return PipelineResult(
@@ -341,9 +365,9 @@ class FullstackPipeline:
                     elapsed_seconds=time.monotonic() - start_time,
                 )
 
-        # ── Phase 4: Parallel Backend + Frontend ──────────────────────────────
+        # ── Phase 5: Parallel Backend + Frontend ──────────────────────────────
         self._phase("Parallel BE+FE Generation", "running")
-        logger.info("[FS Phase 4] Running backend and frontend pipelines in parallel...")
+        logger.info("[FS Phase 5] Running backend and frontend pipelines in parallel...")
 
         # Backend workspace: workspace/backend
         backend_settings = self._settings.model_copy(
@@ -381,9 +405,8 @@ class FullstackPipeline:
         self._validate_contract_blueprint(api_contract, backend_blueprint)
 
         # Build the enriched prompt that carries all context for the backend.
-        # Include the full endpoint schemas (not just paths) so the architect
-        # and coders can generate accurate DTOs, request bodies, and responses.
-        backend_prompt = self._build_backend_prompt(enriched_prompt, api_contract)
+        # Use the plan-enriched prompt so coders get plan.md + full endpoint schemas.
+        backend_prompt = self._build_backend_prompt(enriched_prompt_with_plan, api_contract)
 
         be_task: asyncio.Task | None = None
         fe_task: asyncio.Task | None = None
@@ -492,6 +515,22 @@ class FullstackPipeline:
                 prefs = "; ".join(f"{k}={v}" for k, v in effective_prefs.items())
                 lines.append(f"Tech preferences: {prefs}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _enrich_prompt_with_plan(enriched_prompt: str, plan_md: str) -> str:
+        """Inject the plan.md document into the enriched prompt as context.
+
+        Limits plan.md to first 8000 chars to stay within context budgets —
+        the PHASE 0–3 sections (the actionable parts) appear first in the doc.
+        """
+        plan_excerpt = plan_md[:8000]
+        if len(plan_md) > 8000:
+            plan_excerpt += "\n... [plan.md truncated for context budget] ..."
+        return (
+            enriched_prompt
+            + "\n\n=== Implementation Plan (plan.md) ===\n"
+            + plan_excerpt
+        )
 
     @staticmethod
     def _build_backend_prompt(enriched_prompt: str, api_contract: APIContract | None) -> str:

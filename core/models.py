@@ -117,6 +117,7 @@ class AgentRole(str, Enum):
     INTEGRATION_TESTER = "integration_tester"
     BUILD_VERIFIER = "build_verifier"
     # ── Fullstack / Frontend agent roles ──
+    PLAN_GENERATOR = "plan_generator"
     PRODUCT_PLANNER = "product_planner"
     API_CONTRACT_GENERATOR = "api_contract_generator"
     DESIGN_PARSER = "design_parser"

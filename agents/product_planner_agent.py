@@ -91,7 +91,7 @@ class ProductPlannerAgent(BaseAgent):
         try:
             raw = await self._call_llm_json(prompt)
             self._metrics["llm_calls"] += 1
-            return self._parse_requirements(raw)
+            requirements = self._parse_requirements(raw)
         except Exception as first_err:
             logger.warning(
                 "ProductPlannerAgent: first attempt failed (%s) — retrying with corrective prompt",
@@ -106,7 +106,9 @@ class ProductPlannerAgent(BaseAgent):
             )
             raw = await self._call_llm_json(corrective)
             self._metrics["llm_calls"] += 1
-            return self._parse_requirements(raw)
+            requirements = self._parse_requirements(raw)
+
+        return requirements
 
     async def revise_product(
         self,
@@ -134,6 +136,72 @@ class ProductPlannerAgent(BaseAgent):
         )
         self._metrics["llm_calls"] += 1
         return self._parse_requirements(raw)
+
+    async def parse_from_plan(self, plan_md: str) -> ProductRequirements:
+        """Extract ProductRequirements from an existing plan.md document.
+
+        Used in the plan-first pipeline where plan.md is the source of truth.
+        Performs structured extraction without generating new content.
+        """
+        logger.info("ProductPlannerAgent: extracting requirements from plan.md")
+
+        extraction_system = (
+            "You are a structured data extractor. "
+            "Read the provided plan.md document and extract the product requirements as JSON. "
+            "Respond with a JSON object matching this schema:\n"
+            "{\n"
+            '  "title": "Short project title",\n'
+            '  "description": "2-3 sentence description of what gets built",\n'
+            '  "user_stories": ["As a user, I want ...", ...],\n'
+            '  "features": ["Feature 1", "Feature 2", ...],\n'
+            '  "tech_preferences": {\n'
+            '    "frontend": "React/Next.js|Vue|Angular|none",\n'
+            '    "backend": "FastAPI|Express|Spring Boot|Django|none",\n'
+            '    "db": "PostgreSQL|MySQL|SQLite|MongoDB|h2|none",\n'
+            '    "state": "zustand|redux|context|pinia|none",\n'
+            '    "styling": "tailwind|css-modules|styled-components|mui|none"\n'
+            "  },\n"
+            '  "has_frontend": true,\n'
+            '  "has_backend": true\n'
+            "}\n\n"
+            "Extract ALL information from the document — do not invent or omit anything. "
+            "Derive tech_preferences from PHASE 2 (backend) and PHASE 3 (frontend) sections. "
+            "Set has_frontend=true if a PHASE 3 frontend section is present with files. "
+            "Set has_backend=true if a PHASE 2 backend section is present with files. "
+            "Output ONLY the JSON object — no markdown fences."
+        )
+
+        extraction_prompt = (
+            f"Extract the product requirements from this plan.md document:\n\n"
+            f"{plan_md}\n\n"
+            "Return the JSON object now."
+        )
+
+        try:
+            raw = await self._call_llm_json(extraction_prompt, system_override=extraction_system)
+            self._metrics["llm_calls"] += 1
+            requirements = self._parse_requirements(raw)
+        except Exception as first_err:
+            logger.warning(
+                "ProductPlannerAgent.parse_from_plan: first attempt failed (%s) — retrying",
+                first_err,
+            )
+            corrective = (
+                "Your previous response was not valid JSON. The parser returned:\n"
+                f"  {first_err}\n\n"
+                f"Plan document (first 4000 chars):\n{plan_md[:4000]}\n\n"
+                "Please return ONLY the corrected product requirements JSON object — "
+                "no explanation, no markdown fences."
+            )
+            raw = await self._call_llm_json(corrective, system_override=extraction_system)
+            self._metrics["llm_calls"] += 1
+            requirements = self._parse_requirements(raw)
+
+        logger.info(
+            "ProductPlannerAgent: extracted requirements — %s (FE=%s, BE=%s)",
+            requirements.title, requirements.has_frontend, requirements.has_backend,
+        )
+        return requirements
 
     # ─────────────────────────────────────────────────────────────────────────
 
