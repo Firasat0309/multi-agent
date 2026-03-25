@@ -151,7 +151,7 @@ class ArchitectAgent(BaseAgent):
         # Check for language/framework keywords in the prompt
         if any(kw in lower for kw in ("java", "spring boot", "spring", "maven", "gradle")):
             return cls._LANG_DEFAULT_DB["java"]
-        if any(kw in lower for kw in ("go ", "golang", "gin", "echo", "fiber")):
+        if any(kw in lower for kw in ("golang", "gin", "echo", "fiber")) or re.search(r'\bgo\b', lower):
             return cls._LANG_DEFAULT_DB["go"]
         if any(kw in lower for kw in ("typescript", "express", "nestjs", "node")):
             return cls._LANG_DEFAULT_DB["typescript"]
@@ -545,23 +545,36 @@ class ArchitectAgent(BaseAgent):
                 if fp.endswith(".java") and "src/main/java/" in fp
             ]
             pkg_prefix = ""
+            # Known layer directory names — if the parent dir of a file is one
+            # of these, it's a sub-package, not the project root package.
+            _LAYER_DIRS = frozenset({
+                "controller", "controllers", "service", "services",
+                "repository", "repositories", "model", "models",
+                "entity", "entities", "config", "configuration",
+                "util", "utils", "helper", "helpers", "dto", "dtos",
+                "exception", "exceptions", "filter", "filters",
+                "security", "middleware", "interceptor", "mapper",
+            })
             if java_dirs:
-                # e.g. "src/main/java/com/example/auth/controller/AuthController.java"
-                # → "src/main/java/com/example/auth"
-                parts = java_dirs[0].split("/")
-                try:
-                    java_idx = parts.index("java")
-                    # Take everything up to but not including the last two segments
-                    # (class file + its immediate package like controller/service/etc.)
-                    pkg_parts = parts[: java_idx + 1]  # ["src","main","java"]
-                    remaining = parts[java_idx + 1 :]   # ["com","example","auth","controller","File.java"]
-                    if len(remaining) > 2:
-                        pkg_parts += remaining[: -2]     # drop "controller/File.java"
-                    elif len(remaining) == 2:
-                        pkg_parts += remaining[:1]       # just the top-level package
-                    pkg_prefix = "/".join(pkg_parts)
-                except ValueError:
-                    pkg_prefix = "src/main/java"
+                # Compute parent directories of all Java source files
+                java_parent_dirs = sorted(set(
+                    "/".join(fp.split("/")[:-1]) for fp in java_dirs
+                ))
+                # Compute common path prefix across all parent dirs
+                split_dirs = [d.split("/") for d in java_parent_dirs]
+                min_len = min(len(d) for d in split_dirs)
+                common_parts: list[str] = []
+                for i in range(min_len):
+                    vals = {d[i] for d in split_dirs}
+                    if len(vals) == 1:
+                        common_parts.append(vals.pop())
+                    else:
+                        break
+                # If all files are in the same layer dir, the common prefix
+                # ends with that layer — strip it to get the root package.
+                if common_parts and common_parts[-1].lower() in _LAYER_DIRS:
+                    common_parts = common_parts[:-1]
+                pkg_prefix = "/".join(common_parts) if common_parts else "src/main/java"
             else:
                 pkg_prefix = "src/main/java"
 
@@ -574,6 +587,9 @@ class ArchitectAgent(BaseAgent):
                 # Derive class name from project name
                 raw_name = validated.name.replace("-", " ").replace("_", " ")
                 class_name = "".join(w.capitalize() for w in raw_name.split()) + "Application"
+                # Java class names must start with a letter
+                if class_name and not class_name[0].isalpha():
+                    class_name = "App" + class_name
                 app_path = f"{pkg_prefix}/{class_name}.java"
                 file_blueprints.append(FileBlueprint(
                     path=app_path,
@@ -595,9 +611,25 @@ class ArchitectAgent(BaseAgent):
             )
             if not has_config:
                 props_path = "src/main/resources/application.properties"
+                # Detect whether the project includes JWT / Spring Security so the
+                # generated properties file includes the required keys.
+                _lower_paths = " ".join(existing_paths).lower()
+                # Use word-boundary for 'auth' to avoid false positives (e.g. 'AuthorController')
+                _has_jwt = (
+                    any(kw in _lower_paths for kw in ("jwt", "security", "token"))
+                    or bool(re.search(r'\bauth\b', _lower_paths))
+                )
+                _props_purpose = (
+                    "Spring Boot application configuration — server port, datasource, JPA settings"
+                )
+                if _has_jwt:
+                    _props_purpose += (
+                        "; JWT security settings (jwt.secret, jwt.expiration=86400000)"
+                        "; Spring Security CORS and session management"
+                    )
                 file_blueprints.append(FileBlueprint(
                     path=props_path,
-                    purpose="Spring Boot application configuration — server port, datasource, JPA settings",
+                    purpose=_props_purpose,
                     depends_on=[],
                     exports=[],
                     language="java",
