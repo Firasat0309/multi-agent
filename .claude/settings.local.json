@@ -11,7 +11,13 @@
       "Bash(find /c/Users/SDSI/Documents/AI-BK/multi-agent-claude -name \".env*\" -o -name \"*.env\" 2>/dev/null | head -20)",
       "Bash(wc -l tests/*.py | tail -1)",
       "Bash(wc:*)",
-      "Bash(git clone:*)"
+      "Bash(git clone:*)",
+      "Bash(find /c/Users/SDSI/Documents/AI-BK/multi-agent-claude -maxdepth 3 -type d -not -path */.* -not -path */__pycache__*)",
+      "Bash(ls -lh /c/Users/SDSI/Documents/AI-BK/multi-agent-claude/tests/test_*.py)",
+      "Bash(ls -1 /c/Users/SDSI/Documents/AI-BK/multi-agent-claude/agents/*.py)",
+      "Bash(ls -1 /c/Users/SDSI/Documents/AI-BK/multi-agent-claude/core/*.py)",
+      "Bash(ls:*)",
+      "Bash(find tests:*)"
     ]
   }
 }

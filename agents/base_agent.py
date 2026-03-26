@@ -410,6 +410,23 @@ class BaseAgent(ABC):
                     "When ALL files are written, stop — do not call any more tools."
                 )
 
+            # ── Zero-writes nudge for multi-file agents ──────────────────
+            # If a multi-file agent has spent the first third of its budget
+            # only reading files without writing anything, nudge it to start
+            # producing output so it doesn't exhaust all iterations.
+            if (
+                target_file is None
+                and not files_written
+                and iteration >= max_iterations // 3
+                and not nudge_text
+            ):
+                nudge_text = (
+                    f"WARNING: You have used {iteration + 1} of {max_iterations} iterations "
+                    "and have NOT written any files yet. "
+                    "You MUST start calling write_file NOW to produce the required files. "
+                    "Do not read more files — use the context you already have."
+                )
+
             # Append nudge as a text block inside the same user message
             # to maintain strict assistant/user role alternation.
             if nudge_text:

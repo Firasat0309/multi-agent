@@ -57,6 +57,7 @@ class StateManagementAgent(BaseAgent):
     """
 
     role = AgentRole.STATE_MANAGER
+    max_iterations: int = 20  # multi-file agent: reads context + writes several store files
 
     @property
     def tools(self) -> list[ToolDefinition]:
