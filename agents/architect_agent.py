@@ -14,6 +14,7 @@ from core.models import (
     AgentContext,
     AgentRole,
     FileBlueprint,
+    ProductRequirements,
     RepositoryBlueprint,
     TaskResult,
 )
@@ -254,6 +255,107 @@ class ArchitectAgent(BaseAgent):
 
         # ── Call 2: architecture_doc (separate, non-critical) ─────────────────
         blueprint = await self._fetch_architecture_doc(blueprint, effective_prompt)
+
+        return blueprint
+
+    async def design_from_plan(
+        self,
+        plan_md: str,
+        requirements: ProductRequirements,
+    ) -> RepositoryBlueprint:
+        """Build RepositoryBlueprint guided by PHASE 2 of plan.md.
+
+        The plan is authoritative — file names, layers, and purposes are read
+        directly from the PHASE 2 backend file tree rather than being
+        reinvented by the LLM.  All existing validation (mandatory files
+        injection, dedup, frontend-file stripping) is applied to the result.
+        """
+
+        logger.info("ArchitectAgent.design_from_plan: converting PHASE 2 to blueprint")
+
+        # Extract PHASE 2 section from plan_md
+        phase2 = self._extract_phase(plan_md, "PHASE 2")
+        if not phase2:
+            logger.warning(
+                "design_from_plan: PHASE 2 section not found in plan.md — "
+                "falling back to full plan as context"
+            )
+            phase2 = plan_md
+
+        # Build the enriched user prompt from requirements
+        tech = requirements.tech_preferences or {}
+        effective_prefs = {k: v for k, v in tech.items() if v.lower() != "none"}
+        tech_notes = "; ".join(f"{k}={v}" for k, v in effective_prefs.items()) if effective_prefs else ""
+
+        user_prompt_ctx = (
+            f"Project: {requirements.title}\n"
+            f"Description: {requirements.description}\n"
+        )
+        if tech_notes:
+            user_prompt_ctx += f"Tech preferences: {tech_notes}\n"
+        if requirements.user_stories:
+            user_prompt_ctx += "User stories:\n" + "\n".join(
+                f"  - {s}" for s in requirements.user_stories
+            ) + "\n"
+        if requirements.features:
+            user_prompt_ctx += "Features: " + ", ".join(requirements.features) + "\n"
+
+        architecture_prompt = (
+            f"{user_prompt_ctx}\n"
+            "The following is the authoritative PHASE 2 — BACKEND PLAN from the "
+            "pre-approved plan.md document. Convert it into the architecture JSON format.\n\n"
+            "PHASE 2 BACKEND PLAN:\n"
+            f"{phase2}\n\n"
+            "Convert the file tree and layer descriptions above into the required JSON. "
+            "Every file listed in the file tree must appear as a file_blueprint entry. "
+            "Infer the layer (model/repository/service/controller/config/dto/security/"
+            "exception/infrastructure/util) from the file's location and purpose. "
+            "Set depends_on based on the standard layer dependency order: "
+            "model → repository → service → controller. "
+            "The tech_stack must reflect the language, framework, and database stated "
+            "in the PHASE 2 technology stack section. "
+            "Do NOT add files that are not in the plan. "
+            "Do NOT add any frontend files. "
+            "Respond with valid JSON only. No markdown fences."
+        )
+
+        # Inject DB note if none specified in the prompt
+        effective_user_prompt = requirements.description or requirements.title
+        if not self._user_specified_db(effective_user_prompt) and not any(
+            "db" in k.lower() for k in effective_prefs
+        ):
+            db_note = self._default_db_note(effective_user_prompt)
+            architecture_prompt += (
+                f"\n\n[SYSTEM NOTE: The user did not specify a database. {db_note} "
+                "Configure it as an embedded in-memory datasource if not overridden in the plan.]"
+            )
+
+        logger.info(
+            "ArchitectAgent.design_from_plan: sending blueprint request to LLM — this may take 30-90s…"
+        )
+        response = await self._llm_with_heartbeat(
+            system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
+            user_prompt=architecture_prompt,
+            max_tokens=12288,
+            label="architecture from plan",
+        )
+        self._metrics["llm_calls"] += 1
+        self._metrics["tokens_used"] += sum(response.usage.values())
+
+        try:
+            result = self._parse_json_response(response.content)
+        except ValueError as parse_err:
+            logger.warning(
+                "design_from_plan: JSON parse failed (%s) — retrying with corrective prompt",
+                parse_err,
+            )
+            result = await self._retry_json_parse(response.content, parse_err)
+
+        blueprint = self._parse_blueprint(result)
+
+        # Use plan.md as the architecture doc — no extra LLM call needed since
+        # the plan already contains layer diagrams and descriptions.
+        blueprint = await self._fetch_architecture_doc(blueprint, architecture_prompt[:2000])
 
         return blueprint
 
@@ -649,6 +751,20 @@ class ArchitectAgent(BaseAgent):
             file_blueprints=file_blueprints,
             architecture_doc=validated.architecture_doc,
         )
+
+    @staticmethod
+    def _extract_phase(plan_md: str, phase_header: str) -> str:
+        """Extract a single PHASE section from plan.md content.
+
+        Returns the text from the phase header up to (but not including)
+        the next PHASE header, or an empty string if not found.
+        """
+        # Match lines like "# PHASE 2 — BACKEND PLAN" or "# PHASE 2 - BACKEND PLAN"
+        pattern = rf"(#\s+{re.escape(phase_header)}\s*[—\-].*?)(?=\n#\s+PHASE\s+\d|\Z)"
+        match = re.search(pattern, plan_md, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        return ""
 
     def _resolve_file_language(self, llm_lang: str, path: str, project_lang: str) -> str:
         """Return the correct language tag for a file.

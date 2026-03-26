@@ -753,18 +753,44 @@ class TestFullstackVueJavaE2E:
         # ── Patch agents to return mocked results ─────────────────────────
         call_order: list[str] = []
 
-        async def mock_plan_product(prompt):
+        # plan.md content returned by PlanGeneratorAgent
+        plan_md_content = (
+            "# Todo App — Implementation Plan\n"
+            "**Tech Stack:** Vue | Spring Boot | PostgreSQL | Maven\n\n"
+            "# PHASE 0 — REQUIREMENTS ANALYSIS\n"
+            "Screens: Login, Todo List\n\n"
+            "# PHASE 1 — API CONTRACT\n"
+            "GET /todos — list todos\n"
+            "POST /todos — create todo\n\n"
+            "# PHASE 2 — BACKEND PLAN\n"
+            "Java 17, Spring Boot 3.x\n\n"
+            "# PHASE 3 — FRONTEND PLAN\n"
+            "Vue 3, TypeScript\n\n"
+            "# PHASE 4 — VALIDATION CHECKLIST\n"
+            "- [ ] All entities have @Id\n\n"
+            "# PHASE 5 — AUTO-FIX RULES\n"
+            "Fix and retry.\n\n"
+            "# PHASE 6 — OUTPUT FORMAT\n"
+            "=== FILE: path === content\n\n"
+            "# PHASE 7 — DOCUMENTATION\n"
+            "README with prereqs.\n"
+        )
+
+        async def mock_generate_plan(prompt):
+            call_order.append("plan_generator")
+            return plan_md_content
+
+        async def mock_parse_from_plan(plan_md):
             call_order.append("product_planner")
             return vue_java_requirements
 
-        async def mock_design_architecture(prompt):
+        async def mock_design_from_plan(plan_md, req):
             call_order.append("architect")
-            # Verify enriched prompt contains product requirements
-            assert "Todo App" in prompt
-            assert "Todo CRUD" in prompt
+            # Verify requirements are passed correctly
+            assert req.title == "Todo App"
             return java_blueprint
 
-        async def mock_generate_contract(req, bp):
+        async def mock_extract_from_plan(plan_md, req, bp):
             call_order.append("api_contract")
             assert req.title == "Todo App"
             assert bp.name == "todo-backend"
@@ -802,7 +828,8 @@ class TestFullstackVueJavaE2E:
                 metrics={"components_generated": 3},
             )
 
-        with patch("core.pipeline_fullstack.ProductPlannerAgent") as MockPlanner, \
+        with patch("core.pipeline_fullstack.PlanGeneratorAgent") as MockPlanGen, \
+             patch("core.pipeline_fullstack.ProductPlannerAgent") as MockPlanner, \
              patch("core.pipeline_fullstack.ArchitectAgent") as MockArchitect, \
              patch("core.pipeline_fullstack.APIContractAgent") as MockContract, \
              patch("core.pipeline_run.RunPipeline") as MockBECls, \
@@ -811,9 +838,10 @@ class TestFullstackVueJavaE2E:
             MockBE = MockBECls
             MockFE = MockFECls
 
-            MockPlanner.return_value.plan_product = mock_plan_product
-            MockArchitect.return_value.design_architecture = mock_design_architecture
-            MockContract.return_value.generate_contract = mock_generate_contract
+            MockPlanGen.return_value.generate_plan = mock_generate_plan
+            MockPlanner.return_value.parse_from_plan = mock_parse_from_plan
+            MockArchitect.return_value.design_from_plan = mock_design_from_plan
+            MockContract.return_value.extract_from_plan = mock_extract_from_plan
             MockBE.return_value.execute = mock_be_execute
             MockFE.return_value.execute = mock_fe_execute
 
@@ -825,6 +853,7 @@ class TestFullstackVueJavaE2E:
 
         # ── Assert: all phases ran in correct order ───────────────────────
         assert call_order == [
+            "plan_generator",
             "product_planner",
             "architect",
             "api_contract",

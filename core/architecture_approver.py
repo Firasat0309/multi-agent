@@ -61,6 +61,58 @@ class ArchitectureApprover:
         self._workspace = workspace
         self._live = live
 
+    # ── Plan.md Approval ────────────────────────────────────────────────────
+
+    def approve_plan_md(self, plan_md_content: str) -> bool | str:
+        """Display plan.md and return True/False/feedback-str.
+
+        Interactive mode: renders the markdown using Rich (or plain text fallback)
+        then prompts [y] approve / [n] reject / [e] edit.
+
+        Non-interactive mode: writes plan_md_content to pending_plan.md and raises
+        ArchitecturePendingApprovalError.
+        """
+        if self._interactive:
+            return self._with_live_paused(self._interactive_plan_md, plan_md_content)
+        return self._noninteractive_plan_md(plan_md_content)
+
+    def _interactive_plan_md(self, plan_md_content: str) -> bool | str:
+        try:
+            from rich.console import Console
+            from rich.markdown import Markdown
+
+            console = Console()
+            console.print("\n[bold cyan]═══ Generated Plan (plan.md) ═══[/bold cyan]\n")
+            try:
+                md = Markdown(plan_md_content)
+                console.print(md)
+            except Exception:
+                # Rich Markdown render failed — fall back to plain text display
+                console.print(plan_md_content)
+            return _ask_approve_edit(console, "Approve this plan?")
+        except ImportError:
+            return self._plain_plan_md(plan_md_content)
+
+    def _plain_plan_md(self, plan_md_content: str) -> bool | str:
+        print("\n=== Generated Plan (plan.md) ===\n")
+        # Show up to 200 lines to keep the terminal readable
+        lines = plan_md_content.splitlines()
+        for line in lines[:200]:
+            print(line)
+        if len(lines) > 200:
+            print(f"... [{len(lines) - 200} more lines — review plan.md in workspace] ...")
+        return _ask_approve_edit_plain("Approve this plan?")
+
+    def _noninteractive_plan_md(self, plan_md_content: str) -> "NoReturn":
+        if self._workspace:
+            pending_path = self._workspace / "pending_plan.md"
+            pending_path.write_text(plan_md_content, encoding="utf-8")
+            logger.info("Pending plan.md written to %s", pending_path)
+        raise ArchitecturePendingApprovalError(
+            "plan.md requires human approval. "
+            "Review pending_plan.md in the workspace and re-run with approval."
+        )
+
     # ── Product Requirements Approval ──────────────────────────────────────
 
     def approve_product_plan(self, requirements: ProductRequirements) -> bool | str:
