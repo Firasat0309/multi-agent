@@ -118,7 +118,54 @@ def _validate_rewrite(
             metrics={},
         )
 
+    # ── Guard: Java package declaration must match file path ──────────────
+    if profile.name == "java" and file_path.endswith(".java"):
+        pkg_issue = _validate_java_package(new_content, file_path)
+        if pkg_issue:
+            logger.warning(
+                "%s rewrite has package mismatch for %s: %s — auto-correcting",
+                operation, file_path, pkg_issue,
+            )
+
     return None  # Validation passed
+
+
+def _validate_java_package(content: str, file_path: str) -> str | None:
+    """Validate and auto-correct Java package declaration to match file path.
+
+    Returns a description of the issue if the package was wrong (and corrected),
+    or None if the package is correct.
+
+    Java files under ``src/main/java/com/example/service/UserService.java``
+    MUST declare ``package com.example.service;``.
+    """
+    # Extract expected package from file path
+    # Standard Maven/Gradle: src/main/java/<package_path>/File.java
+    # Also handle: src/<package_path>/File.java (fallback)
+    path_norm = file_path.replace("\\", "/")
+    expected_pkg = ""
+    for marker in ("src/main/java/", "src/test/java/", "src/main/kotlin/", "src/test/kotlin/"):
+        if marker in path_norm:
+            after_marker = path_norm.split(marker, 1)[1]
+            # Remove filename, keep directory part
+            parts = after_marker.rsplit("/", 1)
+            if len(parts) > 1:
+                expected_pkg = parts[0].replace("/", ".")
+            break
+
+    if not expected_pkg:
+        return None  # Can't determine expected package from path
+
+    # Extract actual package from content
+    pkg_match = _re.search(r"^\s*package\s+([\w.]+)\s*;", content, _re.MULTILINE)
+    if not pkg_match:
+        return f"Missing package declaration (expected: package {expected_pkg};)"
+
+    actual_pkg = pkg_match.group(1)
+    if actual_pkg != expected_pkg:
+        return f"Package mismatch: declared '{actual_pkg}' but path requires '{expected_pkg}'"
+
+    return None
 
 
 # File extensions that are configuration/resource files, not source code.
@@ -188,6 +235,11 @@ class CoderAgent(BaseAgent):
     _LANGUAGE_SYNTAX_RULES: dict[str, str] = {
         "java": (
             "\n\nCRITICAL Java syntax rules — every violation makes the file uncompilable:\n"
+            "- PACKAGE DECLARATION MUST match the file path exactly:\n"
+            "  File: src/main/java/com/example/auth/service/UserService.java\n"
+            "  → MUST declare: package com.example.auth.service;\n"
+            "  Extract the package from the path AFTER src/main/java/ (or src/test/java/).\n"
+            "  A wrong package causes 'package does not exist' build failures.\n"
             "- Every import statement MUST end with a semicolon: `import java.util.List;`\n"
             "- Every field/variable declaration MUST end with exactly ONE semicolon — NEVER `;;`\n"
             "- serialVersionUID must be initialised: `private static final long serialVersionUID = 1L;`\n"
@@ -979,6 +1031,25 @@ class CoderAgent(BaseAgent):
             if lines:
                 props_hint = "\n".join(lines) + "\n"
 
+        # Build source file summary so the LLM knows what dependencies
+        # are actually needed.  Build config files now generate in the last
+        # tier (after all source files), so this list reflects the real project.
+        source_lines = []
+        for bp in context.blueprint.file_blueprints:
+            if bp.path != fb.path and bp.layer not in ("config", "test", "deploy", "docs"):
+                exports_hint = f" (exports: {', '.join(bp.exports[:5])})" if bp.exports else ""
+                source_lines.append(f"  - {bp.path} [{bp.layer}]: {bp.purpose}{exports_hint}")
+
+        source_summary = ""
+        if source_lines:
+            source_summary = (
+                "\n\nSource files in this project (include dependencies for ALL of these):\n"
+                + "\n".join(source_lines[:30])
+                + "\n\nIMPORTANT: Include dependencies for ALL libraries, frameworks, and "
+                "annotations actually used by the source files listed above. Do not guess — "
+                "examine the file purposes and exports to determine the correct dependencies.\n"
+            )
+
         prompt = (
             f"Project: {context.blueprint.name}\n"
             f"Tech stack: {tech}\n"
@@ -987,7 +1058,8 @@ class CoderAgent(BaseAgent):
             f"Purpose: {fb.purpose}\n"
             f"Format: {fmt}\n"
             f"{pom_hint}"
-            f"{props_hint}\n"
+            f"{props_hint}"
+            f"{source_summary}\n"
             f"Output only the {fmt} content. No code, no markdown, no explanations."
         )
 

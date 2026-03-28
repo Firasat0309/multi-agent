@@ -309,7 +309,8 @@ class FrontendPipeline:
             # ── Vue mandatory root: ensure App.vue is in ordered_components ────
             if "vue" in component_plan.framework.lower():
                 has_app = any(
-                    c.file_path and c.file_path.replace("\\", "/").endswith("src/App.vue")
+                    c.file_path and
+                    c.file_path.replace("\\", "/").lstrip("./").lower().endswith("src/app.vue")
                     for c in ordered_components
                 )
                 if not has_app:
@@ -322,14 +323,26 @@ class FrontendPipeline:
                         if getattr(c, "component_type", "") in ("layout", "shared")
                         and c.name != "App"
                     ]
+                    # Determine state solution for Pinia instructions
+                    _state_sol = (component_plan.state_solution or "").lower()
+                    _pinia_note = ""
+                    if "pinia" in _state_sol:
+                        _pinia_note = (
+                            " In main.ts (NOT App.vue), Pinia is registered via "
+                            "app.use(createPinia()). App.vue should NOT call createPinia() "
+                            "itself — just use stores normally via useXxxStore()."
+                        )
                     app_component = UIComponent(
                         name="App",
                         file_path="src/App.vue",
                         component_type="layout",
                         description=(
-                            "Root Vue application shell. Wraps <RouterView /> and provides "
-                            "global layout, navigation, and Pinia/router providers. "
-                            "Must import and render pages via vue-router."
+                            "Root Vue 3 application shell using <script setup lang='ts'>. "
+                            "Must contain <RouterView /> for page routing. "
+                            "Include global navigation/layout wrapping all pages. "
+                            "Import and use vue-router's RouterView and RouterLink. "
+                            f"{_pinia_note}"
+                            "Do NOT import createApp or createPinia here — that belongs in main.ts."
                         ),
                         depends_on=layout_names[:5],  # depend on layouts so it renders last
                         children=page_names,
@@ -621,7 +634,7 @@ class FrontendPipeline:
                                         if len(parts) > 1:
                                             imp_path = parts[-1].strip().strip("'\"").strip(";")
                                             if imp_path.startswith("."):
-                                                for ext in (".ts", ".tsx", "/index.ts", "/index.tsx"):
+                                                for ext in (".ts", ".tsx", ".vue", "/index.ts", "/index.tsx"):
                                                     candidate = _posixpath.normpath(
                                                         _posixpath.join(file_dir, imp_path + ext)
                                                     )
@@ -859,21 +872,27 @@ class FrontendPipeline:
                                     store_related[comp.file_path] = src[:4000]
                             except OSError:
                                 pass
-                    # Also include api.ts so the store can import from it
-                    api_path = workspace / "src/lib/api.ts"
-                    if api_path.exists():
-                        try:
-                            store_related["src/lib/api.ts"] = api_path.read_text(
-                                encoding="utf-8", errors="replace"
-                            )[:4000]
-                        except OSError:
-                            pass
+                    # Also include api.ts and types.ts so the store can import from them
+                    for _api_file in ("src/lib/api.ts", "src/lib/types.ts"):
+                        _api_path = workspace / _api_file
+                        if _api_path.exists():
+                            try:
+                                store_related[_api_file] = _api_path.read_text(
+                                    encoding="utf-8", errors="replace"
+                                )[:4000]
+                            except OSError:
+                                pass
+
+                    # Vue/Pinia: stores/ (plural), React: store/ (singular)
+                    _is_vue = "vue" in (component_plan.framework or "").lower()
+                    _store_dir = "src/stores" if _is_vue else "src/store"
+                    _store_barrel = f"{_store_dir}/index.ts"
 
                     state_ctx = AgentContext(
                         task=Task(
                             task_id=9001,
                             task_type=TaskType.MANAGE_STATE,
-                            file="src/store/index.ts",
+                            file=_store_barrel,
                             description=f"Generate {component_plan.state_solution} store layer",
                             metadata={
                                 "component_plan": component_plan,
@@ -883,7 +902,7 @@ class FrontendPipeline:
                         ),
                         blueprint=frontend_blueprint,
                         file_blueprint=FileBlueprint(
-                            path="src/store/index.ts",
+                            path=_store_barrel,
                             purpose="State management barrel / root store",
                             language="typescript",
                             layer="store",
@@ -933,7 +952,9 @@ class FrontendPipeline:
                             except OSError:
                                 pass
                     # Also include api.ts and store if they exist
-                    for extra in ("src/lib/api.ts", "src/store/index.ts"):
+                    # Check both singular (React) and plural (Vue/Pinia) store paths
+                    for extra in ("src/lib/api.ts", "src/lib/types.ts",
+                                  "src/store/index.ts", "src/stores/index.ts"):
                         ep = workspace / extra
                         if ep.exists():
                             try:
@@ -1237,13 +1258,21 @@ class FrontendPipeline:
             "state": plan.state_solution,
             "styling": requirements.tech_preferences.get("styling", "tailwind"),
         }
+        # Vue uses "stores" (plural) + "composables"; React uses "store" + "hooks"
+        fw_lower = (plan.framework or "").lower()
+        if "vue" in fw_lower:
+            folders = ["src/components", "src/pages", "src/views",
+                       "src/stores", "src/composables", "src/lib"]
+        else:
+            folders = ["src/components", "src/pages", "src/store",
+                       "src/lib", "src/hooks"]
+
         return RepositoryBlueprint(
             name=f"{requirements.title}-frontend",
             description=f"Frontend for {requirements.title}",
             architecture_style="SPA",
             tech_stack=tech_stack,
-            folder_structure=["src/components", "src/pages", "src/store",
-                              "src/lib", "src/hooks"],
+            folder_structure=folders,
             file_blueprints=file_blueprints,
         )
 
@@ -1258,14 +1287,11 @@ class FrontendPipeline:
         Returns a list of human-readable error strings, one per broken import.
         """
         validator = ImportValidator()
-        # Build the set of all .ts/.tsx files that exist in the workspace
-        known_files: set[str] = {
-            p.relative_to(workspace).as_posix()
-            for p in workspace.rglob("*.ts")
-        } | {
-            p.relative_to(workspace).as_posix()
-            for p in workspace.rglob("*.tsx")
-        }
+        # Build the set of all .ts/.tsx/.vue files that exist in the workspace
+        known_files: set[str] = set()
+        for ext in ("*.ts", "*.tsx", "*.vue"):
+            for p in workspace.rglob(ext):
+                known_files.add(p.relative_to(workspace).as_posix())
         errors: list[str] = []
         for comp in components:
             file_path: str = comp.file_path
@@ -1299,7 +1325,7 @@ class FrontendPipeline:
         # Build lookup: basename (no extension) → list of workspace-relative paths
         ts_files: dict[str, list[str]] = {}
         ts_files_lower: dict[str, list[str]] = {}
-        for ext in ("*.ts", "*.tsx"):
+        for ext in ("*.ts", "*.tsx", "*.vue"):
             for p in workspace.rglob(ext):
                 rel = p.relative_to(workspace).as_posix()
                 stem = p.stem  # e.g. "authStore" from "authStore.ts"
@@ -1338,9 +1364,9 @@ class FrontendPipeline:
             r"""(import\s+(?:type\s+)?(?:[^'"\n;]+?\s+from\s+)?['\"])([^'\"]+)(['\"])"""
         )
 
-        # Pre-compute the set of all TS/TSX files once (avoid re-globbing per import)
+        # Pre-compute the set of all TS/TSX/Vue files once (avoid re-globbing per import)
         existing: set[str] = set()
-        for ext in ("*.ts", "*.tsx"):
+        for ext in ("*.ts", "*.tsx", "*.vue"):
             for p in workspace.rglob(ext):
                 existing.add(p.relative_to(workspace).as_posix())
 
@@ -1366,7 +1392,7 @@ class FrontendPipeline:
                 if imp.startswith("@/"):
                     # Resolve @/ → src/
                     resolved = "src/" + imp[2:]
-                    candidates = [resolved + e for e in (".ts", ".tsx", ".js", ".jsx",
+                    candidates = [resolved + e for e in (".ts", ".tsx", ".vue", ".js", ".jsx",
                                                           "/index.ts", "/index.tsx")]
                     candidates.append(resolved)
                     if any(c in existing for c in candidates):
@@ -1408,7 +1434,7 @@ class FrontendPipeline:
 
                 # Check if this relative import already resolves
                 raw = posixpath.normpath(posixpath.join(file_dir, imp)).lstrip("/")
-                candidates = [raw + e for e in (".ts", ".tsx", ".js", ".jsx",
+                candidates = [raw + e for e in (".ts", ".tsx", ".vue", ".js", ".jsx",
                                                  "/index.ts", "/index.tsx")]
                 candidates.append(raw)
                 if any(c in existing for c in candidates):
@@ -1634,7 +1660,7 @@ class FrontendPipeline:
                                     imp_path = parts[-1].strip().strip("'\"").strip(";")
                                     if imp_path.startswith("."):
                                         file_dir = _posixpath.dirname(file_path)
-                                        for ext in (".ts", ".tsx", "/index.ts", "/index.tsx"):
+                                        for ext in (".ts", ".tsx", ".vue", "/index.ts", "/index.tsx"):
                                             # Normalise the relative path (collapse ..)
                                             # using posixpath to stay platform-independent
                                             candidate = _posixpath.normpath(
@@ -2068,6 +2094,26 @@ class FrontendPipeline:
         env_path = workspace / ".env.local"
         env_path.write_text(env_content, encoding="utf-8")
         logger.info("Wrote .env.local")
+
+        # ── Vue/Vite: env.d.ts for import.meta.env types ─────────────────
+        if "vue" in fw:
+            env_dts = workspace / "env.d.ts"
+            if not env_dts.exists():
+                env_dts.write_text(
+                    '/// <reference types="vite/client" />\n\n'
+                    "interface ImportMetaEnv {\n"
+                    "  readonly VITE_API_BASE_URL: string\n"
+                    "  readonly VITE_APP_NAME: string\n"
+                    "}\n\n"
+                    "interface ImportMeta {\n"
+                    "  readonly env: ImportMetaEnv\n"
+                    "}\n",
+                    encoding="utf-8",
+                )
+                logger.info("Wrote env.d.ts (Vite environment types)")
+
+            # main.ts is generated in the Vue config block below (line ~2414)
+            # with full router + Pinia + CSS imports.
 
         # ── globals.css ───────────────────────────────────────────────────
         styling = requirements.tech_preferences.get("styling", "tailwind").lower()

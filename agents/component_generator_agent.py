@@ -153,9 +153,12 @@ class ComponentGeneratorAgent(BaseAgent):
         )
 
     @staticmethod
-    def _framework_rules(framework: str) -> str:
+    def _framework_rules(framework: str, file_path: str = "") -> str:
         """Return framework-specific generation rules for the user prompt."""
         fw = (framework or "").lower()
+        # Infer Vue from file extension when framework string is missing
+        if not fw and file_path and file_path.endswith(".vue"):
+            fw = "vue"
         if "vue" in fw:
             return (
                 "FRAMEWORK: Vue 3 (Composition API)\n"
@@ -373,7 +376,7 @@ class ComponentGeneratorAgent(BaseAgent):
         if component and (component.state_needs or component.api_calls):
             preloaded = [
                 p for p in (context.related_files or {})
-                if any(seg in p for seg in ("store", "lib", "hooks"))
+                if any(seg in p for seg in ("store", "stores", "lib", "hooks", "composables"))
             ]
             if preloaded:
                 store_discovery = (
@@ -399,8 +402,15 @@ class ComponentGeneratorAgent(BaseAgent):
                 "code skeleton, then hydrate it with the described API and state handlers. "
             )
 
-        # Framework-specific rules injected into the user prompt
-        fw_rules = self._framework_rules(plan.framework if plan else "")
+        # Framework-specific rules injected into the user prompt.
+        # Fall back to blueprint tech_stack if plan is absent (e.g. recovery tasks).
+        fw_name = ""
+        if plan:
+            fw_name = plan.framework
+        elif context.blueprint and context.blueprint.tech_stack:
+            fw_name = context.blueprint.tech_stack.get("framework", "")
+        comp_path = component.file_path if component else ""
+        fw_rules = self._framework_rules(fw_name, file_path=comp_path)
 
         return (
             f"{req_text}{comp_text}\n{plan_text}\n{design_text}\n{contract_text}\n"
@@ -676,14 +686,37 @@ class ComponentGeneratorAgent(BaseAgent):
 
         store_lib_files = {
             p: c for p, c in related_files.items()
-            if any(seg in p for seg in ("store", "lib", "hooks", "hook"))
+            if any(seg in p for seg in ("store", "stores", "lib", "hooks", "hook", "composable"))
         }
         if not store_lib_files:
             return ""
 
+        # Pinia setup() syntax patterns:
+        #   const user = ref<User | null>(null)
+        #   const isLoading = ref(false)
+        #   const items = reactive<Item[]>([])
+        #   const fullName = computed(() => ...)
+        _PINIA_REF = _re.compile(
+            r"^\s+const\s+(\w+)\s*=\s*(ref|reactive|computed)\s*(?:<([^>]+)>)?\s*\(",
+            _re.MULTILINE,
+        )
+        # Pinia setup() action functions:
+        #   async function login(credentials: LoginRequest) { ... }
+        #   function logout() { ... }
+        _PINIA_FN = _re.compile(
+            r"^\s+(?:async\s+)?function\s+(\w+)\s*(\([^)]*\))",
+            _re.MULTILINE,
+        )
+        # Pinia return statement — extract what the store exposes:
+        #   return { user, isLoading, login, logout }
+        _PINIA_RETURN = _re.compile(
+            r"return\s*\{([^}]+)\}",
+        )
+
         sections: list[str] = []
         for fpath, content in store_lib_files.items():
             sigs: list[str] = []
+            is_pinia = "defineStore" in content
 
             # ── Type / interface definitions with fields ──────────────────
             type_lines = _extract_type_definitions(content)
@@ -709,6 +742,34 @@ class ComponentGeneratorAgent(BaseAgent):
                 # Skip if already captured as export or interface member
                 if not any(name in s for s in sigs):
                     sigs.append(f"  {name}({params})")
+
+            # ── Pinia setup() syntax extraction ──────────────────────────
+            if is_pinia:
+                # Find what the store returns (its public API)
+                return_names: set[str] = set()
+                rm = _PINIA_RETURN.search(content)
+                if rm:
+                    return_names = {
+                        n.strip() for n in rm.group(1).split(",")
+                        if n.strip()
+                    }
+
+                # Extract ref/reactive/computed state
+                for m in _PINIA_REF.finditer(content):
+                    name = m.group(1)
+                    kind = m.group(2)  # ref, reactive, computed
+                    type_hint = m.group(3) or ""
+                    if not return_names or name in return_names:
+                        if not any(name in s for s in sigs):
+                            type_str = f": {type_hint}" if type_hint else ""
+                            sigs.append(f"  {name}{type_str} ({kind})")
+
+                # Extract action functions
+                for m in _PINIA_FN.finditer(content):
+                    name, params = m.group(1), m.group(2)
+                    if not return_names or name in return_names:
+                        if not any(name in s for s in sigs):
+                            sigs.append(f"  {name}{params}")
 
             if sigs:
                 sections.append(f"  {fpath}:\n" + "\n".join(sigs))
@@ -783,9 +844,10 @@ class ComponentGeneratorAgent(BaseAgent):
         can see actual exports without needing extra tool-call iterations."""
         dirs_to_scan: list[str] = []
         if component.state_needs:
-            dirs_to_scan.append("store")
+            # Scan both singular (Zustand/Redux) and plural (Pinia) store dirs
+            dirs_to_scan.extend(["store", "stores"])
         if component.api_calls:
-            dirs_to_scan.extend(["lib", "hooks"])
+            dirs_to_scan.extend(["lib", "hooks", "composables"])
         if not dirs_to_scan:
             return context
 

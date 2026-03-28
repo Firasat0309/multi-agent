@@ -160,6 +160,36 @@ class StateManagementAgent(BaseAgent):
                     schema_text += f"  {name}: {definition}\n"
             schema_text += "\n"
 
+        # Check if api.ts is pre-loaded in related_files
+        api_preloaded = any(
+            "api.ts" in p for p in (context.related_files or {})
+        )
+        if api_preloaded:
+            api_read_instruction = (
+                "IMPORTANT: src/lib/api.ts is already provided in the Related Files section below.\n"
+                "Do NOT call read_file for it — use the content shown to see exact function exports.\n"
+                "Import those exact exports in your stores.\n\n"
+            )
+        else:
+            api_read_instruction = (
+                "IMPORTANT: Use read_file to read src/lib/api.ts to see what functions/client\n"
+                "it exports. If the file does not exist yet, define your own axios instance\n"
+                "in the store using: import axios from 'axios' and set baseURL from env.\n"
+                "Import those exact exports in your stores.\n\n"
+            )
+
+        # Vue/Pinia-specific store path guidance
+        store_path_hint = ""
+        fw = (plan.framework or "").lower()
+        if "vue" in fw or plan.state_solution.lower() == "pinia":
+            store_path_hint = (
+                "\nVUE / PINIA STORE PATHS:\n"
+                "- Write stores to src/stores/<entity>.ts (PLURAL: stores/, not store/)\n"
+                "- Use defineStore with setup() syntax for full TypeScript support.\n"
+                "- Write barrel: src/stores/index.ts that re-exports ALL store hooks.\n"
+                "- Use import.meta.env.VITE_API_BASE_URL for API base URL (NOT process.env).\n\n"
+            )
+
         return (
             f"Framework: {plan.framework}\n"
             f"State solution: {plan.state_solution}\n"
@@ -167,8 +197,8 @@ class StateManagementAgent(BaseAgent):
             f"Required state slices: {slices_text}\n\n"
             f"{api_text}"
             f"{schema_text}"
-            "IMPORTANT: Before writing store files, use read_file to read src/lib/api.ts\n"
-            "to see what functions/client it exports. Import those exact exports in your stores.\n\n"
+            f"{store_path_hint}"
+            f"{api_read_instruction}"
             "Generate ALL state management files and write each to disk using write_file."
         )
 

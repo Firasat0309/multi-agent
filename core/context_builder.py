@@ -267,6 +267,34 @@ class ContextBuilder:
                         priority=2, relevance_score=0.9, is_stub=False,
                     ))
 
+        # ── Priority 2b: error-referenced files (FIX_CODE only) ─────────────
+        # When fixing build errors, the error messages often reference OTHER
+        # files (e.g. "cannot find symbol: class UserService").  Include those
+        # files so the fix agent can see the actual API surface it needs to
+        # match, instead of guessing method names.
+        if task.task_type == TaskType.FIX_CODE:
+            referenced_paths = task.metadata.get("referenced_files", [])
+            already_paths = {c.path for c in candidates}
+            for ref_path in referenced_paths[:5]:
+                if ref_path in already_paths:
+                    continue
+                content = self._read_file(ref_path)
+                if content is None:
+                    continue
+                file_index = self.repo_index.get_file(ref_path)
+                checksum = file_index.checksum if file_index else ""
+                stub = _ast_extractor.extract_stub(ref_path, content, lang.name, checksum)
+                body = stub if stub else _smart_truncate(content, _DEP_TRUNCATE_SMALL)
+                candidates.append(ContextFile(
+                    path=ref_path,
+                    content=f"// Referenced in build error — use these EXACT signatures\n{body}",
+                    priority=2,
+                    relevance_score=0.95,
+                    is_stub=stub is not None,
+                ))
+                already_paths.add(ref_path)
+                logger.debug("Added error-referenced file to fix context: %s", ref_path)
+
         # ── Priority 3: semantic search hits ─────────────────────────────────
         # Guard: skip if the model warmup thread hasn't finished yet.  Calling
         # search() before _ensure_client() completes would block the event-loop

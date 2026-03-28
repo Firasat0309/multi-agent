@@ -49,8 +49,9 @@ class APIIntegrationAgent(BaseAgent):
 
     Produces:
     - ``src/lib/api.ts`` — Axios/Fetch client with interceptors and error handling
-    - ``src/hooks/use<Resource>.ts`` — SWR/React Query hooks for each resource group
-    - Type definitions derived from the API contract schemas
+    - ``src/lib/types.ts`` — TypeScript interfaces from API contract schemas
+    - React/Next.js: ``src/hooks/use<Resource>.ts`` — SWR/React Query hooks
+    - Vue 3: ``src/composables/use<Resource>.ts`` — Vue composables (ref/reactive)
 
     Uses the agentic loop so it can read generated component files and
     produce integration code that matches the actual usage patterns.
@@ -94,10 +95,41 @@ class APIIntegrationAgent(BaseAgent):
             "- Match the exact parameter and return types components expect."
         )
 
+    @staticmethod
+    def _env_var_instructions(framework: str) -> str:
+        """Return framework-specific env var instructions for the API base URL."""
+        fw = (framework or "").lower()
+        if "vue" in fw or "vite" in fw:
+            return (
+                "\nENVIRONMENT VARIABLE — VITE / VUE:\n"
+                "- The API base URL MUST be read from: import.meta.env.VITE_API_BASE_URL\n"
+                "- Do NOT use process.env — Vite does not expose it to client code.\n"
+                "- Do NOT use NEXT_PUBLIC_ or REACT_APP_ prefixes.\n"
+                "- In api.ts, set: const API_BASE = import.meta.env.VITE_API_BASE_URL || '/api/v1'\n"
+                "- For composables, import the axios/fetch instance from '../lib/api', never inline URLs.\n\n"
+            )
+        if "next" in fw:
+            return (
+                "\nENVIRONMENT VARIABLE — NEXT.JS:\n"
+                "- The API base URL MUST be read from: process.env.NEXT_PUBLIC_API_BASE_URL\n"
+                "- In api.ts, set: const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || '/api/v1'\n\n"
+            )
+        if "angular" in fw:
+            return (
+                "\nENVIRONMENT VARIABLE — ANGULAR:\n"
+                "- Use environment.ts / environment.prod.ts for API base URL.\n\n"
+            )
+        return (
+            "\nENVIRONMENT VARIABLE — REACT (CRA):\n"
+            "- The API base URL MUST be read from: process.env.REACT_APP_API_BASE_URL\n\n"
+        )
+
     def _build_prompt(self, context: AgentContext) -> str:
         contract: APIContract | None = context.task.metadata.get("api_contract")
         plan: ComponentPlan | None = context.task.metadata.get("component_plan")
         backend_models: dict[str, str] | None = context.task.metadata.get("backend_models")
+
+        framework = plan.framework if plan else ""
 
         contract_text = ""
         if contract:
@@ -135,8 +167,25 @@ class APIIntegrationAgent(BaseAgent):
             for path, content in list(backend_models.items())[:10]:
                 be_model_text += f"\n--- {path} ---\n{content}\n"
 
+        env_instructions = self._env_var_instructions(framework)
+
+        # Vue-specific: composables instead of hooks
+        vue_guidance = ""
+        fw = (framework or "").lower()
+        if "vue" in fw:
+            vue_guidance = (
+                "\nVUE 3 COMPOSABLES:\n"
+                "- Generate src/composables/use<Resource>.ts (NOT src/hooks/).\n"
+                "- Each composable uses ref/reactive + async functions for data fetching.\n"
+                "- Do NOT use SWR or React Query — these are React-only libraries.\n"
+                "- Import axios instance from '../lib/api'.\n"
+                "- Return reactive refs and async action functions from each composable.\n"
+                "- If using Pinia stores, composables can import and delegate to stores.\n\n"
+            )
+
         return (
             f"{contract_text}\n{plan_text}\n{be_model_text}\n"
+            f"{env_instructions}{vue_guidance}"
             "Generate ALL API integration files and write each to disk using write_file.\n"
             "IMPORTANT: Your TypeScript interfaces in src/lib/types.ts MUST match the\n"
             "schema definitions and backend models above. Use the exact field names and types."

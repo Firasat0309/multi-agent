@@ -38,7 +38,7 @@ class TestStubGenerator:
         gen.generate_stubs(["src/services/UserService.ts"])
         gen.flush()
         content = (tmp_path / "src/services/UserService.ts").read_text()
-        assert "export class UserService {}" in content
+        assert "export class UserService {" in content
 
     def test_rust_stub(self, tmp_path):
         gen = self._make_generator("rust", tmp_path)

@@ -46,6 +46,24 @@ _DEFAULT_TSCONFIG = """{
 }
 """
 
+_DEFAULT_VUE_TSCONFIG = """{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "preserve",
+    "jsxImportSource": "vue",
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "types": ["vite/client"]
+  },
+  "include": ["src/**/*", "src/**/*.vue", "env.d.ts", "vite-env.d.ts"]
+}
+"""
+
 
 @dataclass
 class TSXError:
@@ -131,14 +149,16 @@ class TSXCompiler:
         A missing ``tsconfig.json`` is created automatically with sensible
         defaults so the check can run even on freshly generated workspaces.
         """
-        tsconfig = workspace / "tsconfig.json"
-        if not tsconfig.exists():
-            tsconfig.write_text(_DEFAULT_TSCONFIG, encoding="utf-8")
-            logger.debug("Created default tsconfig.json in %s", workspace)
-
         # For Vue projects, prefer vue-tsc which understands .vue SFCs.
         # Fall back to plain tsc if vue-tsc is not available.
         use_vue_tsc = self._is_vue_project(workspace)
+
+        tsconfig = workspace / "tsconfig.json"
+        if not tsconfig.exists():
+            template = _DEFAULT_VUE_TSCONFIG if use_vue_tsc else _DEFAULT_TSCONFIG
+            tsconfig.write_text(template, encoding="utf-8")
+            logger.debug("Created default %s tsconfig.json in %s",
+                         "Vue" if use_vue_tsc else "React", workspace)
 
         # Resolve the compiler command — prefers local node_modules/.bin/,
         # falls back to npx which resolves from node_modules automatically.

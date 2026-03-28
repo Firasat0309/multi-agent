@@ -35,6 +35,7 @@ from core.error_attributor import (
     BaseErrorAttributor,
     CompilerErrorAttributor,
     extract_error_lines,
+    extract_referenced_files,
 )
 
 logger = logging.getLogger(__name__)
@@ -233,10 +234,27 @@ class BuildCheckpoint:
             return {}
 
         errors = checkpoint_result.attribution.summary_for_file(file_path)
-        return {
+
+        # Extract files referenced in the error messages so the fix agent
+        # can see the actual API surface of the conflicting dependency.
+        referenced = extract_referenced_files(
+            errors,
+            known_files=self.known_files,
+        )
+        # Exclude the file being fixed — it's already the target
+        referenced = [f for f in referenced if f != file_path]
+
+        ctx: dict[str, Any] = {
             "fix_trigger": "build",
             "build_errors": errors,
             "checkpoint_name": self.name,
             "checkpoint_attempt": checkpoint_result.attempt,
             "build_command": self.build_command,
         }
+        if referenced:
+            ctx["referenced_files"] = referenced[:5]
+            logger.info(
+                "Fix context for %s includes %d referenced files: %s",
+                file_path, len(referenced[:5]), referenced[:5],
+            )
+        return ctx

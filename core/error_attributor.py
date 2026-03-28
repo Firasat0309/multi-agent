@@ -167,6 +167,156 @@ def extract_error_lines(build_output: str, *, max_chars: int = 4000) -> str:
     return result
 
 
+def extract_referenced_files(
+    error_text: str,
+    known_files: set[str] | None = None,
+) -> list[str]:
+    """Extract file paths referenced in build errors that aren't the erroring file itself.
+
+    Compiler errors often reference other files/classes:
+    - Java: "cannot find symbol... class UserService" or "package com.example.service does not exist"
+    - Go: "undefined: models.User"
+    - TypeScript: "Module '../../services/UserService' not found"
+    - Rust: "unresolved import `crate::models::User`"
+    - C#: "The type or namespace name 'UserService' could not be found"
+
+    Returns workspace-relative file paths of referenced files.
+    """
+    if not known_files:
+        return []
+
+    # Patterns that extract class/type/module names from error messages.
+    # Each yields one or more named or positional groups to resolve.
+    _REF_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+        # Java: "cannot find symbol ... class UserService"
+        ("class", re.compile(r"cannot find symbol.*class\s+(\w+)", re.IGNORECASE)),
+        ("class", re.compile(r"symbol:\s*class\s+(\w+)", re.IGNORECASE)),
+        # Java: "cannot find symbol ... variable userService"
+        ("class", re.compile(r"cannot find symbol.*variable\s+(\w+)", re.IGNORECASE)),
+        # Java: "package com.example.service does not exist"
+        ("package", re.compile(r"package\s+([\w.]+)\s+does not exist", re.IGNORECASE)),
+        # Go: "undefined: models.User"
+        ("dotted", re.compile(r"undefined:\s+(\w+)\.(\w+)")),
+        # TypeScript/JS: "Module '../../services/UserService' not found"
+        ("module", re.compile(r"Module\s+['\"](.+?)['\"]", re.IGNORECASE)),
+        # TypeScript/JS: "Cannot find module '../../services/UserService'"
+        ("module", re.compile(r"cannot find module\s+['\"](.+?)['\"]", re.IGNORECASE)),
+        # TypeScript: "has no exported member 'UserService'"
+        ("class", re.compile(r"has no exported member\s+['\"](\w+)['\"]", re.IGNORECASE)),
+        # Rust: "unresolved import `crate::models::User`"
+        ("rust_import", re.compile(r"unresolved import.*::(\w+)", re.IGNORECASE)),
+        # C#: "The type or namespace name 'UserService' could not be found"
+        ("class", re.compile(r"type or namespace name\s+['\"](\w+)['\"]", re.IGNORECASE)),
+    ]
+
+    # Collect candidate names/paths to resolve
+    candidates: set[str] = set()
+
+    for kind, pattern in _REF_PATTERNS:
+        for match in pattern.finditer(error_text):
+            if kind == "class" or kind == "rust_import":
+                candidates.add(match.group(1))
+            elif kind == "package":
+                # Java package → directory path: com.example.service → com/example/service
+                pkg = match.group(1).replace(".", "/")
+                candidates.add(pkg)
+            elif kind == "dotted":
+                # Go: "models.User" → try both "models" and "User"
+                candidates.add(match.group(1))
+                candidates.add(match.group(2))
+            elif kind == "module":
+                # TS/JS module path: strip leading dots/slashes, keep basename
+                mod_path = match.group(1)
+                # Clean relative path prefixes
+                cleaned = mod_path.lstrip("./")
+                candidates.add(cleaned)
+                # Also try just the basename (e.g., "UserService" from "../../services/UserService")
+                basename = PurePosixPath(cleaned).name
+                if basename:
+                    candidates.add(basename)
+
+    # Resolve candidates to known files
+    resolved: list[str] = []
+    seen: set[str] = set()
+
+    for candidate in candidates:
+        if not candidate or len(candidate) < 2:
+            continue
+
+        matched = _resolve_candidate_to_known(candidate, known_files)
+        for m in matched:
+            if m not in seen:
+                seen.add(m)
+                resolved.append(m)
+
+    return resolved
+
+
+def _resolve_candidate_to_known(
+    candidate: str,
+    known_files: set[str],
+) -> list[str]:
+    """Resolve a candidate class/type/path name to known workspace files.
+
+    Returns a list of matched file paths (usually 0 or 1).
+    Ambiguous matches (multiple files with same basename) are discarded.
+    """
+    # 1. Direct suffix match (e.g., "services/UserService" matches
+    #    "src/main/java/com/example/services/UserService.java")
+    suffix_matches = [
+        f for f in known_files
+        if f.endswith(f"/{candidate}") or f == candidate
+    ]
+    if len(suffix_matches) == 1:
+        return suffix_matches
+
+    # 2. Suffix match with common extensions stripped from candidate
+    #    (e.g., "UserService" → matches "UserService.java", "UserService.ts")
+    basename_matches = [
+        f for f in known_files
+        if _basename_no_ext(f).lower() == candidate.lower()
+        or _basename_no_ext(f) == candidate
+    ]
+    if len(basename_matches) == 1:
+        return basename_matches
+
+    # 3. Path-contains match for package/module paths
+    #    (e.g., "com/example/service" → "src/main/java/com/example/service/UserService.java")
+    if "/" in candidate:
+        contains_matches = [
+            f for f in known_files
+            if candidate in f
+        ]
+        if len(contains_matches) == 1:
+            return contains_matches
+        # Multiple matches in the same package dir are all relevant
+        if 1 < len(contains_matches) <= 5:
+            return contains_matches
+
+    # 4. snake_case conversion: "UserService" → "user_service"
+    snake = _to_snake_case(candidate)
+    if snake != candidate.lower():
+        snake_matches = [
+            f for f in known_files
+            if _basename_no_ext(f) == snake
+        ]
+        if len(snake_matches) == 1:
+            return snake_matches
+
+    return []
+
+
+def _basename_no_ext(path: str) -> str:
+    """Return filename without extension: 'src/UserService.java' → 'UserService'."""
+    return PurePosixPath(path).stem
+
+
+def _to_snake_case(name: str) -> str:
+    """Convert CamelCase to snake_case: 'UserService' → 'user_service'."""
+    result = re.sub(r"([A-Z])", r"_\1", name).lower().lstrip("_")
+    return result
+
+
 class BaseErrorAttributor(ABC):
     """Abstract base for error attributors."""
 

@@ -35,6 +35,109 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+def _infer_method_signature_java(
+    name: str, layer: str, is_interface: bool,
+) -> str | None:
+    """Infer a compilable Java method stub from an export name and layer.
+
+    Returns a method declaration string, or None if the export looks like a
+    class/type name (PascalCase with no parens) rather than a method.
+    """
+    # Skip class/type names (PascalCase, no parens)
+    if name and name[0].isupper() and "(" not in name and "_" not in name:
+        return None
+
+    # Strip any trailing parens the architect may have included
+    name = name.split("(")[0].strip()
+    if not name:
+        return None
+
+    body = ";" if is_interface else " { return null; }"
+    void_body = ";" if is_interface else " {}"
+    lower = name.lower()
+
+    # Repository layer: standard CRUD signatures
+    if layer in ("repository", "dao"):
+        if lower.startswith("findall") or lower.startswith("getall"):
+            return f"    public java.util.List<Object> {name}(){body}"
+        if lower.startswith("find") or lower.startswith("get"):
+            return f"    public Object {name}(Long id){body}"
+        if lower in ("save", "create", "insert", "update"):
+            return f"    public Object {name}(Object entity){body}"
+        if lower.startswith("delete") or lower.startswith("remove"):
+            return f"    public void {name}(Long id){void_body}"
+        if lower.startswith("exists") or lower.startswith("count"):
+            return f"    public boolean {name}(Long id){body}"
+        return f"    public Object {name}(Object arg){body}"
+
+    # Controller layer — Spring REST annotations for better compilation
+    if layer == "controller":
+        if lower.startswith(("register", "create", "add", "signup")):
+            return f"    public org.springframework.http.ResponseEntity<Object> {name}(Object request){body}"
+        if lower.startswith(("get", "find", "fetch", "load")):
+            if "all" in lower or "list" in lower:
+                return f"    public org.springframework.http.ResponseEntity<java.util.List<Object>> {name}(){body}"
+            return f"    public org.springframework.http.ResponseEntity<Object> {name}(Long id){body}"
+        if lower.startswith(("update", "edit", "modify", "patch")):
+            return f"    public org.springframework.http.ResponseEntity<Object> {name}(Long id, Object request){body}"
+        if lower.startswith(("delete", "remove")):
+            return f"    public org.springframework.http.ResponseEntity<Void> {name}(Long id){body}"
+        if lower in ("login", "authenticate", "signin"):
+            return f"    public org.springframework.http.ResponseEntity<Object> {name}(Object credentials){body}"
+        if lower in ("logout", "signout"):
+            return f"    public org.springframework.http.ResponseEntity<Void> {name}(){body}"
+        return f"    public org.springframework.http.ResponseEntity<Object> {name}(Object arg){body}"
+
+    # Service / Handler layers
+    if layer in ("service", "handler", "router", "resource", "middleware"):
+        if lower.startswith(("register", "create", "add", "signup")):
+            return f"    public Object {name}(Object request){body}"
+        if lower.startswith(("get", "find", "fetch", "load")):
+            return f"    public Object {name}(Long id){body}"
+        if lower.startswith(("update", "edit", "modify", "patch")):
+            return f"    public Object {name}(Long id, Object request){body}"
+        if lower.startswith(("delete", "remove")):
+            return f"    public void {name}(Long id){void_body}"
+        if lower in ("login", "authenticate", "signin"):
+            return f"    public Object {name}(Object credentials){body}"
+        if lower in ("logout", "signout"):
+            return f"    public void {name}(){void_body}"
+        return f"    public Object {name}(Object arg){body}"
+
+    # Default: generic method stub
+    return f"    public Object {name}(Object arg){body}"
+
+
+def _infer_method_signature_go(name: str, layer: str) -> str | None:
+    """Infer a compilable Go function stub from an export name."""
+    if not name or not name[0].isupper():
+        return None  # unexported
+    return f"func {name}() interface{{}} {{ return nil }}"
+
+
+def _infer_method_signature_ts(name: str, layer: str) -> str | None:
+    """Infer a TypeScript function/method export stub."""
+    if not name:
+        return None
+    # PascalCase → class export; lowercase/camelCase → function
+    if name[0].isupper() and "_" not in name:
+        return None  # class/type, handled separately
+    return f"export function {name}(...args: any[]): any {{ return null as any; }}"
+
+
+def _infer_method_signature_csharp(
+    name: str, layer: str, is_interface: bool,
+) -> str | None:
+    """Infer a C# method stub."""
+    if name and name[0].isupper() and "_" not in name and "(" not in name:
+        return None  # class/type name
+    name = name.split("(")[0].strip()
+    if not name:
+        return None
+    body = ";" if is_interface else " => default!;"
+    return f"        public object {name}(object arg) {body}"
+
+
 class StubGenerator:
     """Creates minimal type stubs for files that haven't been generated yet.
 
@@ -147,7 +250,7 @@ class StubGenerator:
         elif self._lang == "kotlin":
             return self._kotlin_stub(file_path, blueprints)
         elif self._lang == "go":
-            return self._go_stub(file_path)
+            return self._go_stub(file_path, blueprints)
         elif self._lang == "typescript":
             return self._typescript_stub(file_path, blueprints)
         elif self._lang == "rust":
@@ -160,14 +263,11 @@ class StubGenerator:
 
     @staticmethod
     def _java_stub(file_path: str, blueprints: dict[str, object] | None) -> str:
-        """Generate a minimal Java class stub."""
-        # Extract class name from file path
+        """Generate a Java class/interface stub with compilable method signatures."""
         parts = file_path.replace("\\", "/")
         class_name = parts.split("/")[-1].replace(".java", "")
 
         # Determine package from path
-        # e.g., src/main/java/com/example/services/UserService.java
-        # → package com.example.services;
         package_path = parts
         for prefix in ("src/main/java/", "src/"):
             if package_path.startswith(prefix):
@@ -176,96 +276,209 @@ class StubGenerator:
         package_parts = package_path.rsplit("/", 1)
         package = package_parts[0].replace("/", ".") if len(package_parts) > 1 else ""
 
-        lines = []
+        lines: list[str] = []
         if package:
             lines.append(f"package {package};")
             lines.append("")
 
-        # Check if it's an interface based on naming convention
         is_interface = class_name.endswith("Repository") or class_name.startswith("I")
 
-        exports = []
+        exports: list[str] = []
+        layer = ""
         if blueprints and file_path in blueprints:
             bp = blueprints[file_path]
             if hasattr(bp, "exports"):
                 exports = bp.exports  # type: ignore[attr-defined]
+            if hasattr(bp, "layer"):
+                layer = bp.layer or ""  # type: ignore[attr-defined]
+
+        # Add Spring annotations for controllers
+        if layer == "controller" and not is_interface:
+            lines.append("import org.springframework.web.bind.annotation.RestController;")
+            lines.append("import org.springframework.http.ResponseEntity;")
+            lines.append("")
+            lines.append("@RestController")
 
         if is_interface:
             lines.append(f"public interface {class_name} {{")
         else:
             lines.append(f"public class {class_name} {{")
+            lines.append(f"    public {class_name}() {{}}")
 
-        # Add stub methods from exports if available
-        for export in exports[:5]:  # limit to 5 stubs
-            if export[0].isupper() and "(" not in export:
-                continue  # Skip class names
-            lines.append(f"    // stub: {export}")
+        # Generate compilable method stubs from exports
+        for export in exports[:10]:
+            sig = _infer_method_signature_java(export, layer, is_interface)
+            if sig:
+                lines.append(sig)
 
         lines.append("}")
         lines.append("")
         return "\n".join(lines)
 
     @staticmethod
-    def _go_stub(file_path: str) -> str:
-        """Generate a minimal Go package stub."""
+    def _go_stub(file_path: str, blueprints: dict[str, object] | None = None) -> str:
+        """Generate a Go package stub with exported function/struct stubs."""
         parts = file_path.replace("\\", "/").split("/")
         if len(parts) > 1:
-            package = parts[-2]  # directory name is package name
+            package = parts[-2]
         else:
             package = "main"
-        return f"package {package}\n"
+
+        lines = [f"package {package}", ""]
+
+        exports: list[str] = []
+        layer = ""
+        if blueprints and file_path in blueprints:
+            bp = blueprints[file_path]
+            if hasattr(bp, "exports"):
+                exports = bp.exports  # type: ignore[attr-defined]
+            if hasattr(bp, "layer"):
+                layer = bp.layer or ""  # type: ignore[attr-defined]
+
+        for export in exports[:10]:
+            if not export:
+                continue
+            # PascalCase names → exported struct or function
+            if export[0].isupper() and "_" not in export:
+                # Could be a struct type
+                lines.append(f"type {export} struct{{}}")
+            else:
+                sig = _infer_method_signature_go(export, layer)
+                if sig:
+                    lines.append(sig)
+        lines.append("")
+        return "\n".join(lines)
 
     @staticmethod
     def _typescript_stub(
         file_path: str, blueprints: dict[str, object] | None
     ) -> str:
-        """Generate a minimal TypeScript stub."""
+        """Generate a TypeScript stub with exported class/function stubs."""
         parts = file_path.replace("\\", "/")
         name = parts.split("/")[-1].replace(".ts", "").replace(".tsx", "")
-        # PascalCase the name for the class
         class_name = name[0].upper() + name[1:] if name else "Stub"
 
-        lines = [f"export class {class_name} {{}}"]
+        exports: list[str] = []
+        layer = ""
+        if blueprints and file_path in blueprints:
+            bp = blueprints[file_path]
+            if hasattr(bp, "exports"):
+                exports = bp.exports  # type: ignore[attr-defined]
+            if hasattr(bp, "layer"):
+                layer = bp.layer or ""  # type: ignore[attr-defined]
+
+        lines: list[str] = []
+        class_methods: list[str] = []
+        standalone_funcs: list[str] = []
+
+        for export in exports[:10]:
+            if not export:
+                continue
+            sig = _infer_method_signature_ts(export, layer)
+            if sig:
+                standalone_funcs.append(sig)
+            elif export[0].isupper():
+                # Class/type export — will be added as a class
+                pass  # handled by default class below
+
+        # Always emit the primary class
+        lines.append(f"export class {class_name} {{")
+        # Add camelCase exports as methods on the class
+        for export in exports[:10]:
+            if export and not export[0].isupper():
+                lines.append(f"    {export}(...args: any[]): any {{ return null as any; }}")
+        lines.append("}")
+
+        # Standalone function exports
+        for func in standalone_funcs:
+            lines.append(func)
+
+        # Additional type exports
+        for export in exports[:10]:
+            if export and export[0].isupper() and export != class_name:
+                lines.append(f"export interface {export} {{ [key: string]: any; }}")
+
         lines.append("")
         return "\n".join(lines)
 
     @staticmethod
     def _rust_stub(file_path: str, blueprints: dict[str, object] | None) -> str:
-        """Generate a minimal Rust stub."""
+        """Generate a Rust stub with struct and impl block."""
         name = file_path.split("/")[-1].replace(".rs", "")
         struct_name = "".join(w.capitalize() for w in name.split("_"))
-        return f"pub struct {struct_name};\n"
+
+        exports: list[str] = []
+        if blueprints and file_path in blueprints:
+            bp = blueprints[file_path]
+            if hasattr(bp, "exports"):
+                exports = bp.exports  # type: ignore[attr-defined]
+
+        lines = [f"pub struct {struct_name};", ""]
+
+        # Add impl block with method stubs for non-type exports
+        methods: list[str] = []
+        for export in exports[:10]:
+            if not export:
+                continue
+            if export[0].isupper() and "_" not in export:
+                if export != struct_name:
+                    lines.append(f"pub struct {export};")
+            else:
+                methods.append(f"    pub fn {export}(&self) -> Option<()> {{ None }}")
+
+        if methods:
+            lines.append(f"impl {struct_name} {{")
+            lines.extend(methods)
+            lines.append("}")
+
+        lines.append("")
+        return "\n".join(lines)
 
     @staticmethod
     def _csharp_stub(
         file_path: str, blueprints: dict[str, object] | None
     ) -> str:
-        """Generate a minimal C# stub."""
+        """Generate a C# stub with method signatures."""
         class_name = file_path.split("/")[-1].replace(".cs", "")
-        # Guess namespace from path
         parts = file_path.replace("\\", "/").rsplit("/", 1)
         namespace = parts[0].replace("/", ".") if len(parts) > 1 else "App"
-        return (
-            f"namespace {namespace}\n"
-            f"{{\n"
-            f"    public class {class_name} {{ }}\n"
-            f"}}\n"
-        )
+
+        exports: list[str] = []
+        layer = ""
+        is_interface = class_name.startswith("I") and len(class_name) > 1 and class_name[1].isupper()
+        if blueprints and file_path in blueprints:
+            bp = blueprints[file_path]
+            if hasattr(bp, "exports"):
+                exports = bp.exports  # type: ignore[attr-defined]
+            if hasattr(bp, "layer"):
+                layer = bp.layer or ""  # type: ignore[attr-defined]
+
+        keyword = "interface" if is_interface else "class"
+        lines = [
+            f"namespace {namespace}",
+            "{",
+            f"    public {keyword} {class_name}",
+            "    {",
+        ]
+
+        for export in exports[:10]:
+            sig = _infer_method_signature_csharp(export, layer, is_interface)
+            if sig:
+                lines.append(sig)
+
+        lines.append("    }")
+        lines.append("}")
+        lines.append("")
+        return "\n".join(lines)
 
     @staticmethod
     def _kotlin_stub(
         file_path: str, blueprints: dict[str, object] | None
     ) -> str:
-        """Generate a minimal Kotlin class/interface stub.
-
-        Mirrors the Java stub logic but uses Kotlin syntax.  Interfaces are
-        detected by the same naming convention (suffix ``Repository`` or
-        prefix ``I``).
-        """
+        """Generate a Kotlin class/interface stub with method signatures."""
         parts = file_path.replace("\\", "/")
         class_name = parts.split("/")[-1].replace(".kt", "")
 
-        # Determine package from path
         package_path = parts
         for prefix in ("src/main/kotlin/", "src/main/java/", "src/"):
             if package_path.startswith(prefix):
@@ -274,6 +487,15 @@ class StubGenerator:
         package_parts = package_path.rsplit("/", 1)
         package = package_parts[0].replace("/", ".") if len(package_parts) > 1 else ""
 
+        exports: list[str] = []
+        layer = ""
+        if blueprints and file_path in blueprints:
+            bp = blueprints[file_path]
+            if hasattr(bp, "exports"):
+                exports = bp.exports  # type: ignore[attr-defined]
+            if hasattr(bp, "layer"):
+                layer = bp.layer or ""  # type: ignore[attr-defined]
+
         lines: list[str] = []
         if package:
             lines.append(f"package {package}")
@@ -281,9 +503,20 @@ class StubGenerator:
 
         is_interface = class_name.endswith("Repository") or class_name.startswith("I")
         if is_interface:
-            lines.append(f"interface {class_name}")
+            lines.append(f"interface {class_name} {{")
         else:
-            lines.append(f"class {class_name}")
+            lines.append(f"open class {class_name} {{")
+
+        for export in exports[:10]:
+            if not export or (export[0].isupper() and "_" not in export):
+                continue
+            name = export.split("(")[0].strip()
+            if is_interface:
+                lines.append(f"    fun {name}(vararg args: Any?): Any?")
+            else:
+                lines.append(f"    fun {name}(vararg args: Any?): Any? = null")
+
+        lines.append("}")
         lines.append("")
         return "\n".join(lines)
 

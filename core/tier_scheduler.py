@@ -33,8 +33,28 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 logger = logging.getLogger(__name__)
+
+# Build/project config files that should be generated AFTER all source files
+# so the LLM can see actual imports and include correct dependencies.
+_BUILD_CONFIG_NAMES: frozenset[str] = frozenset({
+    "pom.xml", "build.gradle", "build.gradle.kts",
+    "settings.gradle", "settings.gradle.kts",
+    "package.json", "cargo.toml", "go.mod", "go.sum",
+    "requirements.txt", "pyproject.toml", "setup.py",
+})
+_BUILD_CONFIG_EXTENSIONS: frozenset[str] = frozenset({".csproj", ".fsproj", ".vbproj"})
+
+
+def _is_build_config(file_path: str) -> bool:
+    """Check if a file is a build/project configuration file."""
+    name = PurePosixPath(file_path.replace("\\", "/")).name.lower()
+    if name in _BUILD_CONFIG_NAMES:
+        return True
+    suffix = PurePosixPath(name).suffix.lower()
+    return suffix in _BUILD_CONFIG_EXTENSIONS
 
 
 @dataclass
@@ -118,6 +138,26 @@ class TierScheduler:
             assigned.update(tier_files)
             remaining -= set(tier_files)
             tier_index += 1
+
+        # Move build config files (pom.xml, build.gradle, package.json, etc.)
+        # to the final tier so they're generated AFTER all source files.
+        # This lets the LLM see actual imports and include correct dependencies
+        # instead of guessing what the source code will need.
+        config_set = {f for f in file_paths if _is_build_config(f)}
+        if config_set:
+            for tier in tiers:
+                tier.files = [f for f in tier.files if f not in config_set]
+            # Remove empty tiers and renumber
+            tiers = [t for t in tiers if t.files]
+            for i, t in enumerate(tiers):
+                t.index = i
+            # Add config files as the last tier
+            config_tier = Tier(index=len(tiers), files=sorted(config_set))
+            tiers.append(config_tier)
+            logger.info(
+                "Moved %d build config file(s) to final tier %d: %s",
+                len(config_set), config_tier.index, sorted(config_set),
+            )
 
         # Merge adjacent single-file tiers that form linear dependency chains.
         # A→B→C→D produces 4 tiers of 1 file each; they can safely be compiled
