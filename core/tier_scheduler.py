@@ -37,8 +37,8 @@ from pathlib import PurePosixPath
 
 logger = logging.getLogger(__name__)
 
-# Build/project config files that should be generated AFTER all source files
-# so the LLM can see actual imports and include correct dependencies.
+# Build/project config files that must be generated BEFORE all source files
+# so that build checkpoints (mvn package, npm run build) can run after each tier.
 _BUILD_CONFIG_NAMES: frozenset[str] = frozenset({
     "pom.xml", "build.gradle", "build.gradle.kts",
     "settings.gradle", "settings.gradle.kts",
@@ -140,9 +140,9 @@ class TierScheduler:
             tier_index += 1
 
         # Move build config files (pom.xml, build.gradle, package.json, etc.)
-        # to the final tier so they're generated AFTER all source files.
-        # This lets the LLM see actual imports and include correct dependencies
-        # instead of guessing what the source code will need.
+        # to Tier 0 so they exist BEFORE the first build checkpoint runs.
+        # Without pom.xml / package.json, `mvn package` or `npm run build`
+        # will fail immediately after Tier 0.
         config_set = {f for f in file_paths if _is_build_config(f)}
         if config_set:
             for tier in tiers:
@@ -150,13 +150,13 @@ class TierScheduler:
             # Remove empty tiers and renumber
             tiers = [t for t in tiers if t.files]
             for i, t in enumerate(tiers):
-                t.index = i
-            # Add config files as the last tier
-            config_tier = Tier(index=len(tiers), files=sorted(config_set))
-            tiers.append(config_tier)
+                t.index = i + 1  # shift all tiers up by 1
+            # Insert config files as Tier 0 (before all source files)
+            config_tier = Tier(index=0, files=sorted(config_set))
+            tiers.insert(0, config_tier)
             logger.info(
-                "Moved %d build config file(s) to final tier %d: %s",
-                len(config_set), config_tier.index, sorted(config_set),
+                "Moved %d build config file(s) to Tier 0: %s",
+                len(config_set), sorted(config_set),
             )
 
         # Merge adjacent single-file tiers that form linear dependency chains.

@@ -289,32 +289,6 @@ If any validation check fails:
 4. Repeat until all checks pass
 
 Do NOT output code with known errors.
-
----
-
-# PHASE 6 — OUTPUT FORMAT
-
-Output files in this exact format, one block per file:
-
-=== FILE: backend/src/main/java/com/app/config/SecurityConfig.java ===
-<full file content>
-
-=== FILE: frontend/src/api/client.ts ===
-<full file content>
-
-Output ALL files. Never truncate. Never output a stub or TODO.
-
----
-
-# PHASE 7 — DOCUMENTATION
-
-=== FILE: README.md ===
-1. Prerequisites: Java 17, Node 18+, Maven
-2. Running the Backend: cd backend && mvn spring-boot:run (port 8080)
-3. Running the Frontend: cd frontend && npm install && npm run dev (port 5173)
-4. API Reference: POST /api/auth/login (no auth), GET /api/tasks (JWT required)
-5. Environment Variables: VITE_API_BASE_URL
-6. CORS Notes: CorsConfig allows localhost:5173 and localhost:3000
 """
 
 
@@ -409,7 +383,7 @@ class TestPlanGeneratorAgent:
         agent = PlanGeneratorAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
         result = await agent.generate_plan("Build a task manager")
 
-        for phase in ["PHASE 0", "PHASE 1", "PHASE 2", "PHASE 3", "PHASE 4", "PHASE 5", "PHASE 6", "PHASE 7"]:
+        for phase in ["PHASE 0", "PHASE 1", "PHASE 2", "PHASE 3", "PHASE 4", "PHASE 5"]:
             assert phase in result, f"Expected {phase} in plan.md output"
 
     @pytest.mark.anyio
@@ -455,7 +429,6 @@ class TestPlanGeneratorAgent:
         incomplete = "\n".join(
             line for line in sample_plan_md.splitlines()
             if "PHASE 4" not in line and "PHASE 5" not in line
-            and "PHASE 6" not in line and "PHASE 7" not in line
         )
         # Strip the phase bodies too — simulate LLM cutting off early
         incomplete = incomplete.split("# PHASE 4")[0] if "# PHASE 4" in incomplete else incomplete
@@ -494,7 +467,7 @@ class TestPlanGeneratorAgent:
         agent = PlanGeneratorAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
         sp = agent.system_prompt
 
-        for phase in ["PHASE 0", "PHASE 1", "PHASE 2", "PHASE 3", "PHASE 4", "PHASE 5", "PHASE 6", "PHASE 7"]:
+        for phase in ["PHASE 0", "PHASE 1", "PHASE 2", "PHASE 3", "PHASE 4", "PHASE 5"]:
             assert phase in sp, f"System prompt missing {phase}"
 
 

@@ -24,8 +24,6 @@ _REQUIRED_PHASES = [
     "PHASE 3",
     "PHASE 4",
     "PHASE 5",
-    "PHASE 6",
-    "PHASE 7",
 ]
 
 
@@ -56,7 +54,7 @@ class PlanGeneratorAgent(BaseAgent):
             "section independently — missing information in any phase causes generation failure.\n"
             "- Output ONLY the markdown document — no preamble, no explanation, no fences "
             "wrapping the entire document.\n"
-            "- All seven phases (PHASE 0 through PHASE 7) are mandatory. Do NOT skip any.\n\n"
+            "- All six phases (PHASE 0 through PHASE 5) are mandatory. Do NOT skip any.\n\n"
             "REQUIRED DOCUMENT STRUCTURE:\n\n"
             "# <Project Title> — Implementation Plan\n"
             "**Tech Stack:** <Frontend> | <Backend> | <Database> | <Build Tool>\n\n"
@@ -191,26 +189,7 @@ class PlanGeneratorAgent(BaseAgent):
             "3. Re-run the relevant validation checks for that file\n"
             "4. Repeat until all checks pass\n\n"
             "Do NOT output code with known errors. Every file must be complete and "
-            "compilable before output.\n\n"
-            "---\n\n"
-            "# PHASE 6 — OUTPUT FORMAT\n\n"
-            "Output files in this exact format, one block per file:\n\n"
-            "=== FILE: backend/src/main/java/com/app/config/SecurityConfig.java ===\n"
-            "<full file content>\n\n"
-            "=== FILE: frontend/src/api/client.ts ===\n"
-            "<full file content>\n\n"
-            "Output ALL files. Never truncate a file with // ... rest of implementation. "
-            "Never output a stub or TODO.\n\n"
-            "---\n\n"
-            "# PHASE 7 — DOCUMENTATION\n\n"
-            "After all code files, output a single === FILE: README.md === containing:\n"
-            "1. Prerequisites (Java 17, Node 18+, Maven)\n"
-            "2. Running the Backend (mvn spring-boot:run, port 8080)\n"
-            "3. Running the Frontend (npm install && npm run dev, port 5173)\n"
-            "4. API Reference for every endpoint: method, path, auth required, "
-            "request body example, response body example, HTTP status codes\n"
-            "5. Environment Variables (all .env keys with descriptions)\n"
-            "6. CORS Notes (configured origins, how CorsConfig.java is wired)\n"
+            "compilable before output.\n"
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
@@ -253,7 +232,7 @@ class PlanGeneratorAgent(BaseAgent):
                 f"Here is the partial plan you produced (for context):\n"
                 f"{plan_md[:3000]}\n\n"
                 "Please produce a COMPLETE plan.md document that includes ALL phases "
-                "from PHASE 0 through PHASE 7. "
+                "from PHASE 0 through PHASE 5. "
                 "Be specific to the project — use real screen names, entity names, "
                 "and endpoint paths derived from the user's request. "
                 "Output ONLY the markdown document — no preamble, no fences around the document."
@@ -323,7 +302,7 @@ class PlanGeneratorAgent(BaseAgent):
         return (
             f"User request:\n{user_prompt}\n\n"
             "Generate a complete plan.md document for this project. "
-            "The document must include all seven phases (PHASE 0 through PHASE 7) "
+            "The document must include all six phases (PHASE 0 through PHASE 5) "
             "as described in your system prompt. "
             "Be specific to THIS project — reference actual screen names, entity names, "
             "field names, and endpoint paths derived from the user's request. "

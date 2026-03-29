@@ -769,11 +769,7 @@ class TestFullstackVueJavaE2E:
             "# PHASE 4 — VALIDATION CHECKLIST\n"
             "- [ ] All entities have @Id\n\n"
             "# PHASE 5 — AUTO-FIX RULES\n"
-            "Fix and retry.\n\n"
-            "# PHASE 6 — OUTPUT FORMAT\n"
-            "=== FILE: path === content\n\n"
-            "# PHASE 7 — DOCUMENTATION\n"
-            "README with prereqs.\n"
+            "Fix and retry.\n"
         )
 
         async def mock_generate_plan(prompt):
