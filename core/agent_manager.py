@@ -259,17 +259,10 @@ class AgentManager:
             engine.process_event(file_path, EventType.DEPS_MET)
             phase = lc.phase  # now GENERATING
 
-        # Review gating: review is SKIPPED by default to save LLM calls.
-        # The build checkpoint catches compile errors more reliably.
-        # Use --enable-reviewer to opt in, or legacy --skip-reviewer is
-        # still respected for backward compatibility.
         if phase == FilePhase.REVIEWING:
-            reviewer_enabled = "reviewer" in self.settings.enable_agents
-            reviewer_force_skipped = "reviewer" in self.settings.skip_agents
-            if reviewer_force_skipped or not reviewer_enabled:
-                logger.info("[%s] Skipping review (reviewer not enabled)", file_path)
-                engine.process_event(file_path, EventType.REVIEW_PASSED)
-                return
+            logger.info("[%s] Skipping review (simple loop executor)", file_path)
+            engine.process_event(file_path, EventType.REVIEW_PASSED)
+            return
 
         config = self._get_phase_config(phase, lc, file_path)
         if config is None:

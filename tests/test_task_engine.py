@@ -146,8 +146,8 @@ class TestTaskGraphBuilder:
         assert engine.has_file("services/user_service.py")
         assert engine.has_file("controllers/user_controller.py")
 
-        # Global graph is valid
-        assert len(global_graph.tasks) > 3
+        # Global graph is valid and minimal: sentinel + deploy + docs
+        assert len(global_graph.tasks) == 3
         errors = global_graph.validate()
         assert len(errors) == 0
 
@@ -189,9 +189,8 @@ class TestLifecyclePlanBuilder:
         assert engine.has_file("services/UserService.java")
         assert engine.has_file("pom.xml")
 
-        # Global graph should have: sentinel + security + module review
-        # + module fixes (3, config excluded) + arch review + deploy + docs
-        assert len(global_graph.tasks) > 5
+        # Global graph should only contain advisory tasks: sentinel + deploy + docs
+        assert len(global_graph.tasks) == 3
         assert len(global_graph.validate()) == 0
 
     def test_config_files_skip_testing(self):
@@ -229,7 +228,7 @@ class TestLifecyclePlanBuilder:
         assert sentinel is not None
         assert "sentinel" in sentinel.description.lower()
 
-    def test_global_graph_has_all_phases(self):
+    def test_global_graph_only_contains_advisory_tasks(self):
         builder = LifecyclePlanBuilder()
         _, global_graph = builder.build(self._make_blueprint())
 
@@ -237,12 +236,12 @@ class TestLifecyclePlanBuilder:
         # Security and integration are now handled by dedicated checkpoints
         assert TaskType.SECURITY_SCAN not in task_types
         assert TaskType.GENERATE_INTEGRATION_TEST not in task_types
+        assert TaskType.REVIEW_MODULE not in task_types
+        assert TaskType.REVIEW_ARCHITECTURE not in task_types
+        assert TaskType.FIX_CODE not in task_types
         # Advisory tasks remain in the global DAG
-        assert TaskType.REVIEW_MODULE in task_types
-        assert TaskType.REVIEW_ARCHITECTURE in task_types
         assert TaskType.GENERATE_DEPLOY in task_types
         assert TaskType.GENERATE_DOCS in task_types
-        assert TaskType.FIX_CODE in task_types  # module fix tasks
 
     def test_custom_fix_limits(self):
         builder = LifecyclePlanBuilder()
@@ -379,12 +378,13 @@ class TestEnhanceLifecyclePlanBuilder:
         # Test files should skip testing phase
         assert lc.phase == FilePhase.PASSED
 
-    def test_global_graph_has_sentinel_and_review(self):
+    def test_global_graph_only_has_sentinel(self):
         builder = EnhanceLifecyclePlanBuilder()
         _, global_graph = builder.build(self._make_change_plan(), self._make_blueprint())
 
         task_types = {t.task_type for t in global_graph.tasks.values()}
-        assert TaskType.REVIEW_MODULE in task_types
+        assert TaskType.REVIEW_MODULE not in task_types
+        assert len(global_graph.tasks) == 1
         # Should have sentinel task
         sentinel_tasks = [t for t in global_graph.tasks.values() if t.metadata.get("sentinel")]
         assert len(sentinel_tasks) == 1

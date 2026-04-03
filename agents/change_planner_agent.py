@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from agents.base_agent import BaseAgent
@@ -157,6 +159,16 @@ class ChangePlannerAgent(BaseAgent):
         """
         logger.info("Planning changes for request: %s", user_request[:100])
 
+        cache_path = self._plan_cache_path(
+            cache_kind="plan",
+            user_request=user_request,
+            repo_analysis=repo_analysis,
+        )
+        cached = self._load_cached_plan(cache_path)
+        if cached is not None:
+            logger.info("Change plan cache HIT (%s) — skipping LLM call", cache_path.name)
+            return cached
+
         repo_context = self._build_repo_context(repo_analysis, user_request)
 
         prompt = (
@@ -177,7 +189,9 @@ class ChangePlannerAgent(BaseAgent):
                 "ChangePlannerAgent produced empty plan (JSON parse failed). "
                 "Raw response (first 500 chars): %s", raw[:500],
             )
-        return self._parse_change_plan(data)
+        plan = self._parse_change_plan(data)
+        self._write_plan_cache(cache_path, data)
+        return plan
 
     async def revise_changes(
         self,
@@ -200,6 +214,18 @@ class ChangePlannerAgent(BaseAgent):
             ],
             "risk_notes": current.risk_notes,
         }, indent=2)
+        cache_path = self._plan_cache_path(
+            cache_kind="revision",
+            user_request=user_request,
+            repo_analysis=repo_analysis,
+            current_plan=current,
+            feedback=feedback,
+        )
+        cached = self._load_cached_plan(cache_path)
+        if cached is not None:
+            logger.info("Change plan revision cache HIT (%s) — skipping LLM call", cache_path.name)
+            return cached
+
         repo_context = self._build_repo_context(repo_analysis, user_request)
 
         prompt = (
@@ -216,7 +242,103 @@ class ChangePlannerAgent(BaseAgent):
         data = self._parse_json(raw)
         if not data:
             logger.error("ChangePlannerAgent revision produced empty plan")
-        return self._parse_change_plan(data)
+        plan = self._parse_change_plan(data)
+        self._write_plan_cache(cache_path, data)
+        return plan
+
+    def _plan_cache_path(
+        self,
+        *,
+        cache_kind: str,
+        user_request: str,
+        repo_analysis: RepoAnalysis,
+        current_plan: ChangePlan | None = None,
+        feedback: str = "",
+    ) -> Path:
+        cache_dir = self.repo.workspace / ".plan_cache"
+        cache_input: dict[str, Any] = {
+            "kind": cache_kind,
+            "user_request": user_request.strip(),
+            "repo_analysis": self._normalise_repo_analysis(repo_analysis),
+        }
+        if current_plan is not None:
+            cache_input["current_plan"] = self._normalise_change_plan(current_plan)
+        if feedback:
+            cache_input["feedback"] = feedback.strip()
+
+        digest = hashlib.sha256(
+            json.dumps(cache_input, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:16]
+        return cache_dir / f"{digest}.json"
+
+    @staticmethod
+    def _normalise_repo_analysis(repo_analysis: RepoAnalysis) -> dict[str, Any]:
+        modules = sorted(repo_analysis.modules, key=lambda module: module.file)
+        return {
+            "tech_stack": dict(sorted(repo_analysis.tech_stack.items())),
+            "architecture_style": repo_analysis.architecture_style,
+            "entry_points": sorted(repo_analysis.entry_points),
+            "summary": repo_analysis.summary,
+            "modules": [
+                {
+                    "name": module.name,
+                    "file": module.file,
+                    "classes": sorted(module.classes),
+                    "functions": sorted(module.functions),
+                    "imports": sorted(module.imports),
+                    "layer": module.layer,
+                }
+                for module in modules
+            ],
+        }
+
+    @staticmethod
+    def _normalise_change_plan(change_plan: ChangePlan) -> dict[str, Any]:
+        return {
+            "summary": change_plan.summary,
+            "changes": [
+                {
+                    "type": change.type.value,
+                    "file": change.file,
+                    "description": change.description,
+                    "function": change.function,
+                    "class_name": change.class_name,
+                    "depends_on": sorted(change.depends_on),
+                    "details": change.details,
+                }
+                for change in change_plan.changes
+            ],
+            "new_files": [
+                {
+                    "path": new_file.path,
+                    "purpose": new_file.purpose,
+                    "depends_on": sorted(new_file.depends_on),
+                    "exports": sorted(new_file.exports),
+                    "layer": new_file.layer,
+                }
+                for new_file in change_plan.new_files
+            ],
+            "affected_tests": sorted(change_plan.affected_tests),
+            "risk_notes": change_plan.risk_notes,
+        }
+
+    def _load_cached_plan(self, cache_path: Path) -> ChangePlan | None:
+        if not cache_path.exists():
+            return None
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            return self._parse_change_plan(cached)
+        except Exception:
+            logger.warning("Change plan cache read failed — regenerating", exc_info=True)
+            return None
+
+    def _write_plan_cache(self, cache_path: Path, data: dict[str, Any]) -> None:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            logger.info("Change plan cached to %s", cache_path)
+        except Exception:
+            logger.debug("Failed to write change plan cache (non-critical)", exc_info=True)
 
     def _build_repo_context(
         self,

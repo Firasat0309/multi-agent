@@ -36,17 +36,17 @@ class TestPipelineDefinition:
         assert TaskType.GENERATE_INTEGRATION_TEST not in GENERATE_PIPELINE.global_tasks
         assert TaskType.GENERATE_DEPLOY in GENERATE_PIPELINE.global_tasks
         assert TaskType.GENERATE_DOCS in GENERATE_PIPELINE.global_tasks
-        assert TaskType.REVIEW_MODULE in GENERATE_PIPELINE.global_tasks
-        assert TaskType.REVIEW_ARCHITECTURE in GENERATE_PIPELINE.global_tasks
+        assert TaskType.REVIEW_MODULE not in GENERATE_PIPELINE.global_tasks
+        assert TaskType.REVIEW_ARCHITECTURE not in GENERATE_PIPELINE.global_tasks
 
     def test_generate_pipeline_security_checkpoint(self):
         assert GENERATE_PIPELINE.security_checkpoint is not None
-        assert GENERATE_PIPELINE.security_checkpoint.max_cycles == 2
-        assert GENERATE_PIPELINE.security_checkpoint.max_fixes_per_file == 2
+        assert GENERATE_PIPELINE.security_checkpoint.max_cycles == 1
+        assert GENERATE_PIPELINE.security_checkpoint.max_fixes_per_file == 1
 
     def test_generate_pipeline_integration_checkpoint(self):
         assert GENERATE_PIPELINE.integration_checkpoint is not None
-        assert GENERATE_PIPELINE.integration_checkpoint.max_cycles == 2
+        assert GENERATE_PIPELINE.integration_checkpoint.max_cycles == 1
 
     def test_enhance_pipeline_security_checkpoint(self):
         assert ENHANCE_PIPELINE.security_checkpoint is not None

@@ -37,18 +37,17 @@ logger = logging.getLogger(__name__)
 class EnhancePipeline:
     """Executes the repository-modification workflow using the unified executor.
 
-    Uses the same ``PipelineExecutor`` as the Generate pipeline, providing:
-      - Per-file Modify → Review → Fix lifecycle cycles
+        Uses the same simple loop executor as the Generate pipeline, providing:
+            - Per-file Modify → Build → Fix cycles
       - Tier-based dependency scheduling
       - Repo-level build checkpoints with error attribution
       - Test generation and verification
-      - Global module review
 
     Phases:
       1. Analysis      — RepositoryAnalyzerAgent scans existing files
       2. Change Plan   — ChangePlannerAgent produces a structured diff plan
       3. Lifecycle Plan — EnhanceLifecyclePlanBuilder builds engine + global DAG
-      4. Execution      — PipelineExecutor runs tiers, checkpoints, tests
+            4. Execution      — SimpleLoopExecutor runs tiers, builds, fixes, tests
       5. Finalise      — re-index workspace, write modify_report.json
     """
 
@@ -312,14 +311,14 @@ class EnhancePipeline:
                 self._live.update_task(task.task_id, task.description, task.status.value)
 
         # ── Phase 4: Execute via unified PipelineExecutor ─────────────────────
-        self._phase("Code Modification & Review", "running")
+        self._phase("Code Modification", "running")
         logger.info("[Phase 4] Executing targeted modifications via unified executor...")
 
         sandbox = SandboxOrchestrator(self._settings)
         try:
             sb = await sandbox.setup(lang_profile)
         except SandboxUnavailableError as e:
-            self._fail_phase("Code Modification & Review", str(e))
+            self._fail_phase("Code Modification", str(e))
             return PipelineResult(
                 success=False,
                 workspace_path=self._settings.workspace_dir,
@@ -366,15 +365,16 @@ class EnhancePipeline:
         try:
             async with WorkspaceSnapshot(self._settings.workspace_dir) as snap:
                 try:
-                    from core.pipeline_executor import PipelineExecutor
-                    
-                    executor = PipelineExecutor(
+                    from core.simple_loop_executor import SimpleLoopExecutor
+
+                    executor = SimpleLoopExecutor(
                         agent_manager=agent_manager,
                         settings=self._settings,
                         lang_profile=lang_profile,
                         event_bus=event_bus,
                     )
-                    
+                    logger.info("Using SimpleLoopExecutor")
+
                     exec_result = await executor.execute(
                         lifecycle_engine,
                         global_graph,
@@ -394,7 +394,7 @@ class EnhancePipeline:
                     await sandbox.teardown()
         except Exception as e:
             logger.exception("Modification execution failed")
-            self._fail_phase("Code Modification & Review", str(e))
+            self._fail_phase("Code Modification", str(e))
             return PipelineResult(
                 success=False,
                 workspace_path=self._settings.workspace_dir,
@@ -405,7 +405,7 @@ class EnhancePipeline:
                 elapsed_seconds=time.monotonic() - start_time,
             )
 
-        self._complete_phase("Code Modification & Review")
+        self._complete_phase("Code Modification")
 
         # ── Phase 5: Finalise ─────────────────────────────────────────────────
         self._phase("Finalize", "running")
@@ -418,7 +418,7 @@ class EnhancePipeline:
 
         elapsed = time.monotonic() - start_time
         stats = exec_result.get("stats", {})
-        # Code success: all files modified/generated, reviewed, and built.
+        # Code success: all files modified/generated and built.
         # Test failures (tests_degraded) are a quality signal, not a hard gate.
         # Also verify build checkpoints actually passed.
         checkpoints_passed = all(
@@ -428,6 +428,7 @@ class EnhancePipeline:
             stats.get("failed", 0) == 0
             and stats.get("blocked", 0) == 0
             and stats.get("lifecycle_failed", 0) == 0
+            and stats.get("final_build_passed", True)
             and checkpoints_passed
         )
 

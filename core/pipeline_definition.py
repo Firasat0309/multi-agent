@@ -15,21 +15,23 @@ Example::
             Phase(
                 name="code_generation",
                 file_tasks=[
-                    FileTaskDef(TaskType.GENERATE_FILE, review=True, max_review_fixes=3),
+                    FileTaskDef(TaskType.GENERATE_FILE, review=False, max_review_fixes=2),
                 ],
                 checkpoint=CheckpointDef(
                     name="build_verification",
-                    max_retries=4,
+                    max_retries=2,
                 ),
             ),
             Phase(
                 name="testing",
                 file_tasks=[
-                    FileTaskDef(TaskType.GENERATE_TEST, max_test_fixes=3),
+                    FileTaskDef(TaskType.GENERATE_TEST, max_test_fixes=2),
                 ],
             ),
         ],
-        global_tasks=[TaskType.SECURITY_SCAN, TaskType.GENERATE_DEPLOY],
+        global_tasks=[TaskType.GENERATE_DEPLOY, TaskType.GENERATE_DOCS],
+        security_checkpoint=SecurityCheckpointDef(max_cycles=1, max_fixes_per_file=1),
+        integration_checkpoint=IntegrationCheckpointDef(max_cycles=1),
     )
 """
 
@@ -216,8 +218,7 @@ GENERATE_PIPELINE = PipelineDefinition(
                     task_type=TaskType.GENERATE_FILE,
                     # Review is OFF by default — the build checkpoint catches
                     # compile errors more reliably than LLM review, and for
-                    # interpreted languages a linter is cheaper.  Enable with
-                    # --enable-reviewer when code quality review is desired.
+                    # interpreted languages a linter is cheaper.
                     review=False,
                     max_review_fixes=2,
                 ),

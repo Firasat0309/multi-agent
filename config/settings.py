@@ -36,7 +36,6 @@ class SandboxTier(str, Enum):
 class SkippableAgent(str, Enum):
     """Pipeline phases that may be skipped via ``Settings.skip_agents``."""
     TESTER = "tester"
-    REVIEWER = "reviewer"
     SECURITY = "security"
     INTEGRATION = "integration"
 
@@ -143,12 +142,9 @@ class Settings:
     max_concurrent_agents: int = 4
     max_debug_iterations: int = 5
     # Maximum wall-clock seconds allowed for a single lifecycle phase (generate,
-    # review, fix, build, test).  Phases that exceed this budget are cancelled
+    # fix, build, test). Phases that exceed this budget are cancelled
     # and the file is marked FAILED so the rest of the pipeline can proceed.
     phase_timeout_seconds: int = 600
-    review_levels: list[str] = field(
-        default_factory=lambda: ["file", "module", "architecture"]
-    )
     figma_token: str = field(default_factory=lambda: os.environ.get("FIGMA_TOKEN", ""))
     allow_host_execution: bool = False  # Must be True to run without Docker
     require_plan_approval: bool = False  # If True, pause for human review after change planning
@@ -156,15 +152,10 @@ class Settings:
     # Number of build attempts per tier checkpoint (1 initial + retries).
     # Increase for flaky compilers; decrease to fail-fast during development.
     build_checkpoint_retries: int = 3
-    # Agent phases the user wants to skip entirely.  Recognised values:
-    # "tester", "reviewer", "security", "integration".
+    # Agent phases the user wants to skip entirely. Recognised values:
+    # "tester", "security", "integration".
     # Phases listed here are bypassed in the executor.
     skip_agents: frozenset[str] = field(default_factory=frozenset)
-    # Agent phases to explicitly ENABLE that are off by default.
-    # Currently: "reviewer" (code review is skipped by default to reduce
-    # LLM calls — the build checkpoint catches errors more reliably).
-    # Use --enable-reviewer on the CLI to opt in.
-    enable_agents: frozenset[str] = field(default_factory=frozenset)
     # Per-session cost cap in USD.  When total LLM spend exceeds this value,
     # CostLimitExceededError is raised.  0 (default) means unlimited.
     max_cost_usd: float = 0.0
@@ -224,14 +215,6 @@ class Settings:
         if _bad:
             errors.append(
                 f"skip_agents contains unrecognised values: {sorted(_bad)}. "
-                f"Valid: {sorted(_valid_agents)}"
-            )
-
-        # Validate enable_agents against the same enum
-        _bad_enable = self.enable_agents - _valid_agents
-        if _bad_enable:
-            errors.append(
-                f"enable_agents contains unrecognised values: {sorted(_bad_enable)}. "
                 f"Valid: {sorted(_valid_agents)}"
             )
 

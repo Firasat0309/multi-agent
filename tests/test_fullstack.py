@@ -3098,15 +3098,15 @@ class TestTaskDispatcherApiContract:
         assert captured_kwargs["api_contract"] is sample_api_contract
 
 
-# ── PipelineExecutor checkpoint api_contract propagation tests ───────────────
+# ── SimpleLoopExecutor checkpoint api_contract propagation tests ─────────────
 
 
-class TestPipelineExecutorCheckpointApiContract:
+class TestSimpleLoopExecutorCheckpointApiContract:
     """Verify the api_contract is forwarded to ContextBuilder in all checkpoint paths
     by checking the AgentContext received by the agent has the contract set."""
 
     def _make_executor(self, api_contract=None):
-        from core.pipeline_executor import PipelineExecutor
+        from core.simple_loop_executor import SimpleLoopExecutor
         from core.language import get_language_profile
 
         am = MagicMock()
@@ -3128,7 +3128,7 @@ class TestPipelineExecutorCheckpointApiContract:
         settings.skip_agents = []
         settings.build_checkpoint_retries = 1
 
-        return PipelineExecutor(
+        return SimpleLoopExecutor(
             agent_manager=am,
             settings=settings,
             lang_profile=lang,

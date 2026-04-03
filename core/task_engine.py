@@ -1,10 +1,10 @@
 """Task DAG engine with topological execution ordering.
 
 Execution model: **Lifecycle + global DAG** — ``LifecyclePlanBuilder.build()`` creates:
-  - A ``LifecycleEngine`` for per-file Generate→Review→Fix→Test cycles
-  - A slim ``TaskGraph`` for global phases (security, module review, deploy, docs)
-  The per-file lifecycle is event-driven; the global DAG runs after all files
-  reach a terminal state.
+    - A ``LifecycleEngine`` for per-file Generate→Build→Fix→Test cycles
+    - A slim ``TaskGraph`` for advisory global phases (deploy, docs)
+    The per-file lifecycle is event-driven; the global DAG runs after all files
+    reach a terminal state.
 
 ``TaskGraphBuilder`` is retained for modification workflows only.
 """
@@ -52,9 +52,9 @@ class TaskGraphBuilder:
 class LifecyclePlanBuilder:
     """Builds a LifecycleEngine + global TaskGraph from a blueprint.
 
-    The per-file lifecycle (Generate → Review → Fix → Test) is handled by
-    the ``LifecycleEngine``.  The global phases (security scan, module review,
-    architecture review, deploy, docs) are still managed as a small DAG.
+    The per-file lifecycle (Generate → Build → Fix → Test) is handled by
+    the ``LifecycleEngine``. Advisory global phases (deploy, docs) are still
+    managed as a small DAG.
     """
 
     def __init__(self) -> None:
@@ -132,16 +132,15 @@ class LifecyclePlanBuilder:
             if fb.layer in ("test", "config", "deploy"):
                 engine.skip_testing(fb.path)
 
-        # ── Build global task graph (advisory tasks — runs in parallel with
-        #    security/integration checkpoints) ──
+        # ── Build global task graph (advisory tasks only) ─────────────────
         #
-        # Security scan and integration tests are NO LONGER in the global DAG.
-        # They are handled by dedicated checkpoints in PipelineExecutor with
-        # feedback loops (scan → fix → rebuild → re-scan).
+        # Security and integration checks are handled by dedicated checkpoints.
+        # Reviewer-driven module/architecture passes are intentionally omitted
+        # from the default graph because they add extra LLM turns without a
+        # deterministic execution loop behind them.
         #
-        # The global DAG now contains only advisory/fire-and-forget tasks:
-        # module review, architecture review, deploy, and docs — all running
-        # in parallel (only gated by the sentinel).
+        # The default global DAG contains only deploy/docs generation, both
+        # gated by the sentinel so they run against the final workspace state.
         global_graph = TaskGraph()
 
         # Sentinel task: marks lifecycle completion (auto-completed by executor)
@@ -154,42 +153,6 @@ class LifecyclePlanBuilder:
             metadata={"sentinel": True},
         )
         global_graph.add_task(lifecycle_done)
-
-        # Module review
-        mod_review = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.REVIEW_MODULE,
-            file="*",
-            description="Module consistency review",
-            dependencies=[lifecycle_done.task_id],
-        )
-        global_graph.add_task(mod_review)
-
-        # Module fix (per-file, depends on module review)
-        mod_fix_ids: list[int] = []
-        for fb in blueprint.file_blueprints:
-            if fb.layer in ("config", "deploy"):
-                continue
-            mod_fix = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.FIX_CODE,
-                file=fb.path,
-                description=f"Fix {fb.path} based on module review",
-                dependencies=[mod_review.task_id],
-                metadata={"review_task_id": mod_review.task_id},
-            )
-            global_graph.add_task(mod_fix)
-            mod_fix_ids.append(mod_fix.task_id)
-
-        # Architecture review — depends only on sentinel (advisory, no feedback)
-        arch_review = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.REVIEW_ARCHITECTURE,
-            file="*",
-            description="Architecture review for dependency cycles and layer violations",
-            dependencies=[lifecycle_done.task_id],
-        )
-        global_graph.add_task(arch_review)
 
         # Deploy — depends only on sentinel (runs in parallel with everything)
         deploy_task = Task(
@@ -225,13 +188,10 @@ class LifecyclePlanBuilder:
 class ModificationTaskGraphBuilder:
     """Builds a task DAG for modifying an existing repository.
 
-    The modification flow is:
-      1. MODIFY_FILE tasks for each change in the plan (graph-ordered via dep_store)
-      2. GENERATE_FILE tasks for brand-new files in the plan
-      3. REVIEW_FILE for each modified/new file
-      4. FIX_CODE for each review
-      5. GENERATE_TEST for affected test files (expanded by dep_store impact analysis)
-      6. REVIEW_MODULE for cross-file consistency
+        The modification flow is:
+            1. MODIFY_FILE tasks for each change in the plan (graph-ordered via dep_store)
+            2. GENERATE_FILE tasks for brand-new files in the plan
+            3. GENERATE_TEST for affected test files (expanded by dep_store impact analysis)
 
     When ``dep_store`` is provided the builder:
     - Reorders modification tasks topologically so dependencies are modified first
@@ -257,7 +217,7 @@ class ModificationTaskGraphBuilder:
         """Build a task graph from a ChangePlan.
 
         Each ChangeAction becomes a MODIFY_FILE task; each new_file becomes
-        a GENERATE_FILE task.  Reviews and tests follow.
+        a GENERATE_FILE task. Tests follow the write phase directly.
         """
         graph = TaskGraph()
         file_task_map: dict[str, int] = {}  # file_path → last task_id for that file
@@ -341,68 +301,31 @@ class ModificationTaskGraphBuilder:
             graph.add_task(task)
             file_task_map[nf.path] = task.task_id
 
-        # ── Phase 2: Review each modified/new file ────────────────────
-        review_task_map: dict[str, int] = {}
-        for file_path, gen_task_id in file_task_map.items():
-            task = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.REVIEW_FILE,
-                file=file_path,
-                description=f"Review changes in {file_path}",
-                dependencies=[gen_task_id],
-            )
-            graph.add_task(task)
-            review_task_map[file_path] = task.task_id
-
-        # ── Phase 2.5: Fix based on review ────────────────────────────
-        fix_task_ids: list[int] = []
-        for file_path, review_id in review_task_map.items():
-            fix_task = Task(
-                task_id=self._alloc_id(),
-                task_type=TaskType.FIX_CODE,
-                file=file_path,
-                description=f"Fix {file_path} based on review",
-                dependencies=[review_id],
-                metadata={"review_task_id": review_id},
-            )
-            graph.add_task(fix_task)
-            fix_task_ids.append(fix_task.task_id)
-
-        # ── Phase 3: Tests for affected files ─────────────────────────
+        # ── Phase 2: Tests for affected files ──────────────────────────
         # Merge plan's explicit test list with graph-derived impacted tests.
         test_targets = self._expand_test_targets(
             change_plan.affected_tests, list(file_task_map.keys())
         )
+        write_task_ids = list(file_task_map.values())
         for file_path in test_targets:
             task = Task(
                 task_id=self._alloc_id(),
                 task_type=TaskType.GENERATE_TEST,
                 file=file_path,
                 description=f"Generate/update tests for {file_path}",
-                dependencies=fix_task_ids,
+                dependencies=write_task_ids,
             )
             graph.add_task(task)
-
-        # ── Phase 4: Module-level review ──────────────────────────────
-        mod_review = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.REVIEW_MODULE,
-            file="*",
-            description="Module consistency review of modifications",
-            dependencies=fix_task_ids,
-        )
-        graph.add_task(mod_review)
 
         errors = graph.validate()
         if errors:
             raise ValueError(f"Modification task graph validation failed: {errors}")
 
         logger.info(
-            "Built modification task graph: %d tasks (%d modify, %d new, %d review, %d test)",
+            "Built modification task graph: %d tasks (%d modify, %d new, %d test)",
             len(graph.tasks),
             len(ordered_changes),
             len(change_plan.new_files),
-            len(review_task_map),
             len(test_targets),
         )
         return graph
@@ -637,15 +560,15 @@ class EnhanceLifecyclePlanBuilder:
 
     This is the Enhance-pipeline counterpart of ``LifecyclePlanBuilder``.
     Instead of creating GENERATE_FILE lifecycles for every blueprint file, it
-    creates:
-      - MODIFY_FILE lifecycles for existing files being changed
-      - GENERATE_FILE lifecycles for brand-new files
-      - A global TaskGraph with just a module review sentinel
+        creates:
+            - MODIFY_FILE lifecycles for existing files being changed
+            - GENERATE_FILE lifecycles for brand-new files
+            - A minimal global TaskGraph containing only the sentinel
 
     The resulting ``(LifecycleEngine, TaskGraph)`` can be passed directly to
     ``AgentManager.execute_with_checkpoints()`` so the Enhance pipeline uses
-    the same unified executor, tier-based scheduling, build checkpoints, and
-    review→fix cycles as the Generate pipeline.
+    the same executor, tier-based scheduling, and generate→build→fix loop as
+    the Generate pipeline.
     """
 
     def __init__(self, dep_store: DependencyGraphStore | None = None) -> None:
@@ -765,16 +688,6 @@ class EnhanceLifecyclePlanBuilder:
             metadata={"sentinel": True},
         )
         global_graph.add_task(lifecycle_done)
-
-        # Module consistency review
-        mod_review = Task(
-            task_id=self._alloc_id(),
-            task_type=TaskType.REVIEW_MODULE,
-            file="*",
-            description="Module consistency review of modifications",
-            dependencies=[lifecycle_done.task_id],
-        )
-        global_graph.add_task(mod_review)
 
         errors = global_graph.validate()
         if errors:

@@ -279,7 +279,7 @@ class RunPipeline:
                     self._live.update_task(task.task_id, task.description, task.status.value)
 
             # ── Phase 3: Execution ────────────────────────────────────────────────
-            self._phase("Code Generation & Review", "running")
+            self._phase("Code Generation", "running")
             logger.info("[Phase 3] Executing tasks...")
 
             sandbox = SandboxOrchestrator(self._settings)
@@ -287,7 +287,7 @@ class RunPipeline:
             try:
                 sb = await sandbox.setup(lang_profile)
             except SandboxUnavailableError as e:
-                self._fail_phase("Code Generation & Review", str(e))
+                self._fail_phase("Code Generation", str(e))
                 return PipelineResult(
                     success=False,
                     workspace_path=self._settings.workspace_dir,
@@ -346,15 +346,16 @@ class RunPipeline:
                 lifecycle_engine.checkpoint_mode = True
 
             try:
-                from core.pipeline_executor import PipelineExecutor
-                
-                executor = PipelineExecutor(
+                from core.simple_loop_executor import SimpleLoopExecutor
+
+                executor = SimpleLoopExecutor(
                     agent_manager=agent_manager,
                     settings=self._settings,
                     lang_profile=lang_profile,
                     event_bus=event_bus,
                 )
-                
+                logger.info("Using SimpleLoopExecutor")
+
                 exec_result = await executor.execute(
                     lifecycle_engine,
                     global_graph,
@@ -365,7 +366,7 @@ class RunPipeline:
                 )
             except Exception as e:
                 logger.exception("Task execution failed")
-                self._fail_phase("Code Generation & Review", str(e))
+                self._fail_phase("Code Generation", str(e))
                 return PipelineResult(
                     success=False,
                     workspace_path=self._settings.workspace_dir,
@@ -374,7 +375,7 @@ class RunPipeline:
                     elapsed_seconds=time.monotonic() - start_time,
                 )
 
-            self._complete_phase("Code Generation & Review")
+            self._complete_phase("Code Generation")
 
             # ── Phase 4: Finalise ─────────────────────────────────────────────────
             self._phase("Finalize", "running")
@@ -388,7 +389,7 @@ class RunPipeline:
             elapsed = time.monotonic() - start_time
             stats = exec_result.get("stats", {})
 
-            # Code success: all files generated, reviewed, and built correctly.
+            # Code success: all files generated and built correctly.
             # Test failures (tests_degraded) are a quality signal, not a hard gate —
             # the generated code itself is valid even when generated tests don't all pass.
             # Also check checkpoint results — if any build checkpoint failed, the
@@ -401,6 +402,7 @@ class RunPipeline:
                 stats.get("failed", 0) == 0
                 and stats.get("blocked", 0) == 0
                 and stats.get("lifecycle_failed", 0) == 0
+                and stats.get("final_build_passed", True)
                 and checkpoints_passed
             )
             tests_passed = stats.get("lifecycle_tests_degraded", 0) == 0
@@ -603,7 +605,7 @@ class RunPipeline:
         self._complete_phase("Resume: Loading State")
 
         # ── Setup sandbox + agent manager ─────────────────────────────────────
-        self._phase("Code Generation & Review (Resume)", "running")
+        self._phase("Code Generation (Resume)", "running")
 
         mcp_client: MCPClient | None = None
         if self._settings.mcp_server_command:
@@ -621,7 +623,7 @@ class RunPipeline:
         try:
             sb = await sandbox.setup(lang_profile)
         except SandboxUnavailableError as e:
-            self._fail_phase("Code Generation & Review (Resume)", str(e))
+            self._fail_phase("Code Generation (Resume)", str(e))
             return PipelineResult(
                 success=False,
                 workspace_path=workspace,
@@ -683,14 +685,15 @@ class RunPipeline:
 
             errors: list[str] = []
             try:
-                from core.pipeline_executor import PipelineExecutor
+                from core.simple_loop_executor import SimpleLoopExecutor
 
-                executor = PipelineExecutor(
+                executor = SimpleLoopExecutor(
                     agent_manager=agent_manager,
                     settings=self._settings,
                     lang_profile=lang_profile,
                     event_bus=event_bus,
                 )
+                logger.info("Using SimpleLoopExecutor")
 
                 exec_result = await executor.execute(
                     lifecycle_engine,
@@ -702,7 +705,7 @@ class RunPipeline:
                 )
             except Exception as e:
                 logger.exception("[Resume] Task execution failed")
-                self._fail_phase("Code Generation & Review (Resume)", str(e))
+                self._fail_phase("Code Generation (Resume)", str(e))
                 return PipelineResult(
                     success=False,
                     workspace_path=workspace,
@@ -711,7 +714,7 @@ class RunPipeline:
                     elapsed_seconds=time.monotonic() - start_time,
                 )
 
-            self._complete_phase("Code Generation & Review (Resume)")
+            self._complete_phase("Code Generation (Resume)")
 
             # ── Finalise ──────────────────────────────────────────────────────
             try:
@@ -730,6 +733,7 @@ class RunPipeline:
                 stats.get("failed", 0) == 0
                 and stats.get("blocked", 0) == 0
                 and stats.get("lifecycle_failed", 0) == 0
+                and stats.get("final_build_passed", True)
                 and checkpoints_passed
             )
             success = code_success

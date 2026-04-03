@@ -91,7 +91,7 @@ _TRANSITIONS: dict[tuple[FilePhase, EventType], FilePhase] = {
     (FilePhase.REVIEWING, EventType.REVIEW_PASSED): FilePhase.BUILDING,
     (FilePhase.REVIEWING, EventType.REVIEW_FAILED): FilePhase.FIXING,
     # REVIEW_SKIPPED: bypass the REVIEWING phase entirely.
-    # Used when --skip-reviewer is active (default).  The file goes directly
+    # Used by the simplified executor. The file goes directly
     # from GENERATING to BUILDING — the compiler/linter catches errors more
     # reliably and cheaply than an LLM review pass.
     (FilePhase.GENERATING, EventType.REVIEW_SKIPPED): FilePhase.BUILDING,

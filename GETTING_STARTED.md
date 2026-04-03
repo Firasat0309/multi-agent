@@ -224,14 +224,11 @@ codegen generate "Build a REST API" --provider gemini --model gemini-2.0-flash
 ### Skipping phases (for faster iteration)
 
 ```bash
-# Skip reviewer only (faster, less safe)
-codegen generate "Build a TODO API" --skip-reviewer
-
 # Skip tests only
 codegen generate "Build a TODO API" --skip-tester
 
-# Skip both (minimal run — architecture + code only)
-codegen generate "Build a TODO API" --skip-reviewer --skip-tester
+# Skip tests and integration/security checkpoints (minimal verification)
+codegen generate "Build a TODO API" --skip-tester --skip-security --skip-integration
 ```
 
 ### Running without Docker

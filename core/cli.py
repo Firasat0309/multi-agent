@@ -57,8 +57,6 @@ def cli(verbose: bool) -> None:
     help="Allow running without Docker isolation (NOT recommended for untrusted prompts)",
 )
 @click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
-@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent (already off by default)")
-@click.option("--enable-reviewer", is_flag=True, default=False, help="Enable LLM code review (off by default — build checkpoint is more reliable)")
 @click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
 @click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
 @click.option("--resume", is_flag=True, default=False, help="Resume from last checkpoint — skip files that already PASSED")
@@ -79,8 +77,6 @@ def generate(
     no_interactive: bool,
     allow_host_execution: bool,
     skip_tester: bool,
-    skip_reviewer: bool,
-    enable_reviewer: bool,
     skip_security: bool,
     skip_integration: bool,
     resume: bool,
@@ -91,16 +87,10 @@ def generate(
         skip = set()
         if skip_tester:
             skip.add("tester")
-        if skip_reviewer:
-            skip.add("reviewer")
         if skip_security:
             skip.add("security")
         if skip_integration:
             skip.add("integration")
-
-        enable = set()
-        if enable_reviewer:
-            enable.add("reviewer")
 
         settings = Settings(
             workspace_dir=Path(workspace).resolve(),
@@ -112,7 +102,6 @@ def generate(
             max_concurrent_agents=max_agents,
             allow_host_execution=allow_host_execution or sandbox == "local",
             skip_agents=frozenset(skip),
-            enable_agents=frozenset(enable),
         )
 
         pipeline = Pipeline(settings, interactive=not no_interactive)
@@ -184,8 +173,6 @@ def status(workspace: str) -> None:
     help="Allow running without Docker isolation",
 )
 @click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
-@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent (already off by default)")
-@click.option("--enable-reviewer", is_flag=True, default=False, help="Enable LLM code review (off by default)")
 @click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
 @click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
 def enhance(
@@ -198,8 +185,6 @@ def enhance(
     no_interactive: bool,
     allow_host_execution: bool,
     skip_tester: bool,
-    skip_reviewer: bool,
-    enable_reviewer: bool,
     skip_security: bool,
     skip_integration: bool,
 ) -> None:
@@ -226,16 +211,10 @@ def enhance(
         skip = set()
         if skip_tester:
             skip.add("tester")
-        if skip_reviewer:
-            skip.add("reviewer")
         if skip_security:
             skip.add("security")
         if skip_integration:
             skip.add("integration")
-
-        enable = set()
-        if enable_reviewer:
-            enable.add("reviewer")
 
         settings = Settings(
             workspace_dir=ws,
@@ -247,7 +226,6 @@ def enhance(
             max_concurrent_agents=max_agents,
             allow_host_execution=allow_host_execution or sandbox == "local",
             skip_agents=frozenset(skip),
-            enable_agents=frozenset(enable),
         )
 
         pipeline = Pipeline(settings, interactive=not no_interactive)
@@ -290,8 +268,6 @@ def enhance(
     help="Allow running without Docker isolation (NOT recommended for untrusted prompts)",
 )
 @click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
-@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent (already off by default)")
-@click.option("--enable-reviewer", is_flag=True, default=False, help="Enable LLM code review (off by default)")
 @click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
 @click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
 @click.option(
@@ -312,8 +288,6 @@ def fullstack(
     figma_url: str,
     allow_host_execution: bool,
     skip_tester: bool,
-    skip_reviewer: bool,
-    enable_reviewer: bool,
     skip_security: bool,
     skip_integration: bool,
     contract_path: str | None,
@@ -336,16 +310,10 @@ def fullstack(
         skip = set()
         if skip_tester:
             skip.add("tester")
-        if skip_reviewer:
-            skip.add("reviewer")
         if skip_security:
             skip.add("security")
         if skip_integration:
             skip.add("integration")
-
-        enable = set()
-        if enable_reviewer:
-            enable.add("reviewer")
 
         settings = Settings(
             workspace_dir=Path(workspace).resolve(),
@@ -357,7 +325,6 @@ def fullstack(
             max_concurrent_agents=max_agents,
             allow_host_execution=allow_host_execution or sandbox == "local",
             skip_agents=frozenset(skip),
-            enable_agents=frozenset(enable),
         )
 
         pipeline = Pipeline(settings, interactive=not no_interactive)

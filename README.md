@@ -152,7 +152,6 @@ Options (all modes):
   --max-agents  INT     Concurrent agents (1–16)       default: 4
   --no-interactive      Disable live dashboard (CI mode)
   --skip-tester         Skip test generation
-  --skip-reviewer       Skip code review
   --allow-host-execution  Run without Docker isolation
 
 enhance only:
