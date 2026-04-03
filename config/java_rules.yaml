@@ -1,0 +1,29 @@
+# Java / Maven / Gradle path markers for package validation.
+# When a Java/Kotlin file resides under one of these directory markers,
+# its declared ``package`` statement must match the directory structure.
+
+java_package_markers:
+  - "src/main/java/"
+  - "src/test/java/"
+  - "src/main/kotlin/"
+  - "src/test/kotlin/"
+
+# Regex to extract a Java/Kotlin package declaration from source code.
+java_package_pattern: "^\\s*package\\s+([\\w.]+)\\s*;?"
+
+# Spring Boot defaults applied when generating pom.xml or build.gradle.
+spring_boot:
+  java_version: 17
+  parent_version: "3.2.0"
+  jjwt_version: "0.11.5"
+  jjwt_artifacts:
+    - "jjwt-api"
+    - "jjwt-impl"
+    - "jjwt-jackson"
+  default_starters:
+    - "spring-boot-starter-web"
+  security_starters:
+    - "spring-boot-starter-security"
+    - "spring-boot-starter-validation"
+  always_include:
+    - "lombok"

@@ -68,8 +68,22 @@ class DependencyGraphStore:
     def get_layers(self) -> dict[str, int]:
         """Compute layer numbers. Leaf nodes (no outgoing deps) are layer 0."""
         layers: dict[str, int] = {}
+        try:
+            ordered = list(nx.topological_sort(self._graph))
+        except nx.NetworkXUnfeasible:
+            logger.warning("Cycle detected in dependency graph — falling back to BFS layering")
+            # Break cycles by removing back-edges and retry
+            dag = self._graph.copy()
+            for cycle in nx.simple_cycles(dag):
+                if len(cycle) >= 2:
+                    dag.remove_edge(cycle[-1], cycle[0])
+            try:
+                ordered = list(nx.topological_sort(dag))
+            except nx.NetworkXUnfeasible:
+                # Still cyclic — assign all nodes layer 0
+                return {n: 0 for n in self._graph.nodes}
         # Reverse topological order: process leaves first
-        for node in reversed(list(nx.topological_sort(self._graph))):
+        for node in reversed(ordered):
             successors = list(self._graph.successors(node))
             if not successors:
                 layers[node] = 0

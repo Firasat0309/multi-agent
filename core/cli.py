@@ -14,19 +14,24 @@ from rich.panel import Panel
 from rich.table import Table
 
 from config.settings import Settings, LLMConfig, LLMProvider, SandboxConfig, SandboxType
+from core.feature_flags import init_features_from_env, freeze_features
+from core.log_redact import SecretRedactionFilter
 from core.pipeline import Pipeline, PipelineResult
 from core.llm_client import LLMConfigError
+from core.shutdown import install_signal_handlers
 
 console = Console()
 
 
 def setup_logging(verbose: bool = False) -> None:
     level = logging.DEBUG if verbose else logging.INFO
+    handler = RichHandler(console=console, rich_tracebacks=True)
+    handler.addFilter(SecretRedactionFilter())
     logging.basicConfig(
         level=level,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(console=console, rich_tracebacks=True)],
+        handlers=[handler],
     )
 
 
@@ -52,7 +57,8 @@ def cli(verbose: bool) -> None:
     help="Allow running without Docker isolation (NOT recommended for untrusted prompts)",
 )
 @click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
-@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent")
+@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent (already off by default)")
+@click.option("--enable-reviewer", is_flag=True, default=False, help="Enable LLM code review (off by default — build checkpoint is more reliable)")
 @click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
 @click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
 @click.option("--resume", is_flag=True, default=False, help="Resume from last checkpoint — skip files that already PASSED")
@@ -74,6 +80,7 @@ def generate(
     allow_host_execution: bool,
     skip_tester: bool,
     skip_reviewer: bool,
+    enable_reviewer: bool,
     skip_security: bool,
     skip_integration: bool,
     resume: bool,
@@ -91,6 +98,10 @@ def generate(
         if skip_integration:
             skip.add("integration")
 
+        enable = set()
+        if enable_reviewer:
+            enable.add("reviewer")
+
         settings = Settings(
             workspace_dir=Path(workspace).resolve(),
             llm=LLMConfig(
@@ -101,6 +112,7 @@ def generate(
             max_concurrent_agents=max_agents,
             allow_host_execution=allow_host_execution or sandbox == "local",
             skip_agents=frozenset(skip),
+            enable_agents=frozenset(enable),
         )
 
         pipeline = Pipeline(settings, interactive=not no_interactive)
@@ -172,7 +184,8 @@ def status(workspace: str) -> None:
     help="Allow running without Docker isolation",
 )
 @click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
-@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent")
+@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent (already off by default)")
+@click.option("--enable-reviewer", is_flag=True, default=False, help="Enable LLM code review (off by default)")
 @click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
 @click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
 def enhance(
@@ -186,6 +199,7 @@ def enhance(
     allow_host_execution: bool,
     skip_tester: bool,
     skip_reviewer: bool,
+    enable_reviewer: bool,
     skip_security: bool,
     skip_integration: bool,
 ) -> None:
@@ -219,6 +233,10 @@ def enhance(
         if skip_integration:
             skip.add("integration")
 
+        enable = set()
+        if enable_reviewer:
+            enable.add("reviewer")
+
         settings = Settings(
             workspace_dir=ws,
             llm=LLMConfig(
@@ -229,6 +247,7 @@ def enhance(
             max_concurrent_agents=max_agents,
             allow_host_execution=allow_host_execution or sandbox == "local",
             skip_agents=frozenset(skip),
+            enable_agents=frozenset(enable),
         )
 
         pipeline = Pipeline(settings, interactive=not no_interactive)
@@ -271,7 +290,8 @@ def enhance(
     help="Allow running without Docker isolation (NOT recommended for untrusted prompts)",
 )
 @click.option("--skip-tester", is_flag=True, default=False, help="Skip the test generation agent")
-@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent")
+@click.option("--skip-reviewer", is_flag=True, default=False, help="Skip the code review agent (already off by default)")
+@click.option("--enable-reviewer", is_flag=True, default=False, help="Enable LLM code review (off by default)")
 @click.option("--skip-security", is_flag=True, default=False, help="Skip the security hardening checkpoint")
 @click.option("--skip-integration", is_flag=True, default=False, help="Skip the integration test checkpoint")
 @click.option(
@@ -293,6 +313,7 @@ def fullstack(
     allow_host_execution: bool,
     skip_tester: bool,
     skip_reviewer: bool,
+    enable_reviewer: bool,
     skip_security: bool,
     skip_integration: bool,
     contract_path: str | None,
@@ -322,6 +343,10 @@ def fullstack(
         if skip_integration:
             skip.add("integration")
 
+        enable = set()
+        if enable_reviewer:
+            enable.add("reviewer")
+
         settings = Settings(
             workspace_dir=Path(workspace).resolve(),
             llm=LLMConfig(
@@ -332,6 +357,7 @@ def fullstack(
             max_concurrent_agents=max_agents,
             allow_host_execution=allow_host_execution or sandbox == "local",
             skip_agents=frozenset(skip),
+            enable_agents=frozenset(enable),
         )
 
         pipeline = Pipeline(settings, interactive=not no_interactive)
@@ -498,6 +524,9 @@ def _display_result(result: PipelineResult) -> None:
 
 
 def main() -> None:
+    install_signal_handlers()
+    init_features_from_env()
+    freeze_features()
     cli()
 
 

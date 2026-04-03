@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import shlex
 import shutil
 import tempfile
 from abc import ABC, abstractmethod
@@ -246,9 +248,12 @@ class DockerSandbox(SandboxBase):
 class LocalSandbox(SandboxBase):
     """Local sandbox for development/testing (no isolation)."""
 
-    def __init__(self) -> None:
+    _DEFAULT_TIMEOUT = 300  # seconds
+
+    def __init__(self, timeout: int = _DEFAULT_TIMEOUT) -> None:
         self._workspaces: dict[str, Path] = {}
         self._counter = 0
+        self._timeout = timeout
 
     async def create(self, workspace_path: Path, language_name: str = "python", tier: SandboxTier = SandboxTier.BUILD, cache_dir: Path | None = None) -> SandboxInfo:
         self._counter += 1
@@ -271,13 +276,40 @@ class LocalSandbox(SandboxBase):
         if not workspace:
             return CommandResult(exit_code=-1, stdout="", stderr="Sandbox not found")
 
-        proc = await asyncio.create_subprocess_shell(
-            command,
+        # Reject dangerous shell metacharacters that could escape the sandbox.
+        # Build/test commands are structured (e.g. "mvn test", "pytest src/").
+        _DANGEROUS = re.compile(r"[`$]|&&|\|\||;;\s*|>\s*/etc/|rm\s+-rf\s+/")
+        if _DANGEROUS.search(command):
+            logger.warning("Blocked potentially dangerous command in LocalSandbox: %s", command[:120])
+            return CommandResult(
+                exit_code=-1, stdout="",
+                stderr="Command rejected: contains disallowed shell metacharacters",
+            )
+
+        # Use subprocess list form via shlex to avoid shell interpretation
+        try:
+            argv = shlex.split(command)
+        except ValueError as e:
+            return CommandResult(exit_code=-1, stdout="", stderr=f"Invalid command: {e}")
+
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
             cwd=str(workspace),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=self._timeout,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return CommandResult(
+                exit_code=-1,
+                stdout="",
+                stderr=f"Command timed out after {self._timeout}s",
+            )
         return CommandResult(
             exit_code=proc.returncode or 0,
             stdout=stdout.decode("utf-8", errors="replace"),
@@ -322,7 +354,7 @@ class SandboxManager:
     def _create_sandbox_backend(self) -> SandboxBase:
         if self.config.sandbox_type == SandboxType.DOCKER:
             return DockerSandbox(self.config)
-        return LocalSandbox()
+        return LocalSandbox(timeout=self.config.timeout_seconds)
 
     async def create_sandbox(
         self,

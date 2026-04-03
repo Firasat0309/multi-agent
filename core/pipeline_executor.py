@@ -35,7 +35,10 @@ from typing import Any, TYPE_CHECKING
 from core.checkpoint import BuildCheckpoint, CheckpointCycleResult, CheckpointResult
 from core.error_attributor import CompilerErrorAttributor, extract_error_lines, llm_attribute
 from core.event_bus import AgentEvent, BusEventType
+from core.feature_flags import feature
+from core.hooks import HookEvent, HookRegistry
 from core.models import AgentContext, Task, TaskResult, TaskType
+from core.graceful_shutdown import shutdown_requested
 from core.state_machine import EventType, FilePhase, LifecycleEngine
 from core.stub_generator import StubGenerator
 from core.tier_scheduler import Tier, TierScheduler
@@ -56,6 +59,53 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class ReverifyState:
+    """Encapsulates the reverify queue, per-file depth counter, and lock.
+
+    The lock makes the drain operation (read-then-clear) atomic across
+    ``await`` points, preventing ``on_file_changed`` from interleaving an
+    insertion that the drain silently removes.
+    """
+
+    def __init__(self, max_depth: int = 5) -> None:
+        self._queue: set[str] = set()
+        self._counts: dict[str, int] = {}
+        self._lock = asyncio.Lock()
+        self.max_depth = max_depth
+
+    def try_enqueue(self, path: str, upstream: str) -> bool:
+        """Increment depth counter and return *True* if within budget.
+
+        If the file has already been queued ``max_depth`` times, log a
+        warning and return *False* so the caller can skip it.
+        """
+        count = self._counts.get(path, 0)
+        if count >= self.max_depth:
+            logger.warning(
+                "Reverify depth cap reached for %s "
+                "(queued %d times) — suppressing further "
+                "re-verifications (upstream: %s)",
+                path, count, upstream,
+            )
+            return False
+        self._counts[path] = count + 1
+        return True
+
+    def depth(self, path: str) -> int:
+        return self._counts.get(path, 0)
+
+    async def enqueue(self, paths: list[str]) -> None:
+        async with self._lock:
+            self._queue.update(paths)
+
+    async def drain(self, tier_files: set[str]) -> set[str]:
+        """Atomically drain and return entries overlapping *tier_files*."""
+        async with self._lock:
+            drained = self._queue & tier_files
+            self._queue -= drained
+        return drained
+
+
 class PipelineExecutor:
     """Unified tier-aware executor with repo-level build checkpoints.
 
@@ -71,35 +121,20 @@ class PipelineExecutor:
         lang_profile: LanguageProfile,
         *,
         event_bus: EventBus | None = None,
+        hook_registry: HookRegistry | None = None,
     ) -> None:
         self._am = agent_manager
         self._settings = settings
         self._lang = lang_profile
         self._compiled = bool(lang_profile.build_command)
         self._event_bus = event_bus
+        self._hooks = hook_registry or HookRegistry()
         self._tier_scheduler = TierScheduler()
 
         # Files queued for re-verification at the next checkpoint because
         # an upstream dependency was modified after they reached a terminal
         # or post-review phase.
-        #
-        # asyncio uses cooperative multitasking (single OS thread): two
-        # coroutines can never run truly simultaneously, but context switches
-        # DO occur at every ``await`` point.  Without a lock, a context switch
-        # between the set-intersection read and the set-difference write in
-        # _drain_reverify_queue() could allow on_file_changed() to insert a
-        # new entry that the drain then silently removes — losing a pending
-        # re-verification.  The lock makes that read-then-clear operation
-        # atomic across await points, preventing any such lost update.
-        self._reverify_queue: set[str] = set()
-        self._reverify_lock = asyncio.Lock()
-        # Per-file re-verification counter.  A file that is permanently broken
-        # (e.g. circular import that the fix agent can't resolve) will keep
-        # triggering FILE_WRITTEN events as it bounces between FIXING and
-        # GENERATING, queuing its dependents on each write.  Capping at
-        # _MAX_REVERIFY_DEPTH prevents this from becoming an infinite cascade.
-        self._reverify_counts: dict[str, int] = {}
-        self._MAX_REVERIFY_DEPTH = 5
+        self._reverify = ReverifyState(max_depth=settings.execution.max_reverify_depth)
 
     def _wire_event_bus(self, engine: LifecycleEngine) -> None:
         """Register event bus subscribers for cross-file coordination.
@@ -131,34 +166,22 @@ class PipelineExecutor:
                         # files still in early phases will naturally pick up changes.
                         if lc.phase in (FilePhase.BUILDING, FilePhase.TESTING,
                                         FilePhase.PASSED, FilePhase.DEGRADED):
-                            # Enforce depth cap — if this dependent has already
-                            # been queued _MAX_REVERIFY_DEPTH times, the upstream
-                            # file is likely in an unresolvable fix loop.  Stop
-                            # cascading to prevent the reverify queue growing
-                            # unboundedly and wasting LLM calls on each rebuild.
-                            count = self._reverify_counts.get(dep_path, 0)
-                            if count >= self._MAX_REVERIFY_DEPTH:
-                                logger.warning(
-                                    "Reverify depth cap reached for %s "
-                                    "(queued %d times) — suppressing further "
-                                    "re-verifications (upstream: %s)",
-                                    dep_path, count, event.file_path,
-                                )
-                                continue
-                            self._reverify_counts[dep_path] = count + 1
-                            to_queue.append(dep_path)
+                            if self._reverify.try_enqueue(dep_path, event.file_path):
+                                to_queue.append(dep_path)
                 if to_queue:
-                    async with self._reverify_lock:
-                        self._reverify_queue.update(to_queue)
+                    await self._reverify.enqueue(to_queue)
                     for dep_path in to_queue:
                         logger.debug(
                             "Queued %s for re-verification (upstream %s changed, depth=%d)",
                             dep_path, event.file_path,
-                            self._reverify_counts.get(dep_path, 0),
+                            self._reverify.depth(dep_path),
                         )
             except Exception:
-                logger.debug(
-                    "Could not compute dependents for %s", event.file_path,
+                logger.warning(
+                    "Could not compute dependents for %s — "
+                    "re-verification may be incomplete",
+                    event.file_path,
+                    exc_info=True,
                 )
 
         async def on_build_failed(event: AgentEvent) -> None:
@@ -217,6 +240,13 @@ class PipelineExecutor:
 
         # Wire up event bus subscribers for cross-file coordination.
         self._wire_event_bus(engine)
+
+        # Fire pipeline start hook
+        if feature("HOOK_SYSTEM"):
+            await self._hooks.fire(HookEvent.PIPELINE_START,
+                total_files=len(engine._lifecycles),
+                total_tiers=len(tiers) if tiers else 1,
+            )
 
         # If no tiers provided, treat all files as a single tier (backward compat)
         if tiers is None:
@@ -349,6 +379,16 @@ class PipelineExecutor:
 
                     # Persist lifecycle state after each tier for resume support.
                     self._save_lifecycle_state(engine)
+
+                    # For interpreted languages (no build checkpoint), files
+                    # reaching BUILDING must be auto-advanced to TESTING so
+                    # they don't stall.  The BUILDING phase only has value
+                    # when there's a compiler to run.
+                    if not ck_def:
+                        for path in tier.files:
+                            lc = engine.get_lifecycle(path)
+                            if lc.phase == FilePhase.BUILDING:
+                                engine.process_event(path, EventType.BUILD_PASSED)
 
                     if ck_def:
                         # Forward-reference stubs for later-tier files so this
@@ -503,7 +543,7 @@ class PipelineExecutor:
                 len(bus_failures), bus_failures,
             )
 
-        return {
+        result = {
             "stats": {
                 **global_stats,
                 "lifecycle_passed": lifecycle_summary["passed"],
@@ -529,6 +569,16 @@ class PipelineExecutor:
             "integration_checkpoint": integration_result,
         }
 
+        # Fire pipeline end hook
+        if feature("HOOK_SYSTEM"):
+            await self._hooks.fire(HookEvent.PIPELINE_END,
+                elapsed_seconds=elapsed,
+                passed=lifecycle_summary["passed"],
+                failed=lifecycle_summary["failed"],
+            )
+
+        return result
+
     # ── Tier lifecycle execution ─────────────────────────────────────────
 
     def _save_lifecycle_state(self, engine: LifecycleEngine) -> None:
@@ -547,15 +597,8 @@ class PipelineExecutor:
     async def _drain_reverify_queue(self, tier_files: set[str]) -> set[str]:
         """Atomically drain and return the subset of reverify-queue entries
         that belong to *tier_files*.
-
-        The lock makes the read-then-clear atomic so the ``on_file_changed``
-        event handler cannot interleave an insertion between the snapshot
-        and the removal, preventing duplicate processing of the same file.
         """
-        async with self._reverify_lock:
-            drained = self._reverify_queue & tier_files
-            self._reverify_queue -= drained
-        return drained
+        return await self._reverify.drain(tier_files)
 
     async def _run_tier_lifecycles(
         self,
@@ -630,6 +673,15 @@ class PipelineExecutor:
         deferred_phases = {FilePhase.BUILDING, FilePhase.TESTING}
 
         while True:
+            # ── Graceful shutdown: stop dispatching new work ──────────
+            if shutdown_requested():
+                logger.warning("[Tier %d] Shutdown requested — draining %d in-flight task(s)", tier.index, len(in_flight))
+                for t in list(running_tasks):
+                    t.cancel()
+                if running_tasks:
+                    await asyncio.gather(*list(running_tasks), return_exceptions=True)
+                break
+
             # Cascade failures: if any tier file FAILED (timeout, retries
             # exhausted), immediately fail all PENDING dependents rather
             # than waiting for the staleness timeout.
@@ -679,6 +731,7 @@ class PipelineExecutor:
                         try:
                             engine.process_event(path, EventType.RETRIES_EXHAUSTED)
                         except Exception:
+                            logger.warning("[%s] Failed to fire RETRIES_EXHAUSTED — forcing FAILED", path)
                             engine.get_lifecycle(path).phase = FilePhase.FAILED
                 break
 
@@ -695,8 +748,8 @@ class PipelineExecutor:
                 )
                 if done:
                     _last_progress = time.monotonic()
-            except Exception:
-                pass  # asyncio.wait itself should not raise; be defensive
+            except Exception as _wait_exc:
+                logger.debug("asyncio.wait raised unexpectedly: %s", _wait_exc)
 
             # Staleness check: if no progress was made and non-terminal files
             # remain in this tier (PENDING or early phases), diagnose explicitly.
@@ -724,6 +777,7 @@ class PipelineExecutor:
                         try:
                             engine.process_event(path, EventType.RETRIES_EXHAUSTED)
                         except Exception:
+                            logger.warning("[%s] Failed to fire RETRIES_EXHAUSTED — forcing FAILED", path)
                             lc.phase = FilePhase.FAILED
                     break
 
@@ -1143,6 +1197,15 @@ class PipelineExecutor:
                     in_flight.discard(path)
 
         while True:
+            # ── Graceful shutdown ─────────────────────────────────────
+            if shutdown_requested():
+                logger.warning("Shutdown requested — draining %d in-flight test task(s)", len(in_flight))
+                for t in list(running_tasks):
+                    t.cancel()
+                if running_tasks:
+                    await asyncio.gather(*list(running_tasks), return_exceptions=True)
+                break
+
             # Get files in TESTING or FIXING (test fix) phase
             actionable = [
                 (path, phase) for path, phase in engine.get_actionable_files()
@@ -1729,6 +1792,7 @@ class PipelineExecutor:
             if test_content is None:
                 test_content = "(could not read test file)"
         except Exception:
+            logger.debug("Could not read test file %s", test_file)
             test_content = "(could not read test file)"
 
         # Collect source file summaries

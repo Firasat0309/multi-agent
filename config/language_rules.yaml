@@ -1,0 +1,38 @@
+# Language-specific patterns for detecting duplicate top-level definitions.
+# Each language key maps to a regex pattern (Python re.MULTILINE) whose group 1
+# captures the identifier name.  If the same name appears more than once, the
+# content is flagged as having duplicate definitions.
+
+python:
+  duplicate_pattern: "^(?:class|def|async\\s+def)\\s+(\\w+)"
+  # Names that may legally repeat (empty for Python)
+  duplicates_allowed: []
+
+java:
+  duplicate_pattern: "^\\s*(?:public|private|protected)?\\s*(?:static\\s+)?(?:class|interface|enum|record)\\s+(\\w+)"
+  duplicates_allowed: []
+
+typescript:
+  duplicate_pattern: "^(?:export\\s+)?(?:class|interface|enum|function|const|type)\\s+(\\w+)"
+  duplicates_allowed: []
+
+go:
+  duplicate_pattern: "^(?:func|type)\\s+(\\w+)"
+  # Go permits multiple init() functions per file
+  duplicates_allowed: ["init"]
+
+csharp:
+  duplicate_pattern: "^\\s*(?:public|private|protected|internal)?\\s*(?:static\\s+)?(?:class|interface|enum|struct|record)\\s+(\\w+)"
+  duplicates_allowed: []
+
+rust:
+  duplicate_pattern: "^(?:pub\\s+)?(?:fn|struct|enum|trait|type)\\s+(\\w+)"
+  duplicates_allowed: []
+
+kotlin:
+  duplicate_pattern: "^\\s*(?:public|private|protected|internal)?\\s*(?:data\\s+)?(?:class|interface|enum|object|fun)\\s+(\\w+)"
+  duplicates_allowed: []
+
+ruby:
+  duplicate_pattern: "^\\s*(?:class|module|def)\\s+(\\w+)"
+  duplicates_allowed: []

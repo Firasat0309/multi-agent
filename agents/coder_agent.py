@@ -8,25 +8,33 @@ from pathlib import Path
 from typing import Any
 
 from agents.base_agent import BaseAgent
+from config.settings import ExecutionConfig
 from core.agent_tools import CODER_TOOLS, ToolDefinition
 from core.error_attributor import extract_error_lines
 from core.language import get_language_profile, LanguageProfile
+from core.language_rules import get_rules as get_language_rules
 from core.models import AgentContext, AgentRole, TaskResult, TaskType
+
+# Defaults loaded from ExecutionConfig so they stay in sync with the
+# central configuration.  Module-level references are used by free
+# functions (_validate_rewrite, _has_duplicate_definitions) that don't
+# have access to a Settings instance.
+_EXEC_DEFAULTS = ExecutionConfig()
 
 # Files with more lines than this threshold are modified via unified diff instead
 # of a full-file rewrite.  Diffs are ~5–20× cheaper in tokens for large files.
-_LARGE_FILE_THRESHOLD = 200
+_LARGE_FILE_THRESHOLD = _EXEC_DEFAULTS.large_file_threshold
 
 # Max chars of build/compiler output to include in fix prompts.
 # Maven can dump 50K+ chars; the relevant error lines are always near the end.
-_MAX_ERROR_CHARS = 3_000
+_MAX_ERROR_CHARS = _EXEC_DEFAULTS.max_error_chars
 # Max chars of a single related file included in fix context.
-_MAX_RELATED_FILE_CHARS = 2_000
+_MAX_RELATED_FILE_CHARS = _EXEC_DEFAULTS.max_related_file_chars
 
 # Maximum allowed content growth factor for fix/modify rewrites.
 # If new content exceeds original_size * this factor, the rewrite is rejected
 # as it likely contains duplicated code from LLM hallucination.
-_MAX_CONTENT_GROWTH = 1.35
+_MAX_CONTENT_GROWTH = _EXEC_DEFAULTS.max_content_growth
 
 logger = logging.getLogger(__name__)
 
@@ -36,23 +44,18 @@ def _has_duplicate_definitions(content: str, language: str) -> bool:
 
     Returns True if the same top-level definition name appears more than once,
     which is a strong signal of LLM output duplication.
+
+    Patterns are loaded from ``config/language_rules.yaml``.
     """
-    # Language-specific patterns for top-level definitions
-    patterns: dict[str, _re.Pattern[str]] = {
-        "python": _re.compile(r"^(?:class|def|async\s+def)\s+(\w+)", _re.MULTILINE),
-        "java": _re.compile(r"^\s*(?:public|private|protected)?\s*(?:static\s+)?(?:class|interface|enum|record)\s+(\w+)", _re.MULTILINE),
-        "typescript": _re.compile(r"^(?:export\s+)?(?:class|interface|enum|function|const|type)\s+(\w+)", _re.MULTILINE),
-        "go": _re.compile(r"^(?:func|type)\s+(\w+)", _re.MULTILINE),
-        "csharp": _re.compile(r"^\s*(?:public|private|protected|internal)?\s*(?:static\s+)?(?:class|interface|enum|struct|record)\s+(\w+)", _re.MULTILINE),
-        "rust": _re.compile(r"^(?:pub\s+)?(?:fn|struct|enum|trait|type)\s+(\w+)", _re.MULTILINE),
-    }
-    pattern = patterns.get(language)
+    from config.language_rule_loader import get_duplicate_pattern, get_duplicates_allowed
+
+    pattern = get_duplicate_pattern(language)
     if not pattern:
         return False
     names = pattern.findall(content)
-    if language == "go":
-        # Go permits multiple init functions per file; they should not be treated as duplicates.
-        names = [name for name in names if name != "init"]
+    allowed = set(get_duplicates_allowed(language))
+    if allowed:
+        names = [n for n in names if n not in allowed]
     return len(names) != len(set(names))
 
 
@@ -65,15 +68,15 @@ def _validate_rewrite(
 ) -> TaskResult | None:
     """Validate a code rewrite and return TaskResult if validation fails, None if valid.
 
-    Returns ``success=True`` with ``files_modified=[]`` when the rewrite is
-    rejected.  This is deliberate: in the lifecycle flow,
+    Returns ``success=True`` with ``files_modified=[]`` and
+    ``metrics={"rewrite_rejected": True}`` when the rewrite is rejected.
+    The pipeline executor checks for ``rewrite_rejected`` and fires
+    ``REWRITE_REJECTED`` instead of ``FIX_APPLIED`` so the file stays in
+    its current phase without consuming a fix budget.
+
     ``success=False`` fires ``RETRIES_EXHAUSTED`` which **immediately kills
     the file** — a single bad LLM output (probabilistic!) would permanently
     block the file and cascade failures to all downstream dependents.
-    ``success=True`` fires ``FIX_APPLIED`` instead, which sends the file back
-    through the review→fix cycle for another attempt.  It burns one review
-    round on unchanged code, but the file stays alive and the fix-count
-    budget eventually terminates the loop gracefully via DEGRADED.
 
     For the checkpoint path (``_dispatch_fix``), the return value is
     discarded anyway — the build simply re-runs regardless.
@@ -230,114 +233,9 @@ class CoderAgent(BaseAgent):
     def tools(self) -> list[ToolDefinition]:
         return CODER_TOOLS
 
-    # Per-language syntax rules injected into the system prompt so the LLM
-    # doesn't produce the most common syntax errors for that language.
-    _LANGUAGE_SYNTAX_RULES: dict[str, str] = {
-        "java": (
-            "\n\nCRITICAL Java syntax rules — every violation makes the file uncompilable:\n"
-            "- PACKAGE DECLARATION MUST match the file path exactly:\n"
-            "  File: src/main/java/com/example/auth/service/UserService.java\n"
-            "  → MUST declare: package com.example.auth.service;\n"
-            "  Extract the package from the path AFTER src/main/java/ (or src/test/java/).\n"
-            "  A wrong package causes 'package does not exist' build failures.\n"
-            "- Every import statement MUST end with a semicolon: `import java.util.List;`\n"
-            "- Every field/variable declaration MUST end with exactly ONE semicolon — NEVER `;;`\n"
-            "- serialVersionUID must be initialised: `private static final long serialVersionUID = 1L;`\n"
-            "- Every statement (assignment, return, method call, throw) MUST end with a semicolon\n"
-            "- Method/constructor signatures do NOT end with a semicolon — only close with `{}`\n"
-            "- Class/interface/enum declarations open with `{` and close with `}` — no trailing semicolon\n"
-            "- Annotations (@Override, @Autowired, @Entity) go on the line BEFORE the annotated element\n"
-            "- Generic type parameters use angle brackets: `List<String>`, not raw `List`\n"
-            "- Before writing the file, mentally scan every line for missing or duplicate semicolons\n"
-            "\n\nCRITICAL Spring Boot 3.x rules — these APIs were REMOVED and cause compile/startup failures:\n"
-            "- NEVER extend WebSecurityConfigurerAdapter — it was removed in Spring Boot 3.x.\n"
-            "  Use a @Bean SecurityFilterChain method instead:\n"
-            "    @Bean public SecurityFilterChain filterChain(HttpSecurity http) throws Exception { ... }\n"
-            "- NEVER use antMatchers() — removed in Spring Boot 3.x. Use requestMatchers() instead.\n"
-            "- NEVER use http.authorizeRequests() — deprecated. Use http.authorizeHttpRequests() instead.\n"
-            "- Use lambda DSL for ALL Spring Security configuration (not deprecated method-chaining):\n"
-            "    http.csrf(csrf -> csrf.disable())\n"
-            "    http.cors(cors -> cors.configurationSource(corsConfigurationSource()))\n"
-            "    http.sessionManagement(sm -> sm.sessionCreationPolicy(SessionCreationPolicy.STATELESS))\n"
-            "    http.authorizeHttpRequests(auth -> auth\n"
-            "        .requestMatchers(\"/api/v1/auth/**\").permitAll()\n"
-            "        .anyRequest().authenticated())\n"
-            "- For H2 console access: add .requestMatchers(\"/h2-console/**\").permitAll() and\n"
-            "    http.headers(h -> h.frameOptions(fo -> fo.disable()))\n"
-            "\n\nCRITICAL Spring Boot 3.x PasswordEncoder / circular-dependency rule:\n"
-            "- NEVER define the PasswordEncoder @Bean inside SecurityConfig if AuthService is also\n"
-            "  injected into SecurityConfig. This creates a circular dependency:\n"
-            "  SecurityConfig → AuthService → PasswordEncoder (defined in SecurityConfig) → CYCLE.\n"
-            "- ALWAYS define PasswordEncoder in a SEPARATE @Configuration class (e.g. AppConfig.java):\n"
-            "    @Configuration public class AppConfig {\n"
-            "        @Bean public PasswordEncoder passwordEncoder() { return new BCryptPasswordEncoder(); }\n"
-            "    }\n"
-            "- SecurityConfig should inject PasswordEncoder via constructor, NOT define it.\n"
-            "\n\nCRITICAL JWT filter registration rule:\n"
-            "- If JwtAuthenticationFilter extends OncePerRequestFilter, do NOT annotate it with\n"
-            "  @Component. Register it only inside SecurityConfig via addFilterBefore().\n"
-            "  Having BOTH @Component AND addFilterBefore() causes double execution.\n"
-            "\n\nCRITICAL JPA / Hibernate rules:\n"
-            "- Every @Entity class MUST have a no-argument constructor (public or protected).\n"
-            "  If using Lombok, add @NoArgsConstructor. Without it Hibernate throws\n"
-            "  'No default constructor for entity' at startup.\n"
-            "- Every @Entity class MUST have exactly one field annotated with @Id.\n"
-            "- Use @GeneratedValue(strategy = GenerationType.IDENTITY) for auto-increment IDs.\n"
-            "- Enum fields stored in the database MUST be annotated:\n"
-            "    @Enumerated(EnumType.STRING)\n"
-            "    @Column(nullable = false)\n"
-            "  Omitting @Enumerated stores ordinals (0,1,2) which breaks if enum order changes.\n"
-            "- Do NOT use FetchType.EAGER on @OneToMany — it causes N+1 queries and\n"
-            "  potential infinite recursion during JSON serialisation.\n"
-            "\n\nCRITICAL @SpringBootApplication package rule:\n"
-            "- @SpringBootApplication MUST be placed in the ROOT package that is the common\n"
-            "  parent of ALL sub-packages (controllers, services, repositories, models).\n"
-            "  E.g. if controllers are in com.example.auth.controller and services in\n"
-            "  com.example.auth.service, place @SpringBootApplication in com.example.auth\n"
-            "  so Spring scans all sub-packages automatically.\n"
-            "  If it is placed in a sub-package, beans in sibling packages will NOT be found.\n"
-            "\n\nCRITICAL JJWT version rule (use 0.11.x API — do NOT mix versions):\n"
-            "- Use io.jsonwebtoken:jjwt-api:0.11.5 + jjwt-impl:0.11.5 + jjwt-jackson:0.11.5\n"
-            "- Key creation: Keys.hmacShaKeyFor(secret.getBytes(StandardCharsets.UTF_8))\n"
-            "- Token build: Jwts.builder().setSubject(...).setIssuedAt(...)\n"
-            "    .setExpiration(...).signWith(key).compact()\n"
-            "- Token parse: Jwts.parserBuilder().setSigningKey(key).build().parseClaimsJws(token)\n"
-            "- DO NOT use the 0.9.x API (Jwts.parser().setSigningKey(string)) — incompatible.\n"
-            "- DO NOT use the 0.12.x API (Jwts.parser().verifyWith()) — incompatible with 0.11.x.\n"
-            "\n\nCRITICAL CORS rule for Spring Boot 3.x with Spring Security:\n"
-            "- Spring Security 3.x blocks CORS by default. You MUST define a CorsConfigurationSource\n"
-            "  @Bean and wire it into the SecurityFilterChain:\n"
-            "    @Bean public CorsConfigurationSource corsConfigurationSource() {\n"
-            "        CorsConfiguration cfg = new CorsConfiguration();\n"
-            "        cfg.setAllowedOrigins(List.of(\"http://localhost:5173\", \"http://localhost:3000\"));\n"
-            "        cfg.setAllowedMethods(List.of(\"GET\",\"POST\",\"PUT\",\"DELETE\",\"OPTIONS\"));\n"
-            "        cfg.setAllowedHeaders(List.of(\"*\"));\n"
-            "        cfg.setAllowCredentials(true);\n"
-            "        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();\n"
-            "        source.registerCorsConfiguration(\"/**\", cfg);\n"
-            "        return source;\n"
-            "    }"
-        ),
-        "typescript": (
-            "\n\nCRITICAL TypeScript syntax rules:\n"
-            "- Every import statement MUST end with a semicolon\n"
-            "- Every statement MUST end with a semicolon\n"
-            "- Use explicit return types on public functions and methods\n"
-            "- Interface and type declarations do NOT use `=` unless it is a type alias\n"
-            "- Decorators (@Injectable, @Component) go on the line BEFORE the class/method"
-        ),
-        "csharp": (
-            "\n\nCRITICAL C# syntax rules:\n"
-            "- Every using statement MUST end with a semicolon: `using System.Linq;`\n"
-            "- Every field/property/statement MUST end with a semicolon\n"
-            "- Attributes ([HttpGet], [Authorize]) go on the line BEFORE the annotated element\n"
-            "- Auto-properties use `{ get; set; }` syntax"
-        ),
-    }
-
     def _get_source_system_prompt(self, language: str) -> str:
         profile = get_language_profile(language)
-        lang_rules = self._LANGUAGE_SYNTAX_RULES.get(profile.name, "")
+        lang_rules = get_language_rules(profile.name)
         return (
             f"You are an expert {profile.display_name} developer agent working inside "
             f"an automated code generation pipeline.\n\n"
@@ -403,7 +301,7 @@ class CoderAgent(BaseAgent):
         # For compiled languages, embed a pre-write syntax reminder directly in
         # the user turn so the model sees it immediately before producing code.
         syntax_reminder = ""
-        lang_rules = self._LANGUAGE_SYNTAX_RULES.get(profile.name, "")
+        lang_rules = get_language_rules(profile.name)
         if lang_rules:
             syntax_reminder = (
                 f"\n\nBefore calling write_file, verify every line of your code against "
@@ -1100,7 +998,7 @@ class CoderAgent(BaseAgent):
         fb = context.file_blueprint
         lang = (fb.language if fb else None) or context.blueprint.tech_stack.get("language", "python")
         profile = get_language_profile(lang)
-        logger.info(f"Fixing {file_path} based on {len(review_errors)} review issue(s)")
+        logger.info(f"Fixing {file_path} based on fix_trigger={fix_trigger!r}")
 
         # ── Cap error text to avoid token explosion ──────────────────────────
         # Build output (Maven, javac, tsc) can be 50K+ chars.  Use
@@ -1159,7 +1057,7 @@ class CoderAgent(BaseAgent):
 
         # For compiled languages add an explicit post-fix syntax checklist so the
         # model validates its own output before returning.
-        syntax_checklist = self._LANGUAGE_SYNTAX_RULES.get(profile.name, "")
+        syntax_checklist = get_language_rules(profile.name)
         if syntax_checklist:
             syntax_note = (
                 f"\n\nAfter writing the fixed code, verify:\n"

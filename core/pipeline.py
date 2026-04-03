@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from config.settings import Settings
+from core.graceful_shutdown import install_shutdown_handlers
 from core.llm_client import LLMClient
 from core.live_console import LiveConsole, LiveConsoleHandler
 from core.models import RepositoryBlueprint, ChangePlan, RepoAnalysis, TokenCost
@@ -47,6 +48,9 @@ class Pipeline:
         self.interactive = interactive
         self._live: LiveConsole | None = None
         self.llm = LLMClient(self.settings.llm)
+        if self.settings.max_cost_usd > 0:
+            self.llm.max_cost_usd = self.settings.max_cost_usd
+        install_shutdown_handlers()
 
     # ── Public API ────────────────────────────────────────────────────────────
 

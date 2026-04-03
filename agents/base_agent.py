@@ -13,10 +13,13 @@ from typing import Any
 # reduce round-trips for typical class/function sizes.
 _READ_CHUNK_LINES = 150
 
-from core.agent_tools import ToolDefinition
+from core.agent_tools import ToolDefinition, validate_tool_input, validate_tool_input_strict
+from config.settings import ExecutionConfig
+from core.context_compaction import compact_messages
 from core.language import get_language_profile
-from core.llm_client import LLMClient, ToolCall
+from core.llm_client import LLMClient, LLMConfigError, ToolCall
 from core.models import AgentContext, AgentRole, TaskResult
+from core.permissions import ToolPermissionChecker
 from core.repository_manager import RepositoryManager
 from core.mcp_client import MCPClient
 from tools.code_search import CodeSearch
@@ -36,12 +39,16 @@ class BaseAgent(ABC):
         llm_client: LLMClient,
         repo_manager: RepositoryManager,
         mcp_client: MCPClient | None = None,
+        execution_config: ExecutionConfig | None = None,
+        permission_checker: ToolPermissionChecker | None = None,
     ) -> None:
         self.llm = llm_client
         self.repo = repo_manager
         self._mcp_client = mcp_client
         self._mcp_tools: list[ToolDefinition] = []
         self._metrics: dict[str, Any] = {"llm_calls": 0, "tokens_used": 0}
+        self._exec = execution_config or ExecutionConfig()
+        self._permission_checker = permission_checker
         # Tool helpers are created once per agent instance and reused across all
         # tool dispatch calls — avoiding per-call re-instantiation overhead.
         self._code_search = CodeSearch(repo_manager.workspace)
@@ -135,7 +142,7 @@ class BaseAgent(ABC):
         files_written: list[str] = []
         max_iterations = self.max_iterations
         _target = (context.file_blueprint.path if context.file_blueprint else None) or "task"
-        _heartbeat_interval = 15  # seconds between "still waiting" log lines
+        _heartbeat_interval = self._exec.heartbeat_interval
         _max_tokens = self._estimate_max_tokens(context)
 
         async def _llm_call_with_heartbeat(iteration: int) -> "LLMResponseWithTools":
@@ -199,16 +206,25 @@ class BaseAgent(ABC):
         _MAX_LLM_ERRORS = 3  # give up after this many consecutive failures
 
         for iteration in range(max_iterations):
+            # Compact message history if it has grown too large for the
+            # context window.  This preserves the initial prompt and the
+            # most recent tool interactions.
+            messages = compact_messages(messages)
+
             try:
                 response = await _llm_call_with_heartbeat(iteration)
+            except (LLMConfigError, KeyboardInterrupt, SystemExit):
+                # Non-retryable errors surface immediately.
+                raise
             except Exception as llm_exc:
                 # Transient LLM errors (500s, rate limits, blocked responses)
                 # should consume an iteration rather than crash the agent.
                 _llm_errors += 1
                 logger.warning(
-                    "%s: LLM call failed (iter %d, error %d/%d): %s",
+                    "%s: LLM call failed (iter %d, error %d/%d, type=%s): %s",
                     self.__class__.__name__, iteration,
-                    _llm_errors, _MAX_LLM_ERRORS, str(llm_exc)[:150],
+                    _llm_errors, _MAX_LLM_ERRORS,
+                    type(llm_exc).__name__, str(llm_exc)[:150],
                 )
                 if _llm_errors >= _MAX_LLM_ERRORS:
                     raise  # give up after repeated failures
@@ -226,20 +242,7 @@ class BaseAgent(ABC):
                     and iteration < max_iterations - 1
                 )
                 if _file_missing:
-                    # Extract the longest code block from the text response.
-                    # Gemini frequently outputs file content as plain text
-                    # instead of calling write_file.
-                    import re as _re
-                    text = response.content or ""
-                    code_block: str | None = None
-                    if "```" in text:
-                        blocks = _re.findall(
-                            r"```(?:\w+)?\n(.*?)```", text, _re.DOTALL,
-                        )
-                        if blocks:
-                            longest = max(blocks, key=len)
-                            if len(longest.strip()) > 50:
-                                code_block = longest
+                    code_block = self._extract_code_block(response.content or "")
 
                     if _end_turn_reminders < _MAX_END_TURN_REMINDERS:
                         # First attempts: ask the LLM to use write_file.
@@ -368,11 +371,27 @@ class BaseAgent(ABC):
                 # condition no longer applies (before halfway, or file written).
                 _consecutive_nudges = 0
 
-            # Execute all tool calls concurrently.
+            # Execute tool calls: safe tools run concurrently, unsafe ones sequentially.
+            safe_tools = {t.name for t in self.tools if t.is_concurrency_safe}
+
             async def _run_one(tc: ToolCall) -> str:
                 return await self._dispatch_tool(context, tc)
 
-            results = await asyncio.gather(*[_run_one(tc) for tc in response.tool_calls])
+            # Partition into safe (parallel) and unsafe (sequential) batches.
+            safe_calls = [(i, tc) for i, tc in enumerate(response.tool_calls) if tc.name in safe_tools]
+            unsafe_calls = [(i, tc) for i, tc in enumerate(response.tool_calls) if tc.name not in safe_tools]
+
+            results = [None] * len(response.tool_calls)  # type: ignore[assignment]
+
+            # Run safe tools concurrently
+            if safe_calls:
+                safe_results = await asyncio.gather(*[_run_one(tc) for _, tc in safe_calls])
+                for (idx, _), res in zip(safe_calls, safe_results):
+                    results[idx] = res  # type: ignore[assignment]
+
+            # Run unsafe tools sequentially (order-preserving)
+            for idx, tc in unsafe_calls:
+                results[idx] = await _run_one(tc)  # type: ignore[assignment]
 
             tool_results: list[dict] = []
             for tc, result in zip(response.tool_calls, results):
@@ -455,25 +474,16 @@ class BaseAgent(ABC):
             # After _MAX_STAGNANT_ITERATIONS consecutive stagnant iters, treat
             # the agent as done rather than raising RuntimeError.
             if target_file is None and files_written:
-                _this_iter_wrote = any(
-                    tc.name == "write_file" and not result.startswith("Error")
-                    for tc, result in zip(response.tool_calls or [], results if response.tool_calls else [])
+                _stagnant_iterations, should_stop = self._check_stagnation(
+                    response.tool_calls or [],
+                    results if response.tool_calls else [],
+                    _stagnant_iterations,
+                    _MAX_STAGNANT_ITERATIONS,
+                    self.__class__.__name__,
+                    files_written,
                 )
-                if _this_iter_wrote:
-                    _stagnant_iterations = 0
-                else:
-                    _stagnant_iterations += 1
-                    logger.warning(
-                        "%s: no new file written this iteration (%d/%d stagnant, %d files so far)",
-                        self.__class__.__name__, _stagnant_iterations,
-                        _MAX_STAGNANT_ITERATIONS, len(files_written),
-                    )
-                    if _stagnant_iterations >= _MAX_STAGNANT_ITERATIONS:
-                        logger.info(
-                            "%s: stagnation limit reached — treating %d written file(s) as complete",
-                            self.__class__.__name__, len(files_written),
-                        )
-                        return self._parse_agentic_result(context, response.content, files_written)
+                if should_stop:
+                    return self._parse_agentic_result(context, response.content, files_written)
 
         raise RuntimeError(
             f"{self.__class__.__name__} exceeded max_iterations ({max_iterations}) "
@@ -529,9 +539,74 @@ class BaseAgent(ABC):
             metrics=self.get_metrics(),
         )
 
-    # Timeout in seconds for individual tool handler calls (read_file, write_file, etc.).
-    # Prevents the agentic loop from hanging indefinitely if underlying I/O stalls.
-    _TOOL_TIMEOUT_SECONDS: float = 60.0
+    # Timeout for individual tool calls is read from self._exec.tool_timeout_seconds
+    # (set in __init__ from ExecutionConfig).
+
+    @staticmethod
+    def _extract_code_block(text: str) -> str | None:
+        """Return the longest fenced code block from *text*, or ``None``.
+
+        Gemini frequently outputs file content as plain text instead of
+        calling ``write_file``.  This extracts the most substantial block
+        so the end-turn recovery logic can auto-write it.
+        """
+        import re as _re
+        if "```" not in text:
+            return None
+        blocks = _re.findall(r"```(?:\w+)?\n(.*?)```", text, _re.DOTALL)
+        if not blocks:
+            return None
+        longest = max(blocks, key=len)
+        return longest if len(longest.strip()) > 50 else None
+
+    @staticmethod
+    def _check_stagnation(
+        tool_calls: list,
+        results: list[str],
+        stagnant_count: int,
+        max_stagnant: int,
+        agent_name: str,
+        files_written: list[str],
+    ) -> tuple[int, bool]:
+        """Update stagnation counter and return (new_count, should_stop).
+
+        A stagnant iteration is one where the agent has files written but
+        produces no new writes this turn AND made no read/search calls
+        (i.e., it's truly doing nothing productive).  Read-only iterations
+        are treated as research, not stagnation.
+        """
+        wrote_this_iter = any(
+            tc.name == "write_file" and not result.startswith("Error")
+            for tc, result in zip(tool_calls, results)
+        )
+        if wrote_this_iter:
+            return 0, False
+
+        # If the agent made read/search calls this turn, it's actively
+        # researching — only count as half-stagnant (requires 2× the
+        # limit of idle iterations to trigger).
+        read_calls = sum(
+            1 for tc in tool_calls
+            if tc.name in ("read_file", "search_code", "find_definition", "list_files")
+        )
+        if read_calls > 0:
+            # Still doing research — increase counter at half rate
+            stagnant_count += 0.5  # type: ignore[assignment]
+        else:
+            stagnant_count += 1
+
+        stagnant_int = int(stagnant_count)
+        logger.warning(
+            "%s: no new file written this iteration (%.1f/%d stagnant, %d files so far)",
+            agent_name, stagnant_count, max_stagnant, len(files_written),
+        )
+        if stagnant_int >= max_stagnant:
+            logger.info(
+                "%s: stagnation limit reached — treating %d written file(s) as complete",
+                agent_name, len(files_written),
+            )
+            return stagnant_count, True  # type: ignore[return-value]
+        return stagnant_count, False  # type: ignore[return-value]
 
     async def _dispatch_tool(self, context: AgentContext, tc: ToolCall) -> str:
         """Dispatch a tool call to the appropriate handler.
@@ -541,6 +616,22 @@ class BaseAgent(ABC):
         Each handler is wrapped with a timeout to prevent the agentic loop
         from hanging if underlying I/O stalls.
         """
+        # ── Permission checks (when a checker is configured) ──────────────
+        if self._permission_checker is not None:
+            agent_name = self.role.value if hasattr(self, "role") else "unknown"
+            if tc.name in ("write_file", "apply_patch"):
+                path = tc.input.get("path", "")
+                result = self._permission_checker.check_write(path, agent_name=agent_name)
+                if not result.allowed:
+                    logger.warning("Permission denied for %s on %s: %s", tc.name, path, result.reason)
+                    return f"Error: permission denied — {result.reason}"
+
+        # Validate input against JSON Schema (strict with Pydantic when available).
+        validation_err = validate_tool_input_strict(tc.name, tc.input)
+        if validation_err is not None:
+            logger.warning("Tool input validation failed for %s: %s", tc.name, validation_err)
+            return f"Error: {validation_err}"
+
         handlers = {
             "read_file":       self._tool_read_file,
             "write_file":      self._tool_write_file,
@@ -557,11 +648,11 @@ class BaseAgent(ABC):
                 try:
                     return await asyncio.wait_for(
                         self._mcp_client.execute_tool(tc.name, tc.input),
-                        timeout=self._TOOL_TIMEOUT_SECONDS,
+                        timeout=self._exec.tool_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
-                    logger.warning("MCP tool %s timed out after %.0fs", tc.name, self._TOOL_TIMEOUT_SECONDS)
-                    return f"Error: MCP tool '{tc.name}' timed out after {self._TOOL_TIMEOUT_SECONDS:.0f}s"
+                    logger.warning("MCP tool %s timed out after %.0fs", tc.name, self._exec.tool_timeout_seconds)
+                    return f"Error: MCP tool '{tc.name}' timed out after {self._exec.tool_timeout_seconds:.0f}s"
                 except Exception as exc:
                     logger.warning("MCP Tool %s execution raised: %s", tc.name, exc)
                     return f"Error executing MCP tool: {exc}"
@@ -570,15 +661,15 @@ class BaseAgent(ABC):
         try:
             return await asyncio.wait_for(
                 handler(tc.input),
-                timeout=self._TOOL_TIMEOUT_SECONDS,
+                timeout=self._exec.tool_timeout_seconds,
             )
         except asyncio.TimeoutError:
             logger.warning(
                 "Tool %s timed out after %.0fs for %s",
-                tc.name, self._TOOL_TIMEOUT_SECONDS,
+                tc.name, self._exec.tool_timeout_seconds,
                 context.file_blueprint.path if context.file_blueprint else "unknown",
             )
-            return f"Error: tool '{tc.name}' timed out after {self._TOOL_TIMEOUT_SECONDS:.0f}s"
+            return f"Error: tool '{tc.name}' timed out after {self._exec.tool_timeout_seconds:.0f}s"
         except Exception as exc:
             logger.warning("Tool %s raised: %s", tc.name, exc)
             return f"Error: {exc}"

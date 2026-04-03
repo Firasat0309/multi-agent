@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from config.settings import ExecutionConfig
 from core.ast_extractor import ASTExtractor
 from core.language import detect_language_from_blueprint
 from core.models import (
@@ -25,23 +27,6 @@ if TYPE_CHECKING:
     from memory.embedding_store import EmbeddingStore
 
 logger = logging.getLogger(__name__)
-
-# Hard cap on files included in wide-scope reviews to avoid context overflow.
-_MAX_REVIEW_FILES = 20
-# Hard cap on total characters across all related files sent to the LLM.
-_MAX_CONTEXT_CHARS = 120_000
-# Max semantic hits to include from vector search per task.
-_MAX_SEMANTIC_HITS = 3
-# Maximum direct-dependency files included regardless of project size.
-# Prevents a file with 30+ imports from flooding the context window.
-_MAX_DIRECT_DEPS = 10
-# Per-dep char budget for non-stub (full-source) fallbacks.  Reduced for
-# large projects where many deps compete for the same context budget.
-_DEP_TRUNCATE_LARGE = 4_000   # >50 blueprint files
-_DEP_TRUNCATE_SMALL = 8_000   # ≤50 blueprint files
-# Maximum files from the same architectural layer in a single context.
-# Prevents "controller soup" where 8 controllers drown out a critical model.
-_MAX_SAME_LAYER = 3
 
 # Shared extractor instance (stateless aside from cache)
 _ast_extractor = ASTExtractor()
@@ -157,6 +142,7 @@ class ContextBuilder:
         dep_store: DependencyGraphStore | None = None,
         embedding_store: EmbeddingStore | None = None,
         api_contract: APIContract | None = None,
+        execution_config: ExecutionConfig | None = None,
     ) -> None:
         self.workspace = workspace_dir
         self.blueprint = blueprint
@@ -164,6 +150,13 @@ class ContextBuilder:
         self._dep_store = dep_store
         self._embedding_store = embedding_store
         self._api_contract = api_contract
+        self._exec = execution_config or ExecutionConfig()
+        # File read cache: path → (content, mtime).  Avoids re-reading
+        # unchanged files during the same pipeline run.  Invalidated when
+        # the file's mtime changes (e.g. after a fix cycle writes new code).
+        # Bounded to 256 entries (LRU eviction) to prevent unbounded growth.
+        self._file_cache: OrderedDict[Path, tuple[str, float]] = OrderedDict()
+        self._file_cache_max = 256
 
     def build(self, task: Task) -> AgentContext:
         """Build context for a specific task using priority-ordered file collection."""
@@ -231,7 +224,7 @@ class ContextBuilder:
         if file_bp:
             n_total_files = len(self.blueprint.file_blueprints)
             dep_truncate = (
-                _DEP_TRUNCATE_LARGE if n_total_files > 50 else _DEP_TRUNCATE_SMALL
+                self._exec.dep_truncate_large if n_total_files > 50 else self._exec.dep_truncate_small
             )
             # Sort deps: prefer files that are in the same layer as the target
             # (e.g. service depending on other services) over generic utils.
@@ -242,7 +235,7 @@ class ContextBuilder:
                 else 1
             ))
 
-            for dep_path in dep_paths[:_MAX_DIRECT_DEPS]:
+            for dep_path in dep_paths[:self._exec.max_direct_deps]:
                 content = self._read_file(dep_path)
                 if content is None:
                     continue
@@ -284,7 +277,7 @@ class ContextBuilder:
                 file_index = self.repo_index.get_file(ref_path)
                 checksum = file_index.checksum if file_index else ""
                 stub = _ast_extractor.extract_stub(ref_path, content, lang.name, checksum)
-                body = stub if stub else _smart_truncate(content, _DEP_TRUNCATE_SMALL)
+                body = stub if stub else _smart_truncate(content, self._exec.dep_truncate_small)
                 candidates.append(ContextFile(
                     path=ref_path,
                     content=f"// Referenced in build error — use these EXACT signatures\n{body}",
@@ -303,12 +296,12 @@ class ContextBuilder:
             try:
                 hits = self._embedding_store.search(
                     task.description,
-                    n_results=_MAX_SEMANTIC_HITS + 10,
+                    n_results=self._exec.max_semantic_hits + 10,
                 )
                 already = {c.path for c in candidates}
                 sem_added = 0
                 for hit in hits:
-                    if sem_added >= _MAX_SEMANTIC_HITS:
+                    if sem_added >= self._exec.max_semantic_hits:
                         break
                     fp = hit.get("file", "")
                     if not fp or fp in already:
@@ -381,7 +374,7 @@ class ContextBuilder:
         for cf in candidates:
             if cf.path in result:
                 continue  # already included (e.g. target file appears as dep too)
-            if total + len(cf.content) > _MAX_CONTEXT_CHARS:
+            if total + len(cf.content) > self._exec.max_context_chars:
                 logger.debug(
                     "Context budget reached (%d chars), skipping %s (priority=%d)",
                     total, cf.path, cf.priority,
@@ -391,10 +384,10 @@ class ContextBuilder:
             # one layer from flooding the context window.
             if cf.priority > 1:
                 layer = _layer_of(cf.path)
-                if layer_counts.get(layer, 0) >= _MAX_SAME_LAYER:
+                if layer_counts.get(layer, 0) >= self._exec.max_same_layer:
                     logger.debug(
                         "Layer cap reached for '%s' (%d files), skipping %s",
-                        layer, _MAX_SAME_LAYER, cf.path,
+                        layer, self._exec.max_same_layer, cf.path,
                     )
                     continue
                 layer_counts[layer] = layer_counts.get(layer, 0) + 1
@@ -406,7 +399,7 @@ class ContextBuilder:
     # ── Review-file ranking ───────────────────────────────────────────────────
 
     def _rank_review_files(self, task: Task) -> list[FileBlueprint]:
-        """Return up to ``_MAX_REVIEW_FILES`` blueprint files ranked by relevance.
+        """Return up to ``max_context_files`` blueprint files ranked by relevance.
 
         REVIEW_MODULE — prioritises by directory proximity to ``task.file``,
         then by same architectural layer, then by dependency overlap.
@@ -451,7 +444,7 @@ class ContextBuilder:
             return 0.5
 
         ranked = sorted(self.blueprint.file_blueprints, key=_score, reverse=True)
-        return ranked[:_MAX_REVIEW_FILES]
+        return ranked[:self._exec.max_context_files]
 
     def _rank_module_review_by_language(self) -> list[FileBlueprint]:
         """For whole-project module reviews, group files by language and
@@ -467,7 +460,7 @@ class ContextBuilder:
             by_lang.setdefault(lang, []).append(fb)
 
         if not by_lang:
-            return self.blueprint.file_blueprints[:_MAX_REVIEW_FILES]
+            return self.blueprint.file_blueprints[:self._exec.max_context_files]
 
         # Pick the largest language group (primary backend language)
         primary_lang = max(by_lang, key=lambda k: len(by_lang[k]))
@@ -484,7 +477,7 @@ class ContextBuilder:
             return _LAYER_PRIORITY.get(fb.layer or "", 10)
 
         primary_files.sort(key=_layer_score)
-        return primary_files[:_MAX_REVIEW_FILES]
+        return primary_files[:self._exec.max_context_files]
 
     def _rank_architecture_review_files(self) -> list[FileBlueprint]:
         """Sample files proportionally across all architectural layers.
@@ -513,9 +506,9 @@ class ContextBuilder:
 
         n_layers = len(by_layer)
         if n_layers == 0:
-            return source_files[:_MAX_REVIEW_FILES]
+            return source_files[:self._exec.max_context_files]
 
-        per_layer = max(1, _MAX_REVIEW_FILES // n_layers)
+        per_layer = max(1, self._exec.max_context_files // n_layers)
         result: list[FileBlueprint] = []
         seen: set[str] = set()
 
@@ -525,9 +518,9 @@ class ContextBuilder:
                 seen.add(fb.path)
 
         # Fill remaining budget from whichever layers had extras
-        if len(result) < _MAX_REVIEW_FILES:
+        if len(result) < self._exec.max_context_files:
             for fb in source_files:
-                if len(result) >= _MAX_REVIEW_FILES:
+                if len(result) >= self._exec.max_context_files:
                     break
                 if fb.path not in seen:
                     result.append(fb)
@@ -550,7 +543,17 @@ class ContextBuilder:
         for path in candidates:
             if path.exists():
                 try:
-                    return path.read_text(encoding="utf-8")
+                    mtime = path.stat().st_mtime
+                    cached = self._file_cache.get(path)
+                    if cached is not None and cached[1] == mtime:
+                        self._file_cache.move_to_end(path)
+                        return cached[0]
+                    content = path.read_text(encoding="utf-8")
+                    self._file_cache[path] = (content, mtime)
+                    self._file_cache.move_to_end(path)
+                    if len(self._file_cache) > self._file_cache_max:
+                        self._file_cache.popitem(last=False)
+                    return content
                 except Exception:
                     logger.warning(f"Failed to read {path}")
         return None

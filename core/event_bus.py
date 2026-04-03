@@ -105,6 +105,15 @@ class EventBus:
         """Register *handler* to be called whenever *event_type* is published."""
         self._handlers[event_type].append(handler)
 
+    def unsubscribe(self, event_type: BusEventType, handler: Handler) -> bool:
+        """Remove *handler* from *event_type*.  Returns True if found."""
+        handlers = self._handlers[event_type]
+        try:
+            handlers.remove(handler)
+            return True
+        except ValueError:
+            return False
+
     def subscribe_critical(self, event_type: BusEventType, handler: Handler) -> None:
         """Register a *critical* handler that is called whenever *event_type* is
         published.
@@ -115,9 +124,25 @@ class EventBus:
         """
         self._critical_handlers[event_type].append(handler)
 
+    def unsubscribe_critical(self, event_type: BusEventType, handler: Handler) -> bool:
+        """Remove a critical *handler*.  Returns True if found."""
+        handlers = self._critical_handlers[event_type]
+        try:
+            handlers.remove(handler)
+            return True
+        except ValueError:
+            return False
+
     def subscribe_all(self, handler: Handler) -> None:
         """Register *handler* to be called for every published event."""
         self._catch_all.append(handler)
+
+    def reset(self) -> None:
+        """Remove all handlers and clear failures.  Useful for test isolation."""
+        self._handlers.clear()
+        self._critical_handlers.clear()
+        self._catch_all.clear()
+        self.handler_failures.clear()
 
     def has_failures(self) -> bool:
         """Return True if any critical handler has recorded a failure."""

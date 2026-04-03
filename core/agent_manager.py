@@ -259,11 +259,17 @@ class AgentManager:
             engine.process_event(file_path, EventType.DEPS_MET)
             phase = lc.phase  # now GENERATING
 
-        # --skip-reviewer: auto-pass review phases
-        if phase == FilePhase.REVIEWING and "reviewer" in self.settings.skip_agents:
-            logger.info("[%s] Skipping review (--skip-reviewer)", file_path)
-            engine.process_event(file_path, EventType.REVIEW_PASSED)
-            return
+        # Review gating: review is SKIPPED by default to save LLM calls.
+        # The build checkpoint catches compile errors more reliably.
+        # Use --enable-reviewer to opt in, or legacy --skip-reviewer is
+        # still respected for backward compatibility.
+        if phase == FilePhase.REVIEWING:
+            reviewer_enabled = "reviewer" in self.settings.enable_agents
+            reviewer_force_skipped = "reviewer" in self.settings.skip_agents
+            if reviewer_force_skipped or not reviewer_enabled:
+                logger.info("[%s] Skipping review (reviewer not enabled)", file_path)
+                engine.process_event(file_path, EventType.REVIEW_PASSED)
+                return
 
         config = self._get_phase_config(phase, lc, file_path)
         if config is None:
@@ -443,7 +449,13 @@ class AgentManager:
         elif result.success:
             self._metrics["tasks_completed"] += 1
             event_data = self._extract_event_data(result, config["task_type"])
-            engine.process_event(file_path, config["success_event"], event_data)
+            # If the coder agent rejected the rewrite (e.g. content growth,
+            # duplicate definitions), fire REWRITE_REJECTED so the file stays
+            # in its current phase without consuming a fix-budget slot.
+            if result.metrics and result.metrics.get("rewrite_rejected"):
+                engine.process_event(file_path, EventType.REWRITE_REJECTED, event_data)
+            else:
+                engine.process_event(file_path, config["success_event"], event_data)
             logger.info("[%s] %s succeeded", file_path, phase.value)
             # Incremental embedding update for lifecycle path
             if self._embedding_store and result.files_modified:

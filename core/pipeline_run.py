@@ -17,6 +17,7 @@ from core.llm_client import LLMClient, LLMConfigError, calculate_cost
 from core.models import APIContract, RepositoryBlueprint, TokenCost
 from core.run_reporter import RunReporter
 from core.sandbox_orchestrator import SandboxOrchestrator, SandboxUnavailableError
+from core.shutdown import register_resource, unregister_resource
 from core.pipeline_definition import GENERATE_PIPELINE
 from core.tier_scheduler import TierScheduler
 from core.workspace_indexer import index_workspace
@@ -282,6 +283,7 @@ class RunPipeline:
             logger.info("[Phase 3] Executing tasks...")
 
             sandbox = SandboxOrchestrator(self._settings)
+            register_resource(sandbox)
             try:
                 sb = await sandbox.setup(lang_profile)
             except SandboxUnavailableError as e:
@@ -459,6 +461,7 @@ class RunPipeline:
             try:
                 if "sandbox" in locals():
                     await sandbox.teardown()
+                    unregister_resource(sandbox)
             except Exception:
                 logger.warning("Error during sandbox teardown", exc_info=True)
             if mcp_client:
@@ -614,6 +617,7 @@ class RunPipeline:
         repo_manager.initialize(blueprint)
 
         sandbox = SandboxOrchestrator(self._settings)
+        register_resource(sandbox)
         try:
             sb = await sandbox.setup(lang_profile)
         except SandboxUnavailableError as e:
@@ -765,6 +769,7 @@ class RunPipeline:
         finally:
             try:
                 await sandbox.teardown()
+                unregister_resource(sandbox)
             except Exception:
                 logger.warning("Error during sandbox teardown", exc_info=True)
             if mcp_client:

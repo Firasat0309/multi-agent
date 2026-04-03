@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
+from pathlib import Path
 from typing import Any
 
 from agents.base_agent import BaseAgent
@@ -212,8 +214,34 @@ class ArchitectAgent(BaseAgent):
         Split into two LLM calls:
         1. Main call — file blueprints + tech_stack (compact JSON, fits in one response)
         2. Doc call  — architecture_doc markdown (fetched separately to avoid truncation)
+
+        Caching: the blueprint JSON is cached to disk keyed by a SHA-256 hash
+        of the prompt.  Identical prompts reuse the cached blueprint, saving
+        2 LLM calls.  Pass ``ARCHITECTURE_CACHE_DIR`` env var to override the
+        default cache location.
         """
+        import os
         logger.info("Designing architecture from user prompt")
+
+        # ── Check cache ───────────────────────────────────────────────────────
+        cache_dir = Path(os.environ.get(
+            "ARCHITECTURE_CACHE_DIR",
+            str(self.repo.workspace / ".arch_cache"),
+        ))
+        prompt_hash = hashlib.sha256(user_prompt.encode()).hexdigest()[:16]
+        cache_path = cache_dir / f"{prompt_hash}.json"
+
+        if cache_path.exists():
+            try:
+                cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                blueprint = self._parse_blueprint(cached)
+                logger.info(
+                    "Architecture cache HIT (%s) — skipping LLM calls",
+                    cache_path.name,
+                )
+                return blueprint
+            except Exception:
+                logger.warning("Architecture cache read failed — regenerating")
 
         # Belt-and-suspenders: if the user never mentioned a DB, append an
         # explicit instruction so the LLM cannot silently default to Postgres.
@@ -255,6 +283,14 @@ class ArchitectAgent(BaseAgent):
                 parse_err,
             )
             result = await self._retry_json_parse(text, parse_err)
+
+        # ── Write cache ───────────────────────────────────────────────────────
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(result, indent=2), encoding="utf-8")
+            logger.info("Architecture cached to %s", cache_path)
+        except Exception:
+            logger.debug("Failed to write architecture cache (non-critical)", exc_info=True)
 
         blueprint = self._parse_blueprint(result)
 

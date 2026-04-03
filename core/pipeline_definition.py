@@ -214,7 +214,11 @@ GENERATE_PIPELINE = PipelineDefinition(
             file_tasks=[
                 FileTaskDef(
                     task_type=TaskType.GENERATE_FILE,
-                    review=True,
+                    # Review is OFF by default — the build checkpoint catches
+                    # compile errors more reliably than LLM review, and for
+                    # interpreted languages a linter is cheaper.  Enable with
+                    # --enable-reviewer when code quality review is desired.
+                    review=False,
                     max_review_fixes=2,
                 ),
             ],
@@ -228,22 +232,22 @@ GENERATE_PIPELINE = PipelineDefinition(
             file_tasks=[
                 FileTaskDef(
                     task_type=TaskType.GENERATE_TEST,
-                    max_test_fixes=3,
+                    max_test_fixes=2,
                 ),
             ],
         ),
     ],
-    # Advisory tasks — run in parallel with security/integration, no feedback loop.
+    # Advisory tasks — deploy and docs only.  Module/architecture reviews
+    # are removed: they produce findings that are never acted upon (no fix
+    # loop), consuming 2 LLM calls for zero correctness benefit.
     global_tasks=[
-        TaskType.REVIEW_MODULE,
-        TaskType.REVIEW_ARCHITECTURE,
         TaskType.GENERATE_DEPLOY,
         TaskType.GENERATE_DOCS,
     ],
-    # Security hardening: scan → fix critical/high → rebuild → re-scan (max 2 cycles)
-    security_checkpoint=SecurityCheckpointDef(max_cycles=2, max_fixes_per_file=2),
-    # Integration verification: generate → run → triage → fix → re-run (max 2 cycles)
-    integration_checkpoint=IntegrationCheckpointDef(max_cycles=2),
+    # Security hardening: scan → fix critical/high → rebuild → re-scan (1 cycle)
+    security_checkpoint=SecurityCheckpointDef(max_cycles=1, max_fixes_per_file=1),
+    # Integration verification: generate → run → triage → fix → re-run (1 cycle)
+    integration_checkpoint=IntegrationCheckpointDef(max_cycles=1),
 )
 
 
@@ -255,7 +259,7 @@ ENHANCE_PIPELINE = PipelineDefinition(
             file_tasks=[
                 FileTaskDef(
                     task_type=TaskType.MODIFY_FILE,
-                    review=True,
+                    review=False,
                     max_review_fixes=2,
                 ),
             ],
@@ -269,7 +273,7 @@ ENHANCE_PIPELINE = PipelineDefinition(
             file_tasks=[
                 FileTaskDef(
                     task_type=TaskType.GENERATE_TEST,
-                    max_test_fixes=3,
+                    max_test_fixes=2,
                 ),
             ],
             checkpoint=CheckpointDef(
@@ -279,10 +283,8 @@ ENHANCE_PIPELINE = PipelineDefinition(
             ),
         ),
     ],
-    global_tasks=[
-        TaskType.REVIEW_MODULE,
-    ],
-    security_checkpoint=SecurityCheckpointDef(max_cycles=2, max_fixes_per_file=2),
+    global_tasks=[],
+    security_checkpoint=SecurityCheckpointDef(max_cycles=1, max_fixes_per_file=1),
 )
 
 

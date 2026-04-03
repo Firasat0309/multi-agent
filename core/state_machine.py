@@ -51,12 +51,14 @@ class EventType(Enum):
     CODE_GENERATED = "code_generated"
     REVIEW_PASSED = "review_passed"
     REVIEW_FAILED = "review_failed"
+    REVIEW_SKIPPED = "review_skipped"   # bypass review → go straight to build
     FIX_APPLIED = "fix_applied"
     BUILD_PASSED = "build_passed"
     BUILD_FAILED = "build_failed"
     TEST_PASSED = "test_passed"
     TEST_FAILED = "test_failed"
     RETRIES_EXHAUSTED = "retries_exhausted"
+    REWRITE_REJECTED = "rewrite_rejected"
 
 
 # ── Event (immutable audit record) ──────────────────────────────────────
@@ -88,6 +90,11 @@ _TRANSITIONS: dict[tuple[FilePhase, EventType], FilePhase] = {
     (FilePhase.GENERATING, EventType.CODE_GENERATED): FilePhase.REVIEWING,
     (FilePhase.REVIEWING, EventType.REVIEW_PASSED): FilePhase.BUILDING,
     (FilePhase.REVIEWING, EventType.REVIEW_FAILED): FilePhase.FIXING,
+    # REVIEW_SKIPPED: bypass the REVIEWING phase entirely.
+    # Used when --skip-reviewer is active (default).  The file goes directly
+    # from GENERATING to BUILDING — the compiler/linter catches errors more
+    # reliably and cheaply than an LLM review pass.
+    (FilePhase.GENERATING, EventType.REVIEW_SKIPPED): FilePhase.BUILDING,
     (FilePhase.BUILDING, EventType.BUILD_PASSED): FilePhase.TESTING,
     (FilePhase.BUILDING, EventType.BUILD_FAILED): FilePhase.FIXING,
     (FilePhase.TESTING, EventType.TEST_PASSED): FilePhase.PASSED,
@@ -186,6 +193,15 @@ class FileLifecycle:
         if event_type == EventType.RETRIES_EXHAUSTED:
             self.phase = FilePhase.FAILED
             self._record(event_type, old_phase, self.phase, data)
+            return self.phase
+
+        # REWRITE_REJECTED — stay in current phase, do NOT consume a fix budget.
+        # This fires when _validate_rewrite() rejects an LLM output (too large,
+        # duplicates detected, identical content).  The file stays alive so it
+        # can be retried, but we don't advance the fix counter so we don't
+        # accidentally exhaust the budget on a single bad output.
+        if event_type == EventType.REWRITE_REJECTED:
+            self._record(event_type, old_phase, old_phase, data)
             return self.phase
 
         # FIX_APPLIED — destination depends on what triggered the fix
@@ -334,6 +350,10 @@ class LifecycleEngine:
         # the checkpoint explicitly manages it.
         self._checkpoint_mode = checkpoint_mode
 
+        # Cached reverse dependency map (file → dependents).
+        # Built lazily on first access, invalidated only if deps change.
+        self._reverse_deps: dict[str, list[str]] | None = None
+
         # file_overrides allows per-file configuration of generation_task_type
         # and change_metadata (used by the Enhance pipeline).
         overrides = file_overrides or {}
@@ -350,6 +370,16 @@ class LifecycleEngine:
             )
 
     # ── File configuration ──────────────────────────────────────────
+
+    def _get_reverse_deps(self) -> dict[str, list[str]]:
+        """Return the cached reverse dependency map (file → dependents)."""
+        if self._reverse_deps is None:
+            rd: dict[str, list[str]] = {}
+            for path, deps in self._deps.items():
+                for dep in deps:
+                    rd.setdefault(dep, []).append(path)
+            self._reverse_deps = rd
+        return self._reverse_deps
 
     def skip_testing(self, file_path: str) -> None:
         """Mark a file as not needing tests (config, deploy, test layers)."""
@@ -469,6 +499,9 @@ class LifecycleEngine:
         status transitively through the dependency graph so dependents don't
         wait for the staleness timeout.
 
+        Uses a single-pass BFS from currently-FAILED files through the
+        reverse dependency graph, instead of the previous O(n²) while-loop.
+
         Args:
             scope: If provided, only check files within this set (e.g. a
                 tier's file set).  If None, check all files.
@@ -476,33 +509,46 @@ class LifecycleEngine:
         Returns:
             List of file paths that were cascade-failed.
         """
+        # Use cached reverse dependency map
+        reverse_deps = self._get_reverse_deps()
+
+        # Seed the BFS queue with all currently FAILED files
+        from collections import deque
+        queue: deque[str] = deque()
+        for path, lc in self._lifecycles.items():
+            if lc.phase == FilePhase.FAILED:
+                queue.append(path)
+
         cascaded: list[str] = []
-        # Iterate until no more cascades are possible (transitive closure).
-        changed = True
-        while changed:
-            changed = False
-            for path, lc in self._lifecycles.items():
+        visited: set[str] = set()
+
+        while queue:
+            failed_file = queue.popleft()
+            for dependent in reverse_deps.get(failed_file, []):
+                if dependent in visited:
+                    continue
+                visited.add(dependent)
+
+                if dependent not in self._lifecycles:
+                    continue
+                lc = self._lifecycles[dependent]
                 if lc.is_terminal or lc.phase != FilePhase.PENDING:
                     continue
-                if scope is not None and path not in scope:
+                if scope is not None and dependent not in scope:
                     continue
-                deps = self._deps.get(path, [])
-                failed_deps = [
-                    d for d in deps
-                    if d in self._lifecycles
-                    and self._lifecycles[d].phase == FilePhase.FAILED
-                ]
-                if failed_deps:
-                    logger.error(
-                        "[%s] Cascade FAILED — dependency %s failed",
-                        path, failed_deps[0],
-                    )
-                    lc.process_event(EventType.RETRIES_EXHAUSTED, {
-                        "reason": "dependency_failed",
-                        "failed_deps": failed_deps,
-                    })
-                    cascaded.append(path)
-                    changed = True  # re-scan for transitive dependents
+
+                logger.error(
+                    "[%s] Cascade FAILED — dependency %s failed",
+                    dependent, failed_file,
+                )
+                lc.process_event(EventType.RETRIES_EXHAUSTED, {
+                    "reason": "dependency_failed",
+                    "failed_deps": [failed_file],
+                })
+                cascaded.append(dependent)
+                # This dependent is now FAILED — propagate to its dependents
+                queue.append(dependent)
+
         return cascaded
 
     def all_terminal(self) -> bool:

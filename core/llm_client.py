@@ -6,20 +6,22 @@ import asyncio
 import json
 import logging
 import re
+import uuid
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
-from config.settings import LLMConfig, LLMProvider
+from config.settings import ExecutionConfig, LLMConfig, LLMProvider
 from core.circuit_breaker import CircuitBreaker, CircuitOpenError
+from core.errors import CostLimitExceededError
+from core.observability import get_tracer
 
 logger = logging.getLogger(__name__)
 
-# Per-request timeout in seconds.  Applies to each individual API call
-# (not the full retry loop).  Prevents the pipeline from hanging if a
-# provider endpoint stalls.  The value is generous enough for large
-# architecture responses (~16k tokens) while still failing in a
-# human-reasonable timeframe.
-_REQUEST_TIMEOUT = 180  # 3 minutes
+# Default timeout sourced from ExecutionConfig (kept at module level for
+# _get_client which builds SDK clients before generate() is called).
+_EXEC_DEFAULTS = ExecutionConfig()
+_REQUEST_TIMEOUT = _EXEC_DEFAULTS.request_timeout
 
 
 def _blk(block: Any, key: str) -> Any:
@@ -93,6 +95,9 @@ class ToolDefinition:
     name: str
     description: str
     input_schema: dict  # JSON Schema object
+    # Whether this tool is safe to execute concurrently with other safe tools.
+    # Read-only tools (read_file, search_code, etc.) are safe; write tools are not.
+    is_concurrency_safe: bool = True
 
 
 @dataclass
@@ -128,6 +133,99 @@ class LLMRetryableError(Exception):
     pass
 
 
+def _classify_error(error_msg: str) -> tuple[bool, bool]:
+    """Classify an LLM error as (is_rate_limit, is_transient).
+
+    Centralises the string-matching heuristics so ``generate()``,
+    ``_gemini_generate()``, and ``_gemini_generate_with_tools()`` share a
+    single source of truth.
+    """
+    cat = classify_llm_error(error_msg)
+    is_rate_limit = cat == LLMErrorCategory.RATE_LIMITED
+    is_transient = cat.is_retryable
+    return is_rate_limit, is_transient
+
+
+class LLMErrorCategory(Enum):
+    """Fine-grained error categories for LLM API failures."""
+
+    # Retryable
+    RATE_LIMITED = "rate_limited"
+    SERVER_OVERLOADED = "server_overloaded"
+    TIMEOUT = "timeout"
+    TRANSIENT_SERVER = "transient_server"
+    CONTEXT_LENGTH = "context_length"
+    CONTENT_FILTERED = "content_filtered"
+
+    # Non-retryable
+    AUTH_FAILED = "auth_failed"
+    MODEL_NOT_FOUND = "model_not_found"
+    INVALID_REQUEST = "invalid_request"
+    QUOTA_EXCEEDED = "quota_exceeded"
+    UNKNOWN = "unknown"
+
+    @property
+    def is_retryable(self) -> bool:
+        return self in _RETRYABLE_CATEGORIES
+
+
+_RETRYABLE_CATEGORIES = frozenset({
+    LLMErrorCategory.RATE_LIMITED,
+    LLMErrorCategory.SERVER_OVERLOADED,
+    LLMErrorCategory.TIMEOUT,
+    LLMErrorCategory.TRANSIENT_SERVER,
+    LLMErrorCategory.CONTEXT_LENGTH,
+    LLMErrorCategory.CONTENT_FILTERED,
+})
+
+
+def classify_llm_error(error_msg: str) -> LLMErrorCategory:
+    """Map an error message string to a fine-grained :class:`LLMErrorCategory`."""
+    msg = error_msg.lower()
+
+    # Auth / key errors (never retry)
+    if any(tok in error_msg for tok in ("401", "Unauthorized", "Unauthenticated")):
+        return LLMErrorCategory.AUTH_FAILED
+
+    # Model not found (never retry)
+    if "404" in error_msg or "not found" in msg or "not_found" in msg:
+        return LLMErrorCategory.MODEL_NOT_FOUND
+
+    # Rate limits
+    if "429" in error_msg or "rate_limit" in msg or "ratelimit" in msg or "too many requests" in msg:
+        return LLMErrorCategory.RATE_LIMITED
+
+    # Quota / billing
+    if "quota" in msg or "billing" in msg or "insufficient_quota" in msg:
+        return LLMErrorCategory.QUOTA_EXCEEDED
+
+    # Context length exceeded
+    if "context_length" in msg or "max_tokens" in msg or "too long" in msg or "token limit" in msg:
+        return LLMErrorCategory.CONTEXT_LENGTH
+
+    # Content filtering
+    if "content_filter" in msg or "blocked" in msg or "safety" in msg or "harmful" in msg:
+        return LLMErrorCategory.CONTENT_FILTERED
+
+    # Server overloaded
+    if "overloaded" in msg or "resource_exhausted" in msg or "529" in error_msg:
+        return LLMErrorCategory.SERVER_OVERLOADED
+
+    # Transient server errors
+    if any(tok in error_msg for tok in ("500", "502", "503")):
+        return LLMErrorCategory.TRANSIENT_SERVER
+
+    # Timeout
+    if "timeout" in msg or "timed out" in msg:
+        return LLMErrorCategory.TIMEOUT
+
+    # Invalid request (bad params — never retry)
+    if "400" in error_msg or "invalid" in msg or "is not supported" in msg:
+        return LLMErrorCategory.INVALID_REQUEST
+
+    return LLMErrorCategory.UNKNOWN
+
+
 class LLMClient:
     """Unified LLM client supporting Anthropic and OpenAI."""
 
@@ -154,13 +252,19 @@ class LLMClient:
         ],
     }
 
-    def __init__(self, config: LLMConfig):
+    def __init__(self, config: LLMConfig, execution_config: ExecutionConfig | None = None):
         self.config = config
+        self._exec = execution_config or ExecutionConfig()
         self._client: Any = None
-        self._circuit = CircuitBreaker(failure_threshold=5, recovery_timeout=60.0)
+        self._circuit = CircuitBreaker(
+            failure_threshold=self._exec.circuit_failure_threshold,
+            recovery_timeout=self._exec.circuit_recovery_timeout,
+        )
         # Cumulative token counters for cost tracking across the client's lifetime
         self.total_input_tokens: int = 0
         self.total_output_tokens: int = 0
+        # Per-session cost cap (0 = unlimited). Set by the pipeline entry point.
+        self.max_cost_usd: float = 0.0
         self._validate_config()
 
     def _validate_config(self) -> None:
@@ -255,8 +359,8 @@ class LLMClient:
         temp = temperature if temperature is not None else self.config.temperature
         tokens = max_tokens if max_tokens is not None else self.config.max_tokens
 
-        _max_attempts = 4
-        _base_delay = 2.0  # seconds; doubles each attempt (2 → 4 → 8 → …)
+        _max_attempts = self._exec.retry_count
+        _base_delay = self._exec.backoff_base
 
         async def _generate_once() -> LLMResponse:
             if self.config.provider == LLMProvider.ANTHROPIC:
@@ -273,19 +377,29 @@ class LLMClient:
                 )
 
         for attempt in range(_max_attempts):
+            request_id = uuid.uuid4().hex[:12]
+            tracer = get_tracer("llm_client")
             try:
-                logger.info(
-                    "LLM request (attempt %d/%d, provider=%s, model=%s) …",
-                    attempt + 1, _max_attempts,
-                    self.config.provider.value, self.config.model,
-                )
-                response = await asyncio.wait_for(
-                    self._circuit.call(_generate_once),
-                    timeout=_REQUEST_TIMEOUT + 30,  # generous over SDK timeout
-                )
+                with tracer.start_as_current_span("llm.generate") as span:
+                    span.set_attribute("llm.provider", self.config.provider.value)
+                    span.set_attribute("llm.model", self.config.model)
+                    span.set_attribute("llm.attempt", attempt + 1)
+                    span.set_attribute("llm.request_id", request_id)
+                    logger.info(
+                        "LLM request (attempt %d/%d, provider=%s, model=%s, rid=%s) …",
+                        attempt + 1, _max_attempts,
+                        self.config.provider.value, self.config.model, request_id,
+                    )
+                    response = await asyncio.wait_for(
+                        self._circuit.call(_generate_once),
+                        timeout=_REQUEST_TIMEOUT + 30,  # generous over SDK timeout
+                    )
+                    span.set_attribute("llm.input_tokens", response.usage.get("input_tokens", 0))
+                    span.set_attribute("llm.output_tokens", response.usage.get("output_tokens", 0))
                 # Accumulate lifetime token counts for cost reporting
                 self.total_input_tokens += response.usage.get("input_tokens", 0)
                 self.total_output_tokens += response.usage.get("output_tokens", 0)
+                self._check_cost_cap()
                 return response
             except asyncio.TimeoutError:
                 logger.error(
@@ -330,16 +444,7 @@ class LLMClient:
                 error_msg = str(e)
                 error_type = type(e).__name__
 
-                # Classify as retryable (rate-limit / transient server error)
-                is_rate_limit = (
-                    "429" in error_msg
-                    or "rate_limit" in error_msg.lower()
-                    or "ratelimit" in error_msg.lower()
-                    or "too many requests" in error_msg.lower()
-                )
-                is_transient = is_rate_limit or any(
-                    token in error_msg for token in ("500", "502", "503", "overloaded")
-                )
+                is_rate_limit, is_transient = _classify_error(error_msg)
 
                 if is_transient and attempt < _max_attempts - 1:
                     delay = _base_delay * (2 ** attempt)
@@ -489,7 +594,7 @@ class LLMClient:
                     "Set: export GEMINI_API_KEY=\"your-api-key\"\n"
                     "Get key at: https://aistudio.google.com/app/apikey"
                 ) from e
-            elif any(code in str(e) for code in ("500", "502", "503", "529")) or "overloaded" in error_str or "resource_exhausted" in error_str or "429" in str(e):
+            elif _classify_error(str(e))[1]:
                 # Transient server / rate-limit errors — re-raise the original
                 # exception so the caller's retry loop can handle it.
                 raise
@@ -751,6 +856,20 @@ class LLMClient:
         logger.error("Could not parse JSON from LLM response: %s", text[:200])
         return {}
 
+    def _check_cost_cap(self) -> None:
+        """Raise CostLimitExceededError if cumulative spend exceeds the cap."""
+        if self.max_cost_usd <= 0:
+            return
+        spent = calculate_cost(
+            self.config.model, self.total_input_tokens, self.total_output_tokens,
+        )
+        if spent > self.max_cost_usd:
+            raise CostLimitExceededError(
+                f"Session cost ${spent:.4f} exceeds cap ${self.max_cost_usd:.2f}",
+                spent_usd=spent,
+                limit_usd=self.max_cost_usd,
+            )
+
     async def generate_with_tools(
         self,
         messages: list[dict],
@@ -822,6 +941,7 @@ class LLMClient:
         self.total_input_tokens += response.usage.input_tokens
         self.total_output_tokens += response.usage.output_tokens
         self._update_metrics(response.usage)
+        self._check_cost_cap()
 
         # Normalize SDK objects → plain dicts so history is always serialisable
         # and can be re-fed to any provider without Anthropic SDK objects inside.
@@ -892,6 +1012,8 @@ class LLMClient:
 
         self.total_input_tokens += response.usage.prompt_tokens
         self.total_output_tokens += response.usage.completion_tokens
+        self._update_metrics(response.usage)
+        self._check_cost_cap()
 
         choice = response.choices[0]
         msg = choice.message
@@ -962,8 +1084,8 @@ class LLMClient:
         # Flatten normalized messages into a plain conversation string for Gemini
         conversation = self._flatten_messages_for_gemini(messages)
 
-        _max_attempts = 4
-        _base_delay = 2.0
+        _max_attempts = self._exec.retry_count
+        _base_delay = self._exec.backoff_base
         last_exc: Exception | None = None
         response: LLMResponse | None = None
         for _attempt in range(_max_attempts):
@@ -992,16 +1114,7 @@ class LLMClient:
             except Exception as _exc:
                 last_exc = _exc
                 _msg = str(_exc)
-                _msg_lower = _msg.lower()
-                _is_transient = (
-                    any(code in _msg for code in ("500", "502", "503", "529"))
-                    or "overloaded" in _msg_lower
-                    or "resource_exhausted" in _msg_lower
-                    or "rate_limit" in _msg_lower
-                    or "ratelimit" in _msg_lower
-                    or "429" in _msg
-                    or "too many requests" in _msg_lower
-                )
+                _, _is_transient = _classify_error(_msg)
                 if _is_transient and _attempt < _max_attempts - 1:
                     _delay = _base_delay * (2 ** _attempt)
                     logger.warning(
@@ -1016,6 +1129,11 @@ class LLMClient:
             raise LLMClientError(
                 "Gemini generate_with_tools: retry loop exhausted"
             ) from last_exc
+        # Accumulate token counts (bypassed because _gemini_generate is called directly)
+        self.total_input_tokens += response.usage.get("input_tokens", 0)
+        self.total_output_tokens += response.usage.get("output_tokens", 0)
+        self._update_metrics(response.usage)
+        self._check_cost_cap()
         text = response.content.strip()
 
         # Try to detect a tool-call JSON envelope.

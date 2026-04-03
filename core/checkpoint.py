@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from core.error_attributor import (
     AttributionResult,
@@ -39,6 +39,14 @@ from core.error_attributor import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class TerminalRunner(Protocol):
+    """Protocol for terminal command execution (avoids hard dependency on TerminalTools)."""
+
+    async def run_command(self, command: str, *, timeout: int = 120) -> Any:
+        ...
 
 
 @dataclass
@@ -112,7 +120,7 @@ class BuildCheckpoint:
     def __init__(
         self,
         build_command: str,
-        terminal: Any,  # TerminalTools
+        terminal: TerminalRunner,  # TerminalTools or any run_command() provider
         *,
         attributor: BaseErrorAttributor | None = None,
         known_files: set[str] | None = None,
