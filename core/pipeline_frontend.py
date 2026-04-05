@@ -628,22 +628,42 @@ class FrontendPipeline:
                 )
             elif compile_result.errors:
                 # Fix-retry loop: group errors by file, dispatch FIX_CODE tasks
-                _prev_tsx_errors = len(compile_result.errors)
+                _prev_error_fingerprints: set[str] = {
+                    f"{e.file}:{e.line}:{e.code}:{e.message}" for e in compile_result.errors
+                }
                 for retry in range(max_fix_retries):
                     logger.warning(
                         "[FE Phase 4.5] %d TSX error(s) — fix attempt %d/%d",
                         len(compile_result.errors), retry + 1, max_fix_retries,
                     )
+                    # Log actual error details so failures are debuggable
+                    for err in compile_result.errors:
+                        logger.warning(
+                            "[FE Phase 4.5]   %s:%d [%s] %s",
+                            err.file, err.line, err.code, err.message,
+                        )
+
                     # Group errors by file
                     errors_by_file: dict[str, list[str]] = defaultdict(list)
+                    _missing_module_files: list[str] = []
                     for err in compile_result.errors:
                         errors_by_file[err.file].append(
                             f"{err.file}:{err.line}: [{err.code}] {err.message}"
                         )
+                        # Track "Cannot find module" errors — need to create the
+                        # missing file, not just fix the importer
+                        if err.code in ("TS2307", "TS2305"):
+                            import re as _re_mod
+                            _mod_match = _re_mod.search(
+                                r"(?:module|from)\s+['\"]([^'\"]+)['\"]", err.message,
+                            )
+                            if _mod_match:
+                                _missing_module_files.append(_mod_match.group(1))
 
                     # Dispatch fix tasks for each affected file
                     fix_coros = []
                     _ast = ASTExtractor()
+                    import posixpath as _posixpath
                     for file_path, file_errors in errors_by_file.items():
                         fix_agent = agent_manager._create_agent(TaskType.FIX_COMPONENT)
 
@@ -660,7 +680,6 @@ class FrontendPipeline:
                         broken_abs = workspace / file_path
                         if broken_abs.exists():
                             try:
-                                import posixpath as _posixpath
                                 content = broken_abs.read_text(encoding="utf-8", errors="replace")
                                 file_dir = _posixpath.dirname(file_path)
                                 for line in content.splitlines():
@@ -685,12 +704,23 @@ class FrontendPipeline:
                             except OSError:
                                 pass
 
+                        # Always provide a FileBlueprint — even for non-component
+                        # files like stores, utils, types.  Without it the fix
+                        # agent gets no context about what the file is for.
                         fix_fb = None
                         if fix_component:
                             fix_fb = FileBlueprint(
                                 path=file_path,
                                 purpose=fix_component.description or fix_component.name,
                                 depends_on=fix_component.depends_on or [],
+                                language="typescript",
+                            )
+                        else:
+                            # Non-component file (store, types, api, utils)
+                            fix_fb = FileBlueprint(
+                                path=file_path,
+                                purpose=f"TypeScript module — fix TSX errors",
+                                depends_on=[],
                                 language="typescript",
                             )
 
@@ -704,6 +734,13 @@ class FrontendPipeline:
                         }
                         if fix_component:
                             fix_metadata["component"] = fix_component
+                        if retry > 0:
+                            fix_metadata["retry_hint"] = (
+                                "PREVIOUS FIX ATTEMPT FAILED — the same error persists. "
+                                "Try a DIFFERENT approach: check the import paths, "
+                                "verify exported names in dependency files, add missing "
+                                "type declarations, or create any missing exports."
+                            )
 
                         fix_ctx = AgentContext(
                             task=Task(
@@ -719,10 +756,84 @@ class FrontendPipeline:
                         )
                         fix_coros.append(fix_agent.execute(fix_ctx))
 
+                    # Handle "Cannot find module" errors — the missing file
+                    # needs to be CREATED, not fixed in the importer.
+                    for missing_mod in _missing_module_files:
+                        if missing_mod.startswith("."):
+                            # Resolve relative to first file that imports it
+                            for importer_file in errors_by_file:
+                                file_dir = _posixpath.dirname(importer_file)
+                                for ext in (".ts", ".tsx"):
+                                    candidate = _posixpath.normpath(
+                                        _posixpath.join(file_dir, missing_mod + ext)
+                                    )
+                                    if not (workspace / candidate).exists():
+                                        logger.info(
+                                            "[FE Phase 4.5] Creating missing module: %s",
+                                            candidate,
+                                        )
+                                        stub_agent = agent_manager._create_agent(
+                                            TaskType.FIX_COMPONENT,
+                                        )
+                                        stub_meta: dict = {
+                                            "fix_trigger": "build",
+                                            "build_errors": (
+                                                f"This file does not exist but is imported by "
+                                                f"{importer_file}. Create it with the correct "
+                                                f"exports that {importer_file} expects."
+                                            ),
+                                            "component_plan": component_plan,
+                                            "api_contract": api_contract,
+                                        }
+                                        # Read importer to see what it needs
+                                        _imp_abs = workspace / importer_file
+                                        _imp_related: dict[str, str] = {}
+                                        if _imp_abs.exists():
+                                            _imp_related[importer_file] = (
+                                                _imp_abs.read_text(encoding="utf-8", errors="replace")[:3000]
+                                            )
+                                        stub_ctx = AgentContext(
+                                            task=Task(
+                                                task_id=20000 + len(fix_coros),
+                                                task_type=TaskType.FIX_COMPONENT,
+                                                file=candidate,
+                                                description=f"Create missing module {candidate}",
+                                                metadata=stub_meta,
+                                            ),
+                                            blueprint=frontend_blueprint,
+                                            file_blueprint=FileBlueprint(
+                                                path=candidate,
+                                                purpose=f"Missing module imported by {importer_file}",
+                                                depends_on=[],
+                                                language="typescript",
+                                            ),
+                                            related_files=_imp_related or None,
+                                        )
+                                        fix_coros.append(stub_agent.execute(stub_ctx))
+                                        break
+                                break
+
                     fix_results = await asyncio.gather(*fix_coros, return_exceptions=True)
+                    _files_actually_modified = 0
                     for fix_res in fix_results:
                         if isinstance(fix_res, Exception):
-                            logger.error("Fix task failed: %s", fix_res)
+                            logger.error("[FE Phase 4.5] Fix task failed: %s", fix_res)
+                        elif hasattr(fix_res, "files_modified"):
+                            if fix_res.files_modified:
+                                _files_actually_modified += len(fix_res.files_modified)
+                            else:
+                                # Fix was rejected (too small, duplicates, identical)
+                                logger.warning(
+                                    "[FE Phase 4.5] Fix agent produced no changes: %s",
+                                    fix_res.output if hasattr(fix_res, "output") else "unknown",
+                                )
+
+                    if _files_actually_modified == 0:
+                        logger.warning(
+                            "[FE Phase 4.5] No files were modified by fix attempt %d/%d — "
+                            "fix output may have been rejected by validation guards",
+                            retry + 1, max_fix_retries,
+                        )
 
                     # Re-check compilation
                     compile_result = await tsx_compiler.check(workspace)
@@ -730,16 +841,27 @@ class FrontendPipeline:
                         logger.info("[FE Phase 4.5] TSX compilation passed after %d fix(es)", retry + 1)
                         break
 
-                    # Early bailout if no progress was made
-                    _cur_tsx_errors = len(compile_result.errors)
-                    if _cur_tsx_errors >= _prev_tsx_errors:
+                    # Compare error fingerprints — bail only if errors are
+                    # IDENTICAL AND files were actually modified.  If no files
+                    # were modified (fix rejected by validation guards), don't
+                    # bail — try again with retry_hint on the next attempt.
+                    _cur_fingerprints: set[str] = {
+                        f"{e.file}:{e.line}:{e.code}:{e.message}" for e in compile_result.errors
+                    }
+                    if _cur_fingerprints == _prev_error_fingerprints and _files_actually_modified > 0:
                         logger.warning(
-                            "[FE Phase 4.5] No progress: %d error(s) before, %d after — "
-                            "stopping fix loop early (attempt %d/%d)",
-                            _prev_tsx_errors, _cur_tsx_errors, retry + 1, max_fix_retries,
+                            "[FE Phase 4.5] Identical errors after fix attempt %d/%d — "
+                            "stopping (files were modified but errors unchanged)",
+                            retry + 1, max_fix_retries,
                         )
                         break
-                    _prev_tsx_errors = _cur_tsx_errors
+                    if _cur_fingerprints == _prev_error_fingerprints and _files_actually_modified == 0:
+                        logger.warning(
+                            "[FE Phase 4.5] Fix attempt %d/%d rejected by validation — "
+                            "will retry with enhanced context",
+                            retry + 1, max_fix_retries,
+                        )
+                    _prev_error_fingerprints = _cur_fingerprints
                 else:
                     # Exhausted retries
                     tsx_build_passed = False

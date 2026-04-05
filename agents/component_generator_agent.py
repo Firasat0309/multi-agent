@@ -464,7 +464,7 @@ class ComponentGeneratorAgent(BaseAgent):
     # ── Fix path ──────────────────────────────────────────────────────────────
 
     # Maximum allowed content growth factor for fix rewrites.
-    _MAX_CONTENT_GROWTH = 1.35
+    _MAX_CONTENT_GROWTH = 1.5
 
     async def _fix_component(self, context: AgentContext) -> TaskResult:
         """Fix a component file using component-aware context.
@@ -478,6 +478,7 @@ class ComponentGeneratorAgent(BaseAgent):
         build_errors: str = context.task.metadata.get("build_errors", "")
         fix_trigger: str = context.task.metadata.get("fix_trigger", "build")
         component: UIComponent | None = context.task.metadata.get("component")
+        retry_hint: str = context.task.metadata.get("retry_hint", "")
 
         current_content = await self.repo.async_read_file(file_path) or ""
         if not current_content:
@@ -546,11 +547,16 @@ class ComponentGeneratorAgent(BaseAgent):
             schema_lines.append("")
             schema_text = "\n".join(schema_lines) + "\n"
 
+        _retry_section = ""
+        if retry_hint:
+            _retry_section = f"\n⚠️ {retry_hint}\n\n"
+
         prompt = (
             f"{comp_info}{plan_info}"
             f"{store_sigs}{dep_sigs}"
             f"{schema_text}"
             f"{related_section}"
+            f"{_retry_section}"
             f"FIX TASK for: {file_path}\n\n"
             f"Current content:\n```typescript\n{current_content}\n```\n\n"
             f"Build errors to fix ({fix_trigger}):\n{build_errors}\n\n"

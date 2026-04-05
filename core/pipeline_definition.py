@@ -320,7 +320,7 @@ FRONTEND_PIPELINE = PipelineDefinition(
             ],
             checkpoint=CheckpointDef(
                 name="tsx_compilation",
-                max_retries=2,
+                max_retries=3,
                 timeout=120,
             ),
             skip_for_interpreted=False,
