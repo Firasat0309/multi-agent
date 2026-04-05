@@ -876,6 +876,37 @@ class CoderAgent(BaseAgent):
         # ── pom.xml: enforce Java 17, required starters, JWT/Security deps ────
         pom_hint = ""
         if Path(fb.path).name.lower() == "pom.xml":
+            # Detect the actual main class from the blueprint so <mainClass> matches
+            _main_class_fqn = ""
+            for bp in context.blueprint.file_blueprints:
+                if bp.path.endswith((".java",)) and bp.layer == "infrastructure" and any(
+                    kw in bp.purpose.lower() for kw in ("entry point", "springbootapplication", "main class")
+                ):
+                    # Convert path to FQCN: src/main/java/com/app/Application.java → com.app.Application
+                    _p = bp.path.replace("\\", "/")
+                    if "src/main/java/" in _p:
+                        _p = _p.split("src/main/java/", 1)[1]
+                    _main_class_fqn = _p.replace("/", ".").removesuffix(".java")
+                    break
+            if not _main_class_fqn:
+                # Fallback: find any *Application.java file
+                for bp in context.blueprint.file_blueprints:
+                    if bp.path.endswith("Application.java"):
+                        _p = bp.path.replace("\\", "/")
+                        if "src/main/java/" in _p:
+                            _p = _p.split("src/main/java/", 1)[1]
+                        _main_class_fqn = _p.replace("/", ".").removesuffix(".java")
+                        break
+
+            mainclass_hint = ""
+            if _main_class_fqn:
+                mainclass_hint = (
+                    f"\n\nCRITICAL — mainClass MUST match the actual @SpringBootApplication class:\n"
+                    f"  <mainClass>{_main_class_fqn}</mainClass>\n"
+                    f"  The main class is: {_main_class_fqn}\n"
+                    f"  Do NOT invent a different main class name.\n"
+                )
+
             db_hint = ""
             if _has_h2:
                 db_hint = (
@@ -919,7 +950,8 @@ class CoderAgent(BaseAgent):
                 "- Use <release>17</release> in maven-compiler-plugin\n"
                 "- Include all required Spring Boot starter dependencies "
                 "(web, data-jpa, validation, test)"
-                + db_hint + jwt_hint + validation_hint + lombok_hint + "\n"
+                + db_hint + jwt_hint + validation_hint + lombok_hint
+                + mainclass_hint + "\n"
                 "- The pom.xml must be complete and valid — do not truncate it"
             )
 
@@ -941,9 +973,15 @@ class CoderAgent(BaseAgent):
                 ]
             if _has_jwt or _has_security:
                 lines += [
-                    "\nREQUIRED JWT/Security properties (JwtUtil uses @Value — missing = startup crash):",
+                    "\nREQUIRED JWT/Security properties (JwtUtil uses @Value — missing ANY = startup crash):",
                     "  jwt.secret=mySecretKeyForJWTTokenGenerationAndValidation123456",
                     "  jwt.expiration=86400000",
+                    "  # Also define common alternate property names (LLM-generated JWT classes may",
+                    "  # use @Value(\"${app.jwtSecret}\") or @Value(\"${jwt.secret}\") — both must exist):",
+                    "  app.jwtSecret=mySecretKeyForJWTTokenGenerationAndValidation123456",
+                    "  app.jwtExpirationMs=86400000",
+                    "  app.jwt-secret=mySecretKeyForJWTTokenGenerationAndValidation123456",
+                    "  app.jwt-expiration=86400000",
                 ]
             if lines:
                 props_hint = "\n".join(lines) + "\n"

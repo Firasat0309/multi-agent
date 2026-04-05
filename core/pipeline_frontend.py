@@ -89,8 +89,20 @@ class FrontendPipeline:
         figma_url: str = "",
         frontend_workspace: Path | None = None,
         backend_blueprint: RepositoryBlueprint | None = None,
+        prebuilt_design_spec: "UIDesignSpec | None" = None,
+        prebuilt_component_plan: "ComponentPlan | None" = None,
     ) -> PipelineResult:
-        """Run all frontend generation phases and return a PipelineResult."""
+        """Run all frontend generation phases and return a PipelineResult.
+
+        Args:
+            prebuilt_design_spec: When provided, Phase 1 (Design Parsing) is
+                skipped entirely — the caller already ran the DesignParserAgent
+                in parallel with other work (e.g. API contract extraction).
+            prebuilt_component_plan: When provided, Phase 2 (Component Planning)
+                is skipped — the caller extracted the plan deterministically
+                from plan.md.  The ComponentPlannerAgent is still created lazily
+                for potential approval-gate revisions.
+        """
         from core.pipeline import PipelineResult
 
         workspace = frontend_workspace or (self._settings.workspace_dir / "frontend")
@@ -127,16 +139,24 @@ class FrontendPipeline:
 
         try:
             # ── Phase 1: Design Parsing ───────────────────────────────────────────
-            self._phase("FE: Design Parsing", "running")
-            logger.info("[FE Phase 1] Parsing design spec...")
-            design_spec: UIDesignSpec | None = None
-            parser = DesignParserAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
-            design_spec = await parser.parse_design(requirements, figma_url, api_contract=api_contract)
-            logger.info(
-                "UIDesignSpec: %d pages, framework=%s",
-                len(design_spec.pages), design_spec.framework,
-            )
-            self._complete_phase("FE: Design Parsing")
+            if prebuilt_design_spec is not None:
+                design_spec = prebuilt_design_spec
+                logger.info(
+                    "[FE Phase 1] Using pre-built design spec (%d pages, framework=%s) — skipping LLM call",
+                    len(design_spec.pages), design_spec.framework,
+                )
+                self._complete_phase("FE: Design Parsing")
+            else:
+                self._phase("FE: Design Parsing", "running")
+                logger.info("[FE Phase 1] Parsing design spec...")
+                design_spec: UIDesignSpec | None = None
+                parser = DesignParserAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
+                design_spec = await parser.parse_design(requirements, figma_url, api_contract=api_contract)
+                logger.info(
+                    "UIDesignSpec: %d pages, framework=%s",
+                    len(design_spec.pages), design_spec.framework,
+                )
+                self._complete_phase("FE: Design Parsing")
         except Exception as exc:
             logger.exception("Design parsing failed")
             errors.append(f"Design parsing failed: {exc}")
@@ -146,18 +166,27 @@ class FrontendPipeline:
 
         # ── Phase 2: Component Planning ───────────────────────────────────────
         self._phase("FE: Component Planning", "running")
-        logger.info("[FE Phase 2] Planning components...")
-        try:
-            planner = ComponentPlannerAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
-            component_plan = await planner.plan_components(design_spec, api_contract, requirements)
+        planner: ComponentPlannerAgent | None = None
+        if prebuilt_component_plan is not None:
+            component_plan = prebuilt_component_plan
             logger.info(
-                "ComponentPlan: %d components, state=%s",
-                len(component_plan.components), component_plan.state_solution,
+                "[FE Phase 2] Using pre-built component plan (%d components, framework=%s) — skipping LLM call",
+                len(component_plan.components), component_plan.framework,
             )
             self._complete_phase("FE: Component Planning")
-        except Exception as exc:
-            logger.exception("Component planning failed")
-            errors.append(f"Component planning failed: {exc}")
+        else:
+            logger.info("[FE Phase 2] Planning components...")
+            try:
+                planner = ComponentPlannerAgent(llm_client=self._llm, repo_manager=repo_manager, mcp_client=mcp_client)
+                component_plan = await planner.plan_components(design_spec, api_contract, requirements)
+                logger.info(
+                    "ComponentPlan: %d components, state=%s",
+                    len(component_plan.components), component_plan.state_solution,
+                )
+                self._complete_phase("FE: Component Planning")
+            except Exception as exc:
+                logger.exception("Component planning failed")
+                errors.append(f"Component planning failed: {exc}")
             self._fail_phase("FE: Component Planning", str(exc))
             return PipelineResult(
                 success=False,
@@ -202,6 +231,12 @@ class FrontendPipeline:
                 # result is a str — user feedback for revision
                 logger.info("User requested frontend architecture revision: %s", result)
                 try:
+                    if planner is None:
+                        planner = ComponentPlannerAgent(
+                            llm_client=self._llm,
+                            repo_manager=repo_manager,
+                            mcp_client=mcp_client,
+                        )
                     component_plan = await planner.revise_components(
                         component_plan, result,
                     )

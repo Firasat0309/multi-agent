@@ -302,7 +302,7 @@ class ArchitectAgent(BaseAgent):
     async def design_from_plan(
         self,
         plan_md: str,
-        requirements: ProductRequirements,
+        requirements: ProductRequirements | None = None,
     ) -> RepositoryBlueprint:
         """Build RepositoryBlueprint guided by PHASE 2 of plan.md.
 
@@ -310,6 +310,9 @@ class ArchitectAgent(BaseAgent):
         directly from the PHASE 2 backend file tree rather than being
         reinvented by the LLM.  All existing validation (mandatory files
         injection, dedup, frontend-file stripping) is applied to the result.
+
+        *requirements* is optional — when running in parallel with Product
+        Planning the plan.md text alone provides sufficient context.
         """
 
         logger.info("ArchitectAgent.design_from_plan: converting PHASE 2 to blueprint")
@@ -323,23 +326,27 @@ class ArchitectAgent(BaseAgent):
             )
             phase2 = plan_md
 
-        # Build the enriched user prompt from requirements
-        tech = requirements.tech_preferences or {}
-        effective_prefs = {k: v for k, v in tech.items() if v.lower() != "none"}
-        tech_notes = "; ".join(f"{k}={v}" for k, v in effective_prefs.items()) if effective_prefs else ""
+        # Build the enriched user prompt from requirements (if available)
+        # or extract minimal context from the plan.md header.
+        user_prompt_ctx = ""
+        effective_prefs: dict[str, str] = {}
+        if requirements is not None:
+            tech = requirements.tech_preferences or {}
+            effective_prefs = {k: v for k, v in tech.items() if v.lower() != "none"}
+            tech_notes = "; ".join(f"{k}={v}" for k, v in effective_prefs.items()) if effective_prefs else ""
 
-        user_prompt_ctx = (
-            f"Project: {requirements.title}\n"
-            f"Description: {requirements.description}\n"
-        )
-        if tech_notes:
-            user_prompt_ctx += f"Tech preferences: {tech_notes}\n"
-        if requirements.user_stories:
-            user_prompt_ctx += "User stories:\n" + "\n".join(
-                f"  - {s}" for s in requirements.user_stories
-            ) + "\n"
-        if requirements.features:
-            user_prompt_ctx += "Features: " + ", ".join(requirements.features) + "\n"
+            user_prompt_ctx = (
+                f"Project: {requirements.title}\n"
+                f"Description: {requirements.description}\n"
+            )
+            if tech_notes:
+                user_prompt_ctx += f"Tech preferences: {tech_notes}\n"
+            if requirements.user_stories:
+                user_prompt_ctx += "User stories:\n" + "\n".join(
+                    f"  - {s}" for s in requirements.user_stories
+                ) + "\n"
+            if requirements.features:
+                user_prompt_ctx += "Features: " + ", ".join(requirements.features) + "\n"
 
         architecture_prompt = (
             f"{user_prompt_ctx}\n"
@@ -361,7 +368,9 @@ class ArchitectAgent(BaseAgent):
         )
 
         # Inject DB note if none specified in the prompt
-        effective_user_prompt = requirements.description or requirements.title
+        effective_user_prompt = (
+            (requirements.description or requirements.title) if requirements else plan_md[:500]
+        )
         if not self._user_specified_db(effective_user_prompt) and not any(
             "db" in k.lower() for k in effective_prefs
         ):
@@ -372,12 +381,12 @@ class ArchitectAgent(BaseAgent):
             )
 
         logger.info(
-            "ArchitectAgent.design_from_plan: sending blueprint request to LLM — this may take 30-90s…"
+            "ArchitectAgent.design_from_plan: sending blueprint request to LLM — this may take 30-60s…"
         )
         response = await self._llm_with_heartbeat(
             system_prompt=self.system_prompt + "\n\nRespond with valid JSON only. No markdown fences.",
             user_prompt=architecture_prompt,
-            max_tokens=12288,
+            max_tokens=8192,
             label="architecture from plan",
         )
         self._metrics["llm_calls"] += 1
@@ -394,9 +403,12 @@ class ArchitectAgent(BaseAgent):
 
         blueprint = self._parse_blueprint(result)
 
-        # Use plan.md as the architecture doc — no extra LLM call needed since
-        # the plan already contains layer diagrams and descriptions.
-        blueprint = await self._fetch_architecture_doc(blueprint, architecture_prompt[:2000])
+        # plan.md already contains architecture diagrams, layer descriptions,
+        # and file-tree docs — skip the separate _fetch_architecture_doc LLM call
+        # (saves ~60-90s).  Use an excerpt of the plan as the architecture_doc.
+        blueprint.architecture_doc = (
+            "# Architecture (from plan.md)\n\n" + phase2[:4000]
+        )
 
         return blueprint
 
@@ -726,7 +738,8 @@ class ArchitectAgent(BaseAgent):
                 )
                 if _has_jwt:
                     _props_purpose += (
-                        "; JWT security settings (jwt.secret, jwt.expiration=86400000)"
+                        "; JWT security settings (jwt.secret, jwt.expiration, "
+                        "app.jwtSecret, app.jwtExpirationMs — include ALL variants)"
                         "; Spring Security CORS and session management"
                     )
                 file_blueprints.append(FileBlueprint(

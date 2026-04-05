@@ -169,8 +169,14 @@ class DesignParserAgent(BaseAgent):
     async def execute(self, context: AgentContext) -> TaskResult:
         figma_url: str = context.task.metadata.get("figma_url", "")
         try:
-            # Drop into the standard agentic tool loop instead of calling LLM once
-            result = await self.execute_agentic(context)
+            # When no Figma URL is provided the agent doesn't need tool access
+            # (no Figma API calls) — use a fast single-shot LLM call instead of
+            # the multi-turn agentic loop, saving ~30-60s of overhead.
+            if figma_url:
+                result = await self.execute_agentic(context)
+            else:
+                content = await self._call_llm(self._build_prompt(context))
+                result = TaskResult(success=True, output=content)
             if not result.success:
                 return result
 

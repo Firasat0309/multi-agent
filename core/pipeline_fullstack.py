@@ -7,7 +7,7 @@ import json as _json
 import logging
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from agents.architect_agent import ArchitectAgent
 from agents.api_contract_agent import APIContractAgent
@@ -202,64 +202,94 @@ class FullstackPipeline:
                         elapsed_seconds=time.monotonic() - start_time,
                     )
 
-        # ── Phase 2: Product Requirements Extraction ──────────────────────────
-        self._phase("Product Planning", "running")
-        logger.info("[FS Phase 2] Extracting product requirements from plan.md...")
+        # ── Phase 2: Deterministic Plan Parsing (<1 second) ─────────────────
+        # Extracts requirements, blueprint, contract, design spec, and
+        # component plan from plan.md without any LLM calls.  Falls back to
+        # LLM agents only for sections where parsing returned None.
+        from core.plan_parser import parse_plan_md
 
-        requirements: ProductRequirements | None = None
-        planner = ProductPlannerAgent(
-            llm_client=self._llm, repo_manager=shared_repo_manager
+        self._phase("Deterministic Plan Parsing", "running")
+        parsed = parse_plan_md(plan_md)
+        logger.info(
+            "[FS Phase 2] Deterministic parse results — "
+            "req=%s blueprint=%s contract=%s design=%s components=%s",
+            parsed.requirements is not None,
+            parsed.backend_blueprint is not None,
+            parsed.api_contract is not None,
+            parsed.design_spec is not None,
+            parsed.component_plan is not None,
         )
-        try:
-            requirements = await planner.parse_from_plan(plan_md)
-            fullstack_blueprint.product_requirements = requirements
-            logger.info(
-                "Requirements extracted: %s (FE=%s, BE=%s)",
-                requirements.title, requirements.has_frontend, requirements.has_backend,
+        self._complete_phase("Deterministic Plan Parsing")
+
+        # ── Phase 3: LLM Fallback (only for what parsing missed) ─────────────
+        requirements: ProductRequirements | None = parsed.requirements
+        backend_blueprint: RepositoryBlueprint | None = parsed.backend_blueprint
+
+        need_req_llm = requirements is None
+        need_bp_llm = backend_blueprint is None
+
+        if need_req_llm or need_bp_llm:
+            self._phase("LLM Fallback (partial)", "running")
+            logger.warning(
+                "[FS Phase 3] LLM fallback needed — req=%s blueprint=%s",
+                need_req_llm, need_bp_llm,
             )
-            self._complete_phase("Product Planning")
-        except Exception as exc:
-            logger.exception("Product requirements extraction failed")
-            errors.append(f"Product planning failed: {exc}")
-            self._fail_phase("Product Planning", str(exc))
-            return PipelineResult(
-                success=False,
-                workspace_path=root_workspace,
-                errors=errors,
-                elapsed_seconds=time.monotonic() - start_time,
+            _fallback_coros: list = []
+            _fallback_keys: list[str] = []
+
+            if need_req_llm:
+                planner = ProductPlannerAgent(
+                    llm_client=self._llm, repo_manager=shared_repo_manager
+                )
+                _fallback_coros.append(planner.parse_from_plan(plan_md))
+                _fallback_keys.append("requirements")
+
+            if need_bp_llm:
+                architect = ArchitectAgent(
+                    llm_client=self._llm, repo_manager=shared_repo_manager
+                )
+                _fallback_coros.append(architect.design_from_plan(plan_md))
+                _fallback_keys.append("blueprint")
+
+            _fallback_results = await asyncio.gather(
+                *_fallback_coros, return_exceptions=True
             )
 
-        # ── Phase 3: Backend Architecture Design ──────────────────────────────
-        self._phase("Backend Architecture", "running")
-        logger.info("[FS Phase 3] Designing backend architecture from plan.md...")
+            for _key, _res in zip(_fallback_keys, _fallback_results):
+                if isinstance(_res, BaseException):
+                    logger.exception("LLM fallback for %s failed", _key)
+                    errors.append(f"{_key} extraction failed: {_res}")
+                    self._fail_phase("LLM Fallback (partial)", str(_res))
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=root_workspace,
+                        errors=errors,
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+                if _key == "requirements":
+                    requirements = _res
+                elif _key == "blueprint":
+                    backend_blueprint = _res
 
-        backend_blueprint: RepositoryBlueprint | None = None
-        architect = ArchitectAgent(
-            llm_client=self._llm, repo_manager=shared_repo_manager
+            self._complete_phase("LLM Fallback (partial)")
+
+        fullstack_blueprint.product_requirements = requirements
+        fullstack_blueprint.backend_blueprint = backend_blueprint
+        logger.info(
+            "Requirements extracted: %s (FE=%s, BE=%s)",
+            requirements.title, requirements.has_frontend, requirements.has_backend,
         )
-        # enriched_prompt is still built for use in backend generation prompt later
+        logger.info(
+            "Backend blueprint: %s (%d files)",
+            backend_blueprint.name, len(backend_blueprint.file_blueprints),
+        )
+
+        # enriched_prompt is built for use in backend generation prompt later
         enriched_prompt = self._enrich_prompt(user_prompt, requirements)
-        # Inject plan.md context so the backend prompt carries the full specification
         enriched_prompt_with_plan = self._enrich_prompt_with_plan(enriched_prompt, plan_md)
 
-        try:
-            backend_blueprint = await architect.design_from_plan(plan_md, requirements)
-            fullstack_blueprint.backend_blueprint = backend_blueprint
-            logger.info(
-                "Backend blueprint: %s (%d files)",
-                backend_blueprint.name, len(backend_blueprint.file_blueprints),
-            )
-            self._complete_phase("Backend Architecture")
-        except Exception as exc:
-            logger.exception("Backend architecture design failed")
-            errors.append(f"Backend architecture failed: {exc}")
-            self._fail_phase("Backend Architecture", str(exc))
-            return PipelineResult(
-                success=False,
-                workspace_path=root_workspace,
-                errors=errors,
-                elapsed_seconds=time.monotonic() - start_time,
-            )
+        # Lazy architect instance — only created for approval-gate revisions
+        architect: ArchitectAgent | None = None
 
         # ── Approval Gate 2: Backend Architecture ─────────────────────────────
         if self._settings.require_architecture_approval:
@@ -297,6 +327,11 @@ class FullstackPipeline:
                 # result is a str — user feedback for revision
                 logger.info("User requested architecture revision: %s", result)
                 try:
+                    if architect is None:
+                        architect = ArchitectAgent(
+                            llm_client=self._llm,
+                            repo_manager=shared_repo_manager,
+                        )
                     backend_blueprint = await architect.revise_architecture(
                         enriched_prompt_with_plan, backend_blueprint, result,
                     )
@@ -315,11 +350,15 @@ class FullstackPipeline:
                         elapsed_seconds=time.monotonic() - start_time,
                     )
 
-        # ── Phase 4: API Contract ──────────────────────────────────────────────
-        # Either use a pre-supplied contract (--contract flag or auto-detected
-        # api_contract.json in the workspace) or extract one from plan.md.
-        self._phase("API Contract Generation", "running")
+        # ── Phase 4: API Contract + FE Design ────────────────────────────────
+        # Use deterministically parsed results from Phase 2.
+        # Fall back to LLM only when parsing returned None for the contract.
+        # Design spec and component plan are passed through to the FE pipeline
+        # which handles None by running its own LLM-based phases.
+        self._phase("API Contract + FE Design", "running")
         api_contract: APIContract | None = None
+        prebuilt_design_spec = parsed.design_spec
+        prebuilt_component_plan = parsed.component_plan
 
         if preloaded_contract is not None:
             api_contract = preloaded_contract
@@ -328,42 +367,53 @@ class FullstackPipeline:
                 "[FS Phase 4] Using pre-supplied API contract: %s (%d endpoints)",
                 api_contract.title, len(api_contract.endpoints),
             )
-            # Persist the pre-supplied contract into the workspace so downstream
-            # tools and a subsequent --resume run can find it.
             self._write_contract_json(api_contract)
-            self._complete_phase("API Contract Generation")
+        elif parsed.api_contract is not None and parsed.api_contract.endpoints:
+            api_contract = parsed.api_contract
+            fullstack_blueprint.api_contract = api_contract
+            logger.info(
+                "[FS Phase 4] Using deterministically parsed API contract: %s (%d endpoints)",
+                api_contract.title, len(api_contract.endpoints),
+            )
+            self._write_contract_json(api_contract)
         else:
-            logger.info("[FS Phase 4] Extracting API contract from plan.md...")
-            try:
+            # LLM fallback — deterministic parsing could not extract a valid contract
+            logger.warning("[FS Phase 4] API contract parse failed — falling back to LLM...")
+
+            async def _extract_contract() -> APIContract:
                 contract_agent = APIContractAgent(
                     llm_client=self._llm, repo_manager=shared_repo_manager
                 )
-                api_contract = await contract_agent.extract_from_plan(
+                contract = await contract_agent.extract_from_plan(
                     plan_md, requirements, backend_blueprint
                 )
-                if not api_contract.endpoints:
+                if not contract.endpoints:
                     raise ValueError(
                         "API contract extraction returned 0 endpoints "
                         "(PHASE 1 of plan.md may be malformed or empty)"
                     )
-                fullstack_blueprint.api_contract = api_contract
-                logger.info(
-                    "API contract: %s (%d endpoints)",
-                    api_contract.title, len(api_contract.endpoints),
-                )
-                # Persist for inspection and reuse on the next run
-                self._write_contract_json(api_contract)
-                self._complete_phase("API Contract Generation")
-            except Exception as exc:
+                return contract
+
+            contract_result = await _extract_contract()
+            if isinstance(contract_result, BaseException):
                 logger.exception("API contract extraction failed")
-                errors.append(f"API contract generation failed: {exc}")
-                self._fail_phase("API Contract Generation", str(exc))
+                errors.append(f"API contract generation failed: {contract_result}")
+                self._fail_phase("API Contract + FE Design", str(contract_result))
                 return PipelineResult(
                     success=False,
                     workspace_path=self._settings.workspace_dir,
                     errors=errors,
                     elapsed_seconds=time.monotonic() - start_time,
                 )
+            api_contract = contract_result
+            fullstack_blueprint.api_contract = api_contract
+            logger.info(
+                "API contract (LLM fallback): %s (%d endpoints)",
+                api_contract.title, len(api_contract.endpoints),
+            )
+            self._write_contract_json(api_contract)
+
+        self._complete_phase("API Contract + FE Design")
 
         # ── Phase 5: Parallel Backend + Frontend ──────────────────────────────
         self._phase("Parallel BE+FE Generation", "running")
@@ -429,6 +479,8 @@ class FullstackPipeline:
                     figma_url=figma_url,
                     frontend_workspace=frontend_workspace,
                     backend_blueprint=backend_blueprint,
+                    prebuilt_design_spec=prebuilt_design_spec,
+                    prebuilt_component_plan=prebuilt_component_plan,
                 )
             )
             labels.append("frontend")
