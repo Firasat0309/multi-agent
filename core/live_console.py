@@ -31,6 +31,8 @@ class LiveConsole:
         # Track when first task completes to calculate ETA
         self._first_completion_time: float = 0.0
         self._completions_at_first: int = 0
+        self._cost_spent: float = 0.0
+        self._cost_limit: float = 0.0
 
     def start(self) -> None:
         if not self._start_time:
@@ -99,6 +101,17 @@ class LiveConsole:
         self._agent_log.append(f"{timestamp}  {message}")
         if len(self._agent_log) > self._max_log_lines:
             self._agent_log = self._agent_log[-self._max_log_lines:]
+        self._refresh()
+
+    def update_cost(self, spent_usd: float, limit_usd: float) -> None:
+        """Update the cost tracker display, warning when approaching the limit."""
+        self._cost_spent = spent_usd
+        self._cost_limit = limit_usd
+        pct = (spent_usd / limit_usd * 100) if limit_usd > 0 else 0
+        if pct >= 90:
+            self.log(f"[bold red]⚠ COST {pct:.0f}%: ${spent_usd:.2f} / ${limit_usd:.2f}[/bold red]")
+        elif pct >= 80:
+            self.log(f"[yellow]⚠ Cost warning: ${spent_usd:.2f} / ${limit_usd:.2f} ({pct:.0f}%)[/yellow]")
         self._refresh()
 
     def stream_task_output(self, task_id: int, chunk: str) -> None:

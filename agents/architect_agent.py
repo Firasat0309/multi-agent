@@ -498,56 +498,15 @@ class ArchitectAgent(BaseAgent):
 
     @staticmethod
     def _repair_json(text: str) -> str:
-        """Best-effort repair of common LLM JSON mistakes.
-
-        Delegates to the centralized repair in LLMClient which handles
-        trailing commas, single-quoted strings, JS comments, unquoted
-        property names, AND truncated output (unclosed braces/brackets).
-        """
+        """Best-effort repair of common LLM JSON mistakes."""
         from core.llm_client import LLMClient
         return LLMClient._repair_json_text(text)
 
     @classmethod
     def _parse_json_response(cls, text: str) -> dict[str, Any]:
         """Parse JSON from LLM output, handling fences, partial responses, and repair."""
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines)
-
-        # 1. Try strict parse
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-
-        # 2. Try extracting the outermost JSON object
-        start = text.find("{")
-        end = text.rfind("}") + 1
-        if start != -1 and end > start:
-            try:
-                return json.loads(text[start:end])
-            except json.JSONDecodeError:
-                pass
-
-        # 3. Try repair (handles trailing commas, truncated JSON, etc.)
-        try:
-            extracted = text[start:] if start != -1 else text
-            repaired = cls._repair_json(extracted)
-            result = json.loads(repaired)
-            logger.info("Architecture JSON repair succeeded")
-            return result
-        except (json.JSONDecodeError, Exception):
-            pass
-
-        logger.error("Could not parse architecture JSON: %s...", text[:200])
-        raise ValueError(
-            "Failed to parse architecture JSON from LLM response. "
-            "The model returned malformed or truncated JSON. "
-        )
+        from core.json_utils import parse_llm_json_strict
+        return parse_llm_json_strict(text, label="architecture")
 
     async def _retry_json_parse(
         self, malformed_text: str, parse_error: Exception

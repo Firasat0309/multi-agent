@@ -5,8 +5,6 @@ Execution model: **Lifecycle + global DAG** — ``LifecyclePlanBuilder.build()``
     - A slim ``TaskGraph`` for advisory global phases (deploy, docs)
     The per-file lifecycle is event-driven; the global DAG runs after all files
     reach a terminal state.
-
-``TaskGraphBuilder`` is retained for modification workflows only.
 """
 
 from __future__ import annotations
@@ -28,25 +26,8 @@ logger = logging.getLogger(__name__)
 
 
 # Re-export so ``from core.task_engine import TaskGraph`` keeps working.
-__all__ = ["TaskGraph", "TaskGraphBuilder", "LifecyclePlanBuilder",
+__all__ = ["TaskGraph", "LifecyclePlanBuilder",
            "ModificationTaskGraphBuilder", "EnhanceLifecyclePlanBuilder"]
-
-
-class TaskGraphBuilder:
-    """Task graph builder for modification workflows.
-
-    ``build_from_blueprint()`` has been removed — use ``LifecyclePlanBuilder``
-    for new-project generation.  This class is kept for ``ModificationTaskGraphBuilder``
-    which still uses it internally for helper utilities.
-    """
-
-    def __init__(self) -> None:
-        self._next_id = 1
-
-    def _alloc_id(self) -> int:
-        tid = self._next_id
-        self._next_id += 1
-        return tid
 
 
 class LifecyclePlanBuilder:
@@ -566,9 +547,8 @@ class EnhanceLifecyclePlanBuilder:
             - A minimal global TaskGraph containing only the sentinel
 
     The resulting ``(LifecycleEngine, TaskGraph)`` can be passed directly to
-    ``AgentManager.execute_with_checkpoints()`` so the Enhance pipeline uses
-    the same executor, tier-based scheduling, and generate→build→fix loop as
-    the Generate pipeline.
+    ``SimpleLoopExecutor.execute()`` so the Enhance pipeline uses the same
+    tier-based scheduling and generate→build→fix loop as the Generate pipeline.
     """
 
     def __init__(self, dep_store: DependencyGraphStore | None = None) -> None:

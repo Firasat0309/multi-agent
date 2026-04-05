@@ -634,22 +634,22 @@ class TestAgentManagerTaskMap:
         from agents.api_integration_agent import APIIntegrationAgent
         from agents.state_management_agent import StateManagementAgent
 
-        assert TASK_AGENT_MAP[TaskType.PLAN_PRODUCT] is ProductPlannerAgent
-        assert TASK_AGENT_MAP[TaskType.GENERATE_API_CONTRACT] is APIContractAgent
-        assert TASK_AGENT_MAP[TaskType.PARSE_DESIGN] is DesignParserAgent
-        assert TASK_AGENT_MAP[TaskType.PLAN_COMPONENTS] is ComponentPlannerAgent
-        assert TASK_AGENT_MAP[TaskType.BUILD_COMPONENT_DAG] is ComponentDAGAgent
-        assert TASK_AGENT_MAP[TaskType.GENERATE_COMPONENT] is ComponentGeneratorAgent
-        assert TASK_AGENT_MAP[TaskType.INTEGRATE_API] is APIIntegrationAgent
-        assert TASK_AGENT_MAP[TaskType.MANAGE_STATE] is StateManagementAgent
+        assert TASK_AGENT_MAP[TaskType.PLAN_PRODUCT] == ProductPlannerAgent.__name__
+        assert TASK_AGENT_MAP[TaskType.GENERATE_API_CONTRACT] == APIContractAgent.__name__
+        assert TASK_AGENT_MAP[TaskType.PARSE_DESIGN] == DesignParserAgent.__name__
+        assert TASK_AGENT_MAP[TaskType.PLAN_COMPONENTS] == ComponentPlannerAgent.__name__
+        assert TASK_AGENT_MAP[TaskType.BUILD_COMPONENT_DAG] == ComponentDAGAgent.__name__
+        assert TASK_AGENT_MAP[TaskType.GENERATE_COMPONENT] == ComponentGeneratorAgent.__name__
+        assert TASK_AGENT_MAP[TaskType.INTEGRATE_API] == APIIntegrationAgent.__name__
+        assert TASK_AGENT_MAP[TaskType.MANAGE_STATE] == StateManagementAgent.__name__
 
     def test_existing_task_types_still_registered(self):
         from core.agent_manager import TASK_AGENT_MAP
         from agents.coder_agent import CoderAgent
         from agents.reviewer_agent import ReviewerAgent
 
-        assert TASK_AGENT_MAP[TaskType.GENERATE_FILE] is CoderAgent
-        assert TASK_AGENT_MAP[TaskType.REVIEW_FILE] is ReviewerAgent
+        assert TASK_AGENT_MAP[TaskType.GENERATE_FILE] == CoderAgent.__name__
+        assert TASK_AGENT_MAP[TaskType.REVIEW_FILE] == ReviewerAgent.__name__
 
 
 # ── FullstackPipeline helpers tests ──────────────────────────────────────────
@@ -1505,116 +1505,6 @@ class TestTaskDispatcher:
         assert result["stats"].get("failed", 0) >= 1
         # Nothing completed
         assert result["stats"].get("completed", 0) == 0
-
-
-# ── LifecycleOrchestrator tests ───────────────────────────────────────────────
-
-
-class TestLifecycleOrchestrator:
-    """Tests for the newly-extracted LifecycleOrchestrator class."""
-
-    def _make_orchestrator(self):
-        from core.lifecycle_orchestrator import LifecycleOrchestrator
-
-        am = MagicMock()
-        am.settings.max_concurrent_agents = 4
-        am.settings.phase_timeout_seconds = 30
-        am._metrics = {
-            "tasks_completed": 0, "tasks_failed": 0,
-            "total_time": 0.0, "agent_metrics": {},
-        }
-        am._live = None
-        am._event_bus = None
-        am._embedding_store = None
-        am.repo = MagicMock()
-        am.blueprint = MagicMock()
-        am.blueprint.file_blueprints = []
-        am._dep_store = None
-        return LifecycleOrchestrator(am), am
-
-    def test_build_lifecycle_metadata_review_trigger(self):
-        from core.lifecycle_orchestrator import LifecycleOrchestrator
-
-        lc = MagicMock()
-        lc.fix_trigger = "review"
-        lc.review_findings = ["unused var"]
-        lc.review_output = "Review output text"
-        meta = LifecycleOrchestrator._build_lifecycle_metadata(lc)
-
-        assert meta["fix_trigger"] == "review"
-        assert meta["review_errors"] == ["unused var"]
-        assert meta["review_output"] == "Review output text"
-
-    def test_build_lifecycle_metadata_test_trigger(self):
-        from core.lifecycle_orchestrator import LifecycleOrchestrator
-
-        lc = MagicMock()
-        lc.fix_trigger = "test"
-        lc.test_errors = "assertion failed"
-        lc.test_fix_target = "test_foo.py"
-        meta = LifecycleOrchestrator._build_lifecycle_metadata(lc)
-
-        assert meta["fix_trigger"] == "test"
-        assert meta["test_errors"] == "assertion failed"
-        assert meta["test_fix_target"] == "test_foo.py"
-
-    def test_build_lifecycle_metadata_build_trigger(self):
-        from core.lifecycle_orchestrator import LifecycleOrchestrator
-
-        lc = MagicMock()
-        lc.fix_trigger = "build"
-        lc.build_errors = "cannot find symbol"
-        meta = LifecycleOrchestrator._build_lifecycle_metadata(lc)
-
-        assert meta["fix_trigger"] == "build"
-        assert meta["build_errors"] == "cannot find symbol"
-
-    def test_extract_event_data_test_failure(self):
-        from core.lifecycle_orchestrator import LifecycleOrchestrator
-        from core.models import TaskResult
-
-        result = TaskResult(success=False, errors=["assert 1 == 2"])
-        data = LifecycleOrchestrator._extract_event_data(result, TaskType.GENERATE_TEST)
-
-        assert "assert 1 == 2" in data["errors"]
-
-    def test_extract_event_data_test_success_is_empty(self):
-        from core.lifecycle_orchestrator import LifecycleOrchestrator
-        from core.models import TaskResult
-
-        result = TaskResult(success=True, output="tests pass")
-        data = LifecycleOrchestrator._extract_event_data(result, TaskType.GENERATE_TEST)
-
-        assert data == {}
-
-    def test_extract_event_data_build_failure(self):
-        from core.lifecycle_orchestrator import LifecycleOrchestrator
-        from core.models import TaskResult
-
-        result = TaskResult(success=False, errors=["undefined reference"])
-        data = LifecycleOrchestrator._extract_event_data(result, TaskType.VERIFY_BUILD)
-
-        assert "undefined reference" in data["errors"]
-
-    def test_agent_manager_static_methods_forward_to_orchestrator(self):
-        """AgentManager._build_lifecycle_metadata / _extract_event_data must
-        delegate to LifecycleOrchestrator (backward-compat forwarding aliases)."""
-        from core.agent_manager import AgentManager
-        from core.lifecycle_orchestrator import LifecycleOrchestrator
-        from core.models import TaskResult
-
-        lc = MagicMock()
-        lc.fix_trigger = "build"
-        lc.build_errors = "error: missing semicolon"
-
-        am_result = AgentManager._build_lifecycle_metadata(lc)
-        orch_result = LifecycleOrchestrator._build_lifecycle_metadata(lc)
-        assert am_result == orch_result
-
-        tr = TaskResult(success=False, errors=["build error"])
-        am_ev = AgentManager._extract_event_data(tr, TaskType.VERIFY_BUILD)
-        orch_ev = LifecycleOrchestrator._extract_event_data(tr, TaskType.VERIFY_BUILD)
-        assert am_ev == orch_ev
 
 
 # ── Figma API integration tests ───────────────────────────────────────────────
@@ -2968,8 +2858,9 @@ class TestBaseAgentToolTimeout:
         from agents.coder_agent import CoderAgent
 
         agent = CoderAgent(llm_client=mock_llm, repo_manager=mock_repo_manager)
-        # Override timeout to 0.05 s for the test
-        agent._TOOL_TIMEOUT_SECONDS = 0.05
+        # Override timeout to 0.05 s for the test (ExecutionConfig is frozen)
+        from config.settings import ExecutionConfig
+        agent._exec = ExecutionConfig(tool_timeout_seconds=0.05)
 
         async def _slow_read(_inp):
             await asyncio.sleep(10)

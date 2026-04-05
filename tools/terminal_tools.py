@@ -135,10 +135,10 @@ class TerminalTools:
 
         # Build env-var prefix for the container
         # Inside Docker the workspace is mounted at /workspace
-        env_parts = ["PYTHONPATH=/workspace"]
         if self._lang.source_root:
-            env_parts.insert(0, f"PYTHONPATH=/workspace/{self._lang.source_root}:/workspace")
-            env_parts = env_parts[:1]  # keep only the combined one
+            env_parts = [f"PYTHONPATH=/workspace/{self._lang.source_root}:/workspace"]
+        else:
+            env_parts = ["PYTHONPATH=/workspace"]
 
         env_export = " && ".join(f"export {e}" for e in env_parts)
         cmd_str = " ".join(shlex.quote(p) for p in parts)

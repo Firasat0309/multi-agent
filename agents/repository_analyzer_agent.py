@@ -371,21 +371,5 @@ class RepositoryAnalyzerAgent(BaseAgent):
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
         """Parse JSON from LLM output, handling fences."""
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines)
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            start = text.find("{")
-            end = text.rfind("}") + 1
-            if start != -1 and end > start:
-                try:
-                    return json.loads(text[start:end])
-                except json.JSONDecodeError:
-                    pass
-            return {}
+        from core.json_utils import parse_llm_json
+        return parse_llm_json(text, label="repository analysis")

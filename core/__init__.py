@@ -10,7 +10,7 @@ __all__ = [
     "models",
     "permissions",
     "pipeline",
-    "pipeline_executor",
+    "simple_loop_executor",
     "session",
     "state_machine",
     "tool_factory",

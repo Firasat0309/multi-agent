@@ -162,12 +162,7 @@ class DesignParserAgent(BaseAgent):
 
     @staticmethod
     def _repair_json(text: str) -> str:
-        """Best-effort repair of common LLM JSON mistakes.
-
-        Delegates to the centralized repair in LLMClient which handles
-        trailing commas, single-quoted strings, JS comments, unquoted
-        property names, AND truncated output (unclosed braces/brackets).
-        """
+        """Best-effort repair of common LLM JSON mistakes."""
         from core.llm_client import LLMClient
         return LLMClient._repair_json_text(text)
 
@@ -181,26 +176,11 @@ class DesignParserAgent(BaseAgent):
 
             # Parse the final text output into the UIDesignSpec
             import json
+            from core.json_utils import parse_llm_json
             try:
-                # Basic string cleanup to extract JSON if the LLM wrapped it
-                content = result.output.strip()
-                if content.startswith("```"):
-                    content = content.split("\n", 1)[1]
-                    if content.endswith("```"):
-                        content = content[:-3].rsplit("```", 1)[0].rsplit("\n", 1)[0]
-
-                # Try strict parse first, then repair on failure
-                try:
-                    raw = json.loads(content)
-                except json.JSONDecodeError:
-                    repaired = self._repair_json(content)
-                    # Try to extract a JSON object if there's surrounding text
-                    start = repaired.find("{")
-                    end = repaired.rfind("}") + 1
-                    if start != -1 and end > start:
-                        repaired = repaired[start:end]
-                    raw = json.loads(repaired)
-                    logger.info("DesignParserAgent: JSON repair succeeded")
+                raw = parse_llm_json(result.output, label="design parser")
+                if not raw:
+                    raise json.JSONDecodeError("empty result", "", 0)
 
                 requirements: ProductRequirements | None = context.task.metadata.get("requirements")
                 spec = self._parse_spec(raw, requirements, figma_url)

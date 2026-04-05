@@ -16,17 +16,26 @@ for the batch agentic loop rather than an interactive REPL.
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
 # Rough chars-per-token estimate (conservative — avoids exceeding real limit).
 _CHARS_PER_TOKEN = 3.5
 
-# Default budget: 100 000 tokens expressed in characters.
-DEFAULT_CHAR_BUDGET = int(100_000 * _CHARS_PER_TOKEN)
+# Default budget: 120 000 tokens expressed in characters.
+# Raised from 100k → 120k: the extra headroom avoids premature compaction
+# that was discarding critical tool_result messages mid-fix-loop.
+DEFAULT_CHAR_BUDGET = int(120_000 * _CHARS_PER_TOKEN)
 
 # Number of tail messages always preserved verbatim.
-_KEEP_TAIL = 6
+# Raised from 6 → 10: with only 6, the last write_file + its tool_result
+# plus the build error were frequently compacted away, leaving the fix
+# agent with no memory of what it just tried.
+_KEEP_TAIL = 10
 
 
 def _message_chars(msg: dict) -> int:
@@ -56,7 +65,8 @@ def compact_messages(
     If the messages already fit, returns the original list unchanged (no copy).
     Otherwise, the first message + the last *keep_tail* messages are preserved
     and everything in between is replaced by a single ``[context compacted]``
-    user message.
+    user message that includes a summary of which files were read/written in
+    the removed section (so the model doesn't re-read already-seen files).
     """
     total = sum(_message_chars(m) for m in messages)
     if total <= char_budget:
@@ -68,19 +78,141 @@ def compact_messages(
 
     head = [messages[0]]
     tail = messages[-keep_tail:]
-    removed_count = len(messages) - 1 - keep_tail
+    middle = messages[1:-keep_tail]
+    removed_count = len(middle)
+
+    # Extract a brief summary of tool interactions in the removed section
+    # so the model retains awareness of what files were already processed.
+    files_read: list[str] = []
+    files_written: list[str] = []
+    for msg in middle:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("content", "") or block.get("text", "")
+                    if "Written" in text and " bytes to " in text:
+                        # Extract path from "Written N bytes to path"
+                        parts = text.split(" bytes to ", 1)
+                        if len(parts) == 2:
+                            files_written.append(parts[1].split("\n")[0].strip())
+                    elif text.startswith("[File: ") or text.startswith("["):
+                        # read_file result header
+                        path = text.split("|")[0].replace("[File: ", "").replace("[", "").strip()
+                        if path and "/" in path:
+                            files_read.append(path)
 
     logger.info(
-        "Compacting message history: %d chars → removed %d middle messages",
-        total, removed_count,
+        "Compacting message history: %d chars → removed %d middle messages "
+        "(read %d files, wrote %d files)",
+        total, removed_count, len(files_read), len(files_written),
+    )
+
+    summary_parts = [
+        f"[{removed_count} earlier messages removed to fit context window. "
+        f"The conversation started with the task prompt above and the most "
+        f"recent tool interactions follow below.]"
+    ]
+    if files_written:
+        summary_parts.append(
+            f"Files written in removed section: {', '.join(dict.fromkeys(files_written))}"
+        )
+    if files_read:
+        unique_reads = list(dict.fromkeys(files_read))[:15]
+        summary_parts.append(
+            f"Files read in removed section: {', '.join(unique_reads)}"
+        )
+
+    summary = {
+        "role": "user",
+        "content": "\n".join(summary_parts),
+    }
+
+    return head + [summary] + tail
+
+
+async def compact_messages_with_summary(
+    messages: list[dict],
+    llm_generate: "Callable[..., Awaitable[Any]]",
+    *,
+    char_budget: int = DEFAULT_CHAR_BUDGET,
+    keep_tail: int = _KEEP_TAIL,
+) -> list[dict]:
+    """Compaction with an LLM-generated semantic summary of removed messages.
+
+    Like ``compact_messages`` but instead of a bare file-list marker, calls
+    *llm_generate* to produce a concise summary of the removed conversation
+    section.  Falls back to the simple compaction on any LLM failure.
+
+    Args:
+        llm_generate: Async callable with signature
+            ``(prompt: str, system: str, max_tokens: int) -> response``
+            where ``response.content`` is the generated text.  Typically
+            bound to ``LLMClient.generate``.
+    """
+    total = sum(_message_chars(m) for m in messages)
+    if total <= char_budget:
+        return messages
+
+    if len(messages) <= keep_tail + 1:
+        return messages
+
+    head = [messages[0]]
+    tail = messages[-keep_tail:]
+    middle = messages[1:-keep_tail]
+
+    # Build a condensed representation of the middle for the LLM
+    middle_text_parts: list[str] = []
+    for msg in middle:
+        role = msg.get("role", "unknown")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            texts = []
+            for block in content:
+                if isinstance(block, dict):
+                    texts.append(block.get("text", "") or block.get("content", ""))
+                elif isinstance(block, str):
+                    texts.append(block)
+            content = "\n".join(texts)
+        # Truncate individual messages to keep the summarization prompt manageable
+        if len(content) > 500:
+            content = content[:250] + " ... " + content[-250:]
+        middle_text_parts.append(f"[{role}] {content}")
+
+    middle_text = "\n---\n".join(middle_text_parts)
+    # Cap the total summarization input to avoid blowing the budget
+    if len(middle_text) > 15_000:
+        middle_text = middle_text[:7_500] + "\n...[truncated]...\n" + middle_text[-7_500:]
+
+    prompt = (
+        "Summarise the following conversation excerpt in 3-5 bullet points.\n"
+        "Focus on: what files were created/modified, what errors occurred, "
+        "what fixes were attempted, and the current state of progress.\n"
+        "Be concise — this summary will replace the removed messages.\n\n"
+        f"{middle_text}"
+    )
+
+    try:
+        response = await llm_generate(
+            prompt=prompt,
+            system="You are a conversation summariser. Output only the bullet-point summary.",
+            max_tokens=300,
+        )
+        llm_summary = response.content.strip() if hasattr(response, "content") else str(response).strip()
+    except Exception as exc:
+        logger.warning("LLM summary failed (%s), falling back to simple compaction.", exc)
+        return compact_messages(messages, char_budget=char_budget, keep_tail=keep_tail)
+
+    logger.info(
+        "LLM-based compaction: removed %d middle messages, summary %d chars.",
+        len(middle), len(llm_summary),
     )
 
     summary = {
         "role": "user",
         "content": (
-            f"[{removed_count} earlier messages removed to fit context window. "
-            f"The conversation started with the task prompt above and the most "
-            f"recent tool interactions follow below.]"
+            f"[{len(middle)} earlier messages removed to fit context window. "
+            f"LLM-generated summary of removed section:]\n\n{llm_summary}"
         ),
     }
 

@@ -237,10 +237,9 @@ core/                    Orchestration engine
   pipeline_enhance.py    Modification workflow (5 phases)
   pipeline_fullstack.py  Fullstack workflow — concurrent BE + FE execution
   pipeline_frontend.py   Frontend-only pipeline (6 phases)
-  pipeline_executor.py   Tier-based execution engine with build checkpoints
+  simple_loop_executor.py  Tier-based execution engine with build checkpoints
   pipeline_definition.py  Declarative generate / enhance pipeline specs
   agent_manager.py       Agent factory + per-file lifecycle execution
-  lifecycle_orchestrator.py  FSM event loop + global DAG hand-off
   state_machine.py       Per-file FileLifecycle state machine (FilePhase + EventType)
   tier_scheduler.py      Group files into dependency tiers
   task_engine.py         Lifecycle plan builder + global TaskGraph
@@ -253,11 +252,16 @@ core/                    Orchestration engine
   sandbox_orchestrator.py  Docker sandbox setup and teardown
   llm_client.py          Unified LLM client (Anthropic / OpenAI / Gemini)
   observability.py       OpenTelemetry tracing + Prometheus metrics
+  simple_loop_executor.py  Tight generate→build→fix per-file loop
+  tool_dispatcher.py     Extracted tool dispatch + QualityChecker
+  context_cache.py       Shared tier-level context cache
+  context_compaction.py  Message history compaction
 
 memory/
   dependency_graph.py    File-to-file dependency store (used by ContextBuilder)
   embedding_store.py     ChromaDB vector store (semantic code search)
   repo_index.py          Structural catalog (imports, exports, classes, functions)
+  fix_memory_store.py    Fix-attempt persistence + cross-file learning
 
 config/
   settings.py            Pydantic settings dataclass — reads from environment
@@ -266,7 +270,7 @@ tools/
   terminal_tools.py      Run shell commands in sandbox or host
   file_tools.py          Patch application (unified diff)
 
-tests/                   pytest suite — 409 tests, 0 failures
+tests/                   pytest suite — 288 tests
 deploy/                  Docker Compose, Prometheus, Kubernetes manifests
 ```
 

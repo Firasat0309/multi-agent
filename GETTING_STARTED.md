@@ -555,7 +555,7 @@ pytest tests/
 pytest tests/ -x --tb=short
 
 # Specific module
-pytest tests/test_pipeline_executor.py -v
+pytest tests/test_simple_loop_executor.py -v
 
 # With coverage report
 pytest tests/ --cov=. --cov-report=term-missing

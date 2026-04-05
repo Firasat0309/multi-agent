@@ -178,8 +178,8 @@ class IntegrationCheckpointDef:
 class PipelineDefinition:
     """Complete declarative pipeline specification.
 
-    Consumed by the unified ``PipelineExecutor`` which replaces both
-    ``execute_with_lifecycle()`` and ``execute_graph()``.
+    Consumed by ``SimpleLoopExecutor`` which drives the
+    generate → build → fix loop.
     """
 
     name: str

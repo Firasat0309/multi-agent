@@ -6,6 +6,7 @@ import logging
 from typing import Any
 
 from agents.base_agent import BaseAgent
+from core.feature_flags import feature
 from core.models import (
     AgentContext,
     AgentRole,
@@ -15,6 +16,7 @@ from core.models import (
     TaskResult,
     TaskType,
 )
+from core.prompt_templates import PromptTemplates
 
 logger = logging.getLogger(__name__)
 
@@ -23,59 +25,75 @@ class ReviewerAgent(BaseAgent):
     role = AgentRole.REVIEWER
 
     @property
+    def tools(self) -> list:
+        """Read-only tools for cross-file verification (when REVIEWER_TOOLS enabled)."""
+        if not feature("REVIEWER_TOOLS"):
+            return []
+        from core.agent_tools import READ_FILE_TOOL, SEARCH_CODE_TOOL, FIND_DEFINITION_TOOL
+        return [READ_FILE_TOOL, SEARCH_CODE_TOOL, FIND_DEFINITION_TOOL]
+
+    @property
     def system_prompt(self) -> str:
-        return (
-            "You are a senior code reviewer agent. You perform structured, deterministic "
-            "code reviews.\n\n"
-
-            "You MUST respond with a JSON object (no markdown fences, no prose outside JSON):\n"
-            "{\n"
-            '  "passed": true or false,\n'
-            '  "summary": "One-sentence overall assessment",\n'
-            '  "findings": [\n'
-            "    {\n"
-            '      "severity": "critical" | "warning" | "info",\n'
-            '      "file": "path/to/file",\n'
-            '      "line": <line-number-or-null>,\n'
-            '      "message": "What is wrong",\n'
-            '      "suggestion": "How to fix it"\n'
-            "    }\n"
-            "  ]\n"
-            "}\n\n"
-
-            "SEVERITY DEFINITIONS (follow strictly):\n"
-            "- critical: Code will not compile, will crash at runtime, has a security "
-            "vulnerability (injection, XSS, SSRF), or violates the architecture blueprint "
-            "(wrong imports, missing exports, layer violation). ONLY use critical for "
-            "issues that MUST be fixed for the code to work correctly.\n"
-            "- warning: Code works but has a significant quality issue — missing error "
-            "handling for likely failure cases, resource leaks, race conditions, missing "
-            "input validation on public APIs.\n"
-            "- info: Style suggestions, minor improvements, optional optimizations. "
-            "These do NOT affect correctness.\n\n"
-
-            "PASS/FAIL RULE:\n"
-            "- Set \"passed\": false if there is AT LEAST ONE critical finding\n"
-            "- Set \"passed\": true if there are ZERO critical findings "
-            "(warnings and info are acceptable)\n\n"
-
-            "REVIEW CHECKLIST:\n"
-            "1. Does the file compile/parse without syntax errors?\n"
-            "2. Are all imports valid and do they match the dependency graph?\n"
-            "3. Are all exports from the blueprint actually defined?\n"
-            "4. Are there any runtime errors (null dereference, type mismatch, "
-            "missing return statements)?\n"
-            "5. Is error handling present for I/O operations and external calls?\n"
-            "6. Are there security issues (injection, hardcoded secrets, path traversal)?\n"
-            "7. Does the code follow the architectural layer constraints?\n\n"
-
-            "IMPORTANT:\n"
-            "- Do NOT flag style preferences as critical or warning\n"
-            "- Do NOT hallucinate issues — only report problems you can identify in the "
-            "actual code shown to you\n"
-            "- If the code is correct and follows the blueprint, return passed: true "
-            "with an empty findings array\n"
-            "- Be specific: reference exact line numbers and exact variable/method names"
+        return PromptTemplates.compose(
+            PromptTemplates.role("senior code reviewer performing structured, deterministic code reviews"),
+            PromptTemplates.output_json(),
+            PromptTemplates.review_rules(),
+            # Domain-specific JSON schema
+            (
+                "OUTPUT SCHEMA:\n"
+                "{\n"
+                '  "passed": true or false,\n'
+                '  "summary": "One-sentence overall assessment",\n'
+                '  "findings": [\n'
+                "    {\n"
+                '      "severity": "critical" | "warning" | "info",\n'
+                '      "file": "path/to/file",\n'
+                '      "line": <line-number-or-null>,\n'
+                '      "message": "What is wrong",\n'
+                '      "suggestion": "How to fix it"\n'
+                "    }\n"
+                "  ]\n"
+                "}"
+            ),
+            # Domain-specific severity definitions
+            (
+                "SEVERITY DEFINITIONS (follow strictly):\n"
+                "- critical: Code will not compile, will crash at runtime, has a security "
+                "vulnerability (injection, XSS, SSRF), or violates the architecture blueprint "
+                "(wrong imports, missing exports, layer violation). ONLY use critical for "
+                "issues that MUST be fixed for the code to work correctly.\n"
+                "- warning: Code works but has a significant quality issue — missing error "
+                "handling for likely failure cases, resource leaks, race conditions, missing "
+                "input validation on public APIs.\n"
+                "- info: Style suggestions, minor improvements, optional optimizations. "
+                "These do NOT affect correctness."
+            ),
+            # Pass/fail rule
+            (
+                "PASS/FAIL RULE:\n"
+                '- Set "passed": false if there is AT LEAST ONE critical finding\n'
+                '- Set "passed": true if there are ZERO critical findings '
+                "(warnings and info are acceptable)"
+            ),
+            # Review checklist
+            (
+                "REVIEW CHECKLIST:\n"
+                "1. Does the file compile/parse without syntax errors?\n"
+                "2. Are all imports valid and do they match the dependency graph?\n"
+                "3. Are all exports from the blueprint actually defined?\n"
+                "4. Are there any runtime errors (null dereference, type mismatch, "
+                "missing return statements)?\n"
+                "5. Is error handling present for I/O operations and external calls?\n"
+                "6. Are there security issues (injection, hardcoded secrets, path traversal)?\n"
+                "7. Does the code follow the architectural layer constraints?"
+            ),
+            PromptTemplates.no_hallucination(),
+            (
+                "Be specific: reference exact line numbers and exact variable/method names.\n"
+                "Do NOT flag style preferences as critical or warning.\n"
+                "If the code is correct and follows the blueprint, return passed: true "
+                "with an empty findings array."
+            ),
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:
@@ -117,7 +135,12 @@ class ReviewerAgent(BaseAgent):
         )
 
     async def _review_file(self, context: AgentContext) -> ReviewResult:
-        """Review a single file."""
+        """Review a single file.
+
+        When REVIEWER_TOOLS is enabled, uses the agentic loop with read-only
+        tools so the reviewer can cross-reference other files.  Otherwise
+        falls back to single-shot JSON response.
+        """
         formatted = self._format_context(context)
         
         # Explicitly append the target file content with line numbers for the reviewer
@@ -159,16 +182,39 @@ class ReviewerAgent(BaseAgent):
                 f"reference files not in depends_on"
             )
 
+        tool_instructions = ""
+        if self.tools:
+            tool_instructions = (
+                "\n\nYou have access to read-only tools. Use them to:\n"
+                "- read_file: Check dependency files to verify method signatures match\n"
+                "- search_code: Find usages of classes/methods across the codebase\n"
+                "- find_definition: Locate where a symbol is defined\n\n"
+                "After your investigation, output your final review as JSON using "
+                "the schema from your instructions."
+            )
+
         prompt = (
             f"{formatted}\n\n"
             f"Review the file: {context.task.file}\n"
-            f"{blueprint_checklist}\n\n"
+            f"{blueprint_checklist}\n"
+            f"{tool_instructions}\n\n"
             "Check each item in the review checklist from your instructions. "
             "For each issue found, provide the exact line number and a specific "
             "fix suggestion."
         )
 
-        data = await self._call_llm_json(prompt)
+        # If we have tools, use the agentic loop for cross-file verification
+        if self.tools:
+            result = await self.execute_agentic(context)
+            try:
+                import json as _json
+                data = _json.loads(result.output)
+            except (ValueError, TypeError):
+                # If the agentic response isn't valid JSON, try to extract it
+                data = await self._call_llm_json(prompt)
+        else:
+            data = await self._call_llm_json(prompt)
+
         return self._parse_review(data, ReviewLevel.FILE)
 
     async def _review_module(self, context: AgentContext) -> ReviewResult:

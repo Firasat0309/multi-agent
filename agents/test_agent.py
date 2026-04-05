@@ -10,6 +10,7 @@ from agents.base_agent import BaseAgent
 from core.coverage_runner import CoverageRunner
 from core.language import get_language_profile, LanguageProfile
 from core.models import AgentContext, AgentRole, TaskResult
+from core.prompt_templates import PromptTemplates
 from tools.terminal_tools import TerminalTools
 
 logger = logging.getLogger(__name__)
@@ -24,72 +25,84 @@ class TestAgent(BaseAgent):
 
     def _get_system_prompt(self, language: str) -> str:
         profile = get_language_profile(language)
-        return (
-            f"You are a senior test engineer specializing in {profile.display_name}.\n\n"
-
-            "YOUR TASK: Generate a focused, compilable, runnable test file that "
-            "covers the CORE functionality of the source file under test.\n\n"
-
-            "OUTPUT FORMAT:\n"
-            f"- Output ONLY raw {profile.display_name} code — no markdown fences, "
-            "no explanations, no commentary, no text before or after the code\n"
-            "- The very first line must be a valid language statement "
-            f"(package declaration, import, or {profile.display_name} comment)\n\n"
-
-            "CRITICAL REQUIREMENTS:\n"
-            "1. The test file MUST compile and run independently with zero modifications\n"
-            "2. Every import MUST match the EXACT package/module path of the source file — "
-            "copy import paths directly from the source code provided\n"
-            "3. Every test method MUST have ≥1 specific assertion that checks a concrete "
-            "value, type, exception, or state change — NEVER use assertTrue(true), "
-            "assertNotNull(result), or any trivial placeholder as the ONLY assertion\n"
-            "4. Test REAL method signatures from the source code — parameter names, types, "
-            "and return types must match the source EXACTLY\n"
-            "5. Focus on the MAIN public API — test only the most important public "
-            "methods/endpoints that define the file's core responsibility\n"
-            "6. Write 1 happy-path test per core method. Add 1 error-case test ONLY for "
-            "methods that handle user input, I/O, or critical business logic\n"
-            "7. Skip edge cases, boundary tests, and exhaustive permutations — keep it lean\n"
-            "8. Aim for 3–8 total tests per file, NOT 3 per method\n\n"
-
-            "TEST STRUCTURE (follow this order):\n"
-            "1. Package/module declaration (if required by language)\n"
-            "2. All imports (source under test + test framework + mocking library)\n"
-            "3. Test class/suite declaration with setup/teardown\n"
-            f"4. Use the standard {profile.display_name} test framework\n"
-            "5. For the CORE public methods, write:\n"
-            "   a) HAPPY PATH: valid input → verify exact expected return value\n"
-            "   b) ERROR CASE (only for critical methods): invalid input → verify "
-            "exact exception type\n\n"
-
-            "MOCKING RULES:\n"
-            "- Mock ONLY external dependencies (DB, HTTP, filesystem, message queues)\n"
-            "- NEVER mock the class/module under test\n"
-            "- When dependency interfaces are provided in the prompt, mock those EXACT "
-            "signatures — do not guess method names or parameter types\n"
-            "- Configure mock return values for happy-path tests\n"
-            "- Configure mock exceptions for error-case tests\n"
-            "- Verify mock interactions: assert mocks were called with expected arguments\n\n"
-
-            "ASSERTION RULES:\n"
-            "- assertEqual/assertEquals with SPECIFIC expected values (e.g., "
-            "assertEquals(42, result) not assertNotNull(result))\n"
-            "- assertRaises/assertThrows with SPECIFIC exception types\n"
-            "- Assert collection sizes AND specific elements, not just non-emptiness\n"
-            "- Assert state changes on mocks (e.g., verify save() was called with correct entity)\n\n"
-
-            "TEST ISOLATION & DETERMINISM:\n"
-            "- Each test must be independent: set up its own state, clean up after\n"
-            "- Use fixtures/setUp for common initialization code\n"
-            "- NEVER depend on test execution order\n"
-            "- NEVER use real time (sleep, current timestamp) — mock time-dependent behavior\n"
-            "- NEVER use random values without seeding — use fixed test data\n"
-            "- NEVER access real filesystem, network, or databases — mock all I/O\n\n"
-
-            "TEST NAMING:\n"
-            "- Names must describe: WHAT is tested + WHAT input + WHAT is expected\n"
-            "- Example patterns: test_methodName_whenCondition_thenExpectedResult, "
-            "test_createUser_withNullEmail_throwsValidationError"
+        framework = profile.test_command.split()[0] if profile.test_command else "the standard"
+        return PromptTemplates.compose(
+            PromptTemplates.role(f"senior test engineer specializing in {profile.display_name}"),
+            PromptTemplates.output_code(profile.display_name),
+            PromptTemplates.test_rules(framework),
+            # Domain-specific test requirements
+            (
+                "CRITICAL REQUIREMENTS:\n"
+                "1. The test file MUST compile and run independently with zero modifications\n"
+                "2. Every import MUST match the EXACT package/module path of the source file — "
+                "copy import paths directly from the source code provided\n"
+                "3. Every test method MUST have ≥1 specific assertion that checks a concrete "
+                "value, type, exception, or state change — NEVER use assertTrue(true), "
+                "assertNotNull(result), or any trivial placeholder as the ONLY assertion\n"
+                "4. Test REAL method signatures from the source code — parameter names, types, "
+                "and return types must match the source EXACTLY\n"
+                "5. Focus on the MAIN public API — test only the most important public "
+                "methods/endpoints that define the file's core responsibility\n"
+                "6. Write 1 happy-path test per core method. Add 1 error-case test for "
+                "EVERY public method that accepts parameters — test with null/empty/invalid "
+                "input and verify the method either throws a specific exception or returns "
+                "a documented error/default value\n"
+                "7. For methods with numeric or collection parameters, add 1 boundary test "
+                "(e.g., zero, negative, empty collection, max-size input)\n"
+                "8. Aim for 4–10 total tests per file — balance thoroughness with build speed"
+            ),
+            # Test structure
+            (
+                "TEST STRUCTURE (follow this order):\n"
+                "1. Package/module declaration (if required by language)\n"
+                "2. All imports (source under test + test framework + mocking library)\n"
+                "3. Test class/suite declaration with setup/teardown\n"
+                f"4. Use the standard {profile.display_name} test framework\n"
+                "5. For the CORE public methods, write:\n"
+                "   a) HAPPY PATH: valid input → verify exact expected return value\n"
+                "   b) ERROR CASE: invalid/null/empty input → verify exact exception type "
+                "or error return value\n"
+                "   c) BOUNDARY (if applicable): zero, negative, empty collection, "
+                "max value → verify behavior"
+            ),
+            # Mocking rules
+            (
+                "MOCKING RULES:\n"
+                "- Mock ONLY external dependencies (DB, HTTP, filesystem, message queues)\n"
+                "- NEVER mock the class/module under test\n"
+                "- When dependency interfaces are provided in the prompt, mock those EXACT "
+                "signatures — do not guess method names or parameter types\n"
+                "- Configure mock return values for happy-path tests\n"
+                "- Configure mock exceptions for error-case tests\n"
+                "- Verify mock interactions: assert mocks were called with expected arguments"
+            ),
+            # Assertion rules
+            (
+                "ASSERTION RULES:\n"
+                "- assertEqual/assertEquals with SPECIFIC expected values (e.g., "
+                "assertEquals(42, result) not assertNotNull(result))\n"
+                "- assertRaises/assertThrows with SPECIFIC exception types\n"
+                "- Assert collection sizes AND specific elements, not just non-emptiness\n"
+                "- Assert state changes on mocks (e.g., verify save() was called with correct entity)"
+            ),
+            # Test isolation
+            (
+                "TEST ISOLATION & DETERMINISM:\n"
+                "- Each test must be independent: set up its own state, clean up after\n"
+                "- Use fixtures/setUp for common initialization code\n"
+                "- NEVER depend on test execution order\n"
+                "- NEVER use real time (sleep, current timestamp) — mock time-dependent behavior\n"
+                "- NEVER use random values without seeding — use fixed test data\n"
+                "- NEVER access real filesystem, network, or databases — mock all I/O"
+            ),
+            # Test naming
+            (
+                "TEST NAMING:\n"
+                "- Names must describe: WHAT is tested + WHAT input + WHAT is expected\n"
+                "- Example patterns: test_methodName_whenCondition_thenExpectedResult, "
+                "test_createUser_withNullEmail_throwsValidationError"
+            ),
+            PromptTemplates.no_hallucination(),
         )
 
     @property

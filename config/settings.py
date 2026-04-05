@@ -45,7 +45,7 @@ class ExecutionConfig:
     """Tunable constants for the pipeline executor, agents, and context builder.
 
     Previously scattered as module-level ``_MAX_*`` constants across
-    ``pipeline_executor.py``, ``context_builder.py``, ``coder_agent.py``,
+    ``simple_loop_executor.py``, ``context_builder.py``, ``coder_agent.py``,
     and ``base_agent.py``.  Centralising them here lets operators tune
     behaviour per-project without code changes.
     """
@@ -86,6 +86,23 @@ class ExecutionConfig:
     retry_count: int = 4
     # Base delay in seconds for exponential backoff (doubles each attempt).
     backoff_base: float = 2.0
+
+    # ── Token budgets ────────────────────────────────────────────────────
+    # Max tokens a single file may consume across all attempts (generate + fixes).
+    file_token_budget: int = 50_000
+    # Max tokens for a single agent agentic-loop session.
+    agent_token_budget: int = 80_000
+    # Token threshold at which conversation compaction is triggered in the
+    # agentic loop.  Expressed as estimated tokens (chars / 3.5).
+    compaction_threshold_tokens: int = 80_000
+
+    # ── Blueprint validation ─────────────────────────────────────────────
+    # Max retry attempts for blueprint validation failures.
+    blueprint_max_retries: int = 3
+
+    # ── Cost warning ─────────────────────────────────────────────────────
+    # Percentage of max_cost_usd at which a warning is logged.
+    cost_warning_pct: float = 0.8
 
     # ── Circuit breaker ──────────────────────────────────────────────────
     # Consecutive failures before the circuit opens.

@@ -492,41 +492,6 @@ class ChangePlannerAgent(BaseAgent):
 
     @staticmethod
     def _parse_json(text: str) -> dict[str, Any]:
-        """Parse JSON from LLM output, handling markdown fences and truncation.
-
-        The fallback bracket-scan walks inward from the outermost ``{`` and
-        ``}`` so a truncated response that ends mid-array or mid-string is
-        rejected cleanly rather than parsed as a silently incomplete plan.
-        """
-        text = text.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines)
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-
-        # Walk inward: find outermost { … } pair where both ends parse cleanly.
-        # rfind("}") alone can match an interior "}" in truncated output,
-        # producing an incomplete but parse-successful fragment.
-        start = text.find("{")
-        if start == -1:
-            logger.error("No JSON object found in change plan response: %s...", text[:200])
-            return {}
-
-        end = len(text)
-        while end > start:
-            end = text.rfind("}", start, end)
-            if end == -1:
-                break
-            try:
-                return json.loads(text[start:end + 1])
-            except json.JSONDecodeError:
-                pass  # try one character shorter
-
-        logger.error("Could not parse change plan JSON: %s...", text[:200])
-        return {}
+        """Parse JSON from LLM output, handling markdown fences and truncation."""
+        from core.json_utils import parse_llm_json
+        return parse_llm_json(text, walk_inward=True, label="change plan")

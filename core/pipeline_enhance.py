@@ -310,7 +310,7 @@ class EnhancePipeline:
             for task in global_graph.tasks.values():
                 self._live.update_task(task.task_id, task.description, task.status.value)
 
-        # ── Phase 4: Execute via unified PipelineExecutor ─────────────────────
+        # ── Phase 4: Execute via SimpleLoopExecutor ─────────────────────────
         self._phase("Code Modification", "running")
         logger.info("[Phase 4] Executing targeted modifications via unified executor...")
 

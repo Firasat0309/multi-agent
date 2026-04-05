@@ -8,6 +8,7 @@ from typing import Any
 
 from agents.base_agent import BaseAgent
 from core.models import AgentContext, AgentRole, TaskResult
+from core.prompt_templates import PromptTemplates
 from tools.terminal_tools import TerminalTools
 
 logger = logging.getLogger(__name__)
@@ -22,53 +23,58 @@ class SecurityAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return (
-            "You are a security review agent. You analyze source code for real, "
-            "exploitable vulnerabilities.\n\n"
-
-            "You MUST respond with a JSON object (no markdown fences, no prose):\n"
-            "{\n"
-            '  "passed": true or false,\n'
-            '  "vulnerabilities": [\n'
-            "    {\n"
-            '      "severity": "critical" | "high" | "medium" | "low",\n'
-            '      "file": "exact/path/to/file",\n'
-            '      "line": <line-number>,\n'
-            '      "type": "<one of the allowed types below>",\n'
-            '      "description": "Specific description of the vulnerability",\n'
-            '      "remediation": "Specific code change to fix it"\n'
-            "    }\n"
-            "  ],\n"
-            '  "summary": "One-sentence overall security assessment"\n'
-            "}\n\n"
-
-            "ALLOWED VULNERABILITY TYPES:\n"
-            "SQL_INJECTION, COMMAND_INJECTION, XSS, SSRF, PATH_TRAVERSAL, "
-            "INSECURE_DESERIALIZATION, HARDCODED_SECRET, INSECURE_CRYPTO, "
-            "MISSING_AUTH, MISSING_INPUT_VALIDATION, INSECURE_DEPENDENCY, "
-            "INFORMATION_DISCLOSURE, RACE_CONDITION\n\n"
-
-            "SEVERITY DEFINITIONS:\n"
-            "- critical: Directly exploitable, leads to data breach or RCE "
-            "(e.g., unsanitized SQL concatenation, command injection with user input)\n"
-            "- high: Exploitable with some effort (e.g., XSS in user-facing endpoint, "
-            "missing authentication on admin route)\n"
-            "- medium: Potential risk requiring specific conditions (e.g., weak crypto, "
-            "verbose error messages leaking stack traces)\n"
-            "- low: Best practice violation, minimal real-world risk "
-            "(e.g., missing rate limiting, debug mode enabled)\n\n"
-
-            "PASS/FAIL RULE:\n"
-            "- Set \"passed\": false if ANY critical or high severity vulnerability exists\n"
-            "- Set \"passed\": true if only medium/low findings or no findings\n\n"
-
-            "FALSE POSITIVE AVOIDANCE:\n"
-            "- Do NOT flag framework-managed security features as vulnerabilities "
-            "(e.g., Spring Security CSRF protection, Django ORM parameterization, "
-            "Express.js helmet middleware)\n"
-            "- Do NOT flag parameterized queries / prepared statements as SQL injection\n"
-            "- Do NOT flag dependencies without evidence of a known vulnerability\n"
-            "- Only report vulnerabilities you can specifically identify in the actual code shown"
+        return PromptTemplates.compose(
+            PromptTemplates.role("security review agent analyzing source code for real, exploitable vulnerabilities"),
+            PromptTemplates.output_json(),
+            PromptTemplates.security_rules(),
+            # Domain-specific JSON schema
+            (
+                "OUTPUT SCHEMA:\n"
+                "{\n"
+                '  "passed": true or false,\n'
+                '  "vulnerabilities": [\n'
+                "    {\n"
+                '      "severity": "critical" | "high" | "medium" | "low",\n'
+                '      "file": "exact/path/to/file",\n'
+                '      "line": <line-number>,\n'
+                '      "type": "<one of the allowed types below>",\n'
+                '      "description": "Specific description of the vulnerability",\n'
+                '      "remediation": "Specific code change to fix it"\n'
+                "    }\n"
+                "  ],\n"
+                '  "summary": "One-sentence overall security assessment"\n'
+                "}"
+            ),
+            # Domain-specific vulnerability types and severity
+            (
+                "ALLOWED VULNERABILITY TYPES:\n"
+                "SQL_INJECTION, COMMAND_INJECTION, XSS, SSRF, PATH_TRAVERSAL, "
+                "INSECURE_DESERIALIZATION, HARDCODED_SECRET, INSECURE_CRYPTO, "
+                "MISSING_AUTH, MISSING_INPUT_VALIDATION, INSECURE_DEPENDENCY, "
+                "INFORMATION_DISCLOSURE, RACE_CONDITION\n\n"
+                "SEVERITY DEFINITIONS:\n"
+                "- critical: Directly exploitable, leads to data breach or RCE "
+                "(e.g., unsanitized SQL concatenation, command injection with user input)\n"
+                "- high: Exploitable with some effort (e.g., XSS in user-facing endpoint, "
+                "missing authentication on admin route)\n"
+                "- medium: Potential risk requiring specific conditions (e.g., weak crypto, "
+                "verbose error messages leaking stack traces)\n"
+                "- low: Best practice violation, minimal real-world risk "
+                "(e.g., missing rate limiting, debug mode enabled)"
+            ),
+            # Pass/fail and false positive avoidance
+            (
+                "PASS/FAIL RULE:\n"
+                '- Set "passed": false if ANY critical or high severity vulnerability exists\n'
+                '- Set "passed": true if only medium/low findings or no findings\n\n'
+                "FALSE POSITIVE AVOIDANCE:\n"
+                "- Do NOT flag framework-managed security features as vulnerabilities "
+                "(e.g., Spring Security CSRF protection, Django ORM parameterization, "
+                "Express.js helmet middleware)\n"
+                "- Do NOT flag parameterized queries / prepared statements as SQL injection\n"
+                "- Do NOT flag dependencies without evidence of a known vulnerability"
+            ),
+            PromptTemplates.no_hallucination(),
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:

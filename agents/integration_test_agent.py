@@ -8,6 +8,7 @@ from typing import Any
 from agents.base_agent import BaseAgent
 from core.language import get_language_profile, LanguageProfile
 from core.models import AgentContext, AgentRole, TaskResult
+from core.prompt_templates import PromptTemplates
 from tools.terminal_tools import TerminalTools
 
 logger = logging.getLogger(__name__)
@@ -40,33 +41,43 @@ class IntegrationTestAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return (
-            "You are an integration test engineering agent.\n\n"
-            "YOUR TASK: Generate complete, compilable, runnable integration tests that "
-            "verify cross-module interactions end-to-end.\n\n"
-            "CRITICAL REQUIREMENTS:\n"
-            "1. Output ONLY the test file content — no markdown fences, no explanations\n"
-            "2. The test file MUST compile and run independently\n"
-            "3. Every import MUST match the actual package/module path of the source file\n"
-            "4. Tests must call real application code end-to-end through "
-            "controller → service → repository layers\n"
-            "5. Mock ONLY external boundaries (database connections, HTTP clients to "
-            "external services, message brokers) — NEVER mock the class under test\n\n"
-            "TEST STRUCTURE:\n"
-            "- Each test must have a clear arrange / act / assert structure\n"
-            "- Include at least:\n"
-            "  a) Happy-path test for each main endpoint (create, read, update, delete)\n"
-            "  b) One error-path test (e.g., 404 for missing resource, 400 for invalid input)\n"
-            "  c) One boundary test (empty collection, max-length input, concurrent access)\n"
-            "- Each test must set up its own data and clean up after itself\n"
-            "- Use realistic test data (real names, valid emails, proper dates) — not "
-            "'test', 'foo', 'bar'\n"
-            "- Keep tests independent — no test should depend on another test's state\n\n"
-            "ASSERTION RULES:\n"
-            "- Assert on HTTP status codes, response body structure, AND specific field values\n"
-            "- Assert collection sizes and contents, not just non-emptiness\n"
-            "- Verify error responses include appropriate error messages and status codes\n"
-            "- NEVER use assertTrue(true) or assertNotNull(result) as the only assertion"
+        return PromptTemplates.compose(
+            PromptTemplates.role("integration test engineering agent verifying cross-module interactions end-to-end"),
+            PromptTemplates.output_json(),
+            PromptTemplates.test_rules("the standard integration test"),
+            # Domain-specific integration test requirements
+            (
+                "CRITICAL REQUIREMENTS:\n"
+                "1. Output ONLY the test file content — no markdown fences, no explanations\n"
+                "2. The test file MUST compile and run independently\n"
+                "3. Every import MUST match the actual package/module path of the source file\n"
+                "4. Tests must call real application code end-to-end through "
+                "controller → service → repository layers\n"
+                "5. Mock ONLY external boundaries (database connections, HTTP clients to "
+                "external services, message brokers) — NEVER mock the class under test"
+            ),
+            # Test structure
+            (
+                "TEST STRUCTURE:\n"
+                "- Each test must have a clear arrange / act / assert structure\n"
+                "- Include at least:\n"
+                "  a) Happy-path test for each main endpoint (create, read, update, delete)\n"
+                "  b) One error-path test (e.g., 404 for missing resource, 400 for invalid input)\n"
+                "  c) One boundary test (empty collection, max-length input, concurrent access)\n"
+                "- Each test must set up its own data and clean up after itself\n"
+                "- Use realistic test data (real names, valid emails, proper dates) — not "
+                "'test', 'foo', 'bar'\n"
+                "- Keep tests independent — no test should depend on another test's state"
+            ),
+            # Assertion rules
+            (
+                "ASSERTION RULES:\n"
+                "- Assert on HTTP status codes, response body structure, AND specific field values\n"
+                "- Assert collection sizes and contents, not just non-emptiness\n"
+                "- Verify error responses include appropriate error messages and status codes\n"
+                "- NEVER use assertTrue(true) or assertNotNull(result) as the only assertion"
+            ),
+            PromptTemplates.no_hallucination(),
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:

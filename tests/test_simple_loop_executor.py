@@ -82,16 +82,3 @@ async def test_incremental_builds_are_serialized(tmp_path):
     )
 
     assert max_in_flight == 1
-
-
-def test_pipeline_executor_is_a_simple_loop_compatibility_wrapper(tmp_path):
-    from core.pipeline_executor import PipelineExecutor
-
-    executor = _make_executor(
-        tmp_path,
-        type_check_command="cargo check",
-        build_command="cargo build",
-    )
-    compat = PipelineExecutor(executor._am, executor._settings, executor._lang)
-
-    assert isinstance(compat, SimpleLoopExecutor)

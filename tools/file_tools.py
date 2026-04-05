@@ -41,6 +41,11 @@ class FileTools:
     def __init__(self, workspace_root: Path) -> None:
         self.root = workspace_root
 
+    @staticmethod
+    def _ensure_newline(text: str) -> str:
+        """Ensure *text* ends with a newline."""
+        return text if text.endswith("\n") else text + "\n"
+
     def read_file(self, path: str) -> str:
         """Read a file relative to workspace root."""
         resolved = self._resolve(path)
@@ -78,7 +83,7 @@ class FileTools:
         lines = resolved.read_text(encoding="utf-8").splitlines(keepends=True)
         for i, line in enumerate(lines):
             if anchor in line:
-                lines.insert(i + 1, new_content if new_content.endswith("\n") else new_content + "\n")
+                lines.insert(i + 1, self._ensure_newline(new_content))
                 _write_atomic(resolved, "".join(lines))
                 return f"Inserted after line {i + 1} in {path}"
         raise ValueError(f"Anchor not found in {path}: {anchor[:50]}...")
@@ -91,7 +96,7 @@ class FileTools:
         lines = resolved.read_text(encoding="utf-8").splitlines(keepends=True)
         for i, line in enumerate(lines):
             if anchor in line:
-                lines.insert(i, new_content if new_content.endswith("\n") else new_content + "\n")
+                lines.insert(i, self._ensure_newline(new_content))
                 _write_atomic(resolved, "".join(lines))
                 return f"Inserted before line {i + 1} in {path}"
         raise ValueError(f"Anchor not found in {path}: {anchor[:50]}...")
@@ -103,7 +108,7 @@ class FileTools:
             raise FileNotFoundError(f"File not found: {path}")
         lines = resolved.read_text(encoding="utf-8").splitlines(keepends=True)
         idx = max(0, min(line_number - 1, len(lines)))
-        lines.insert(idx, new_content if new_content.endswith("\n") else new_content + "\n")
+        lines.insert(idx, self._ensure_newline(new_content))
         _write_atomic(resolved, "".join(lines))
         return f"Inserted at line {line_number} in {path}"
 

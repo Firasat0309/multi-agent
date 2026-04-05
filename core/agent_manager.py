@@ -1,25 +1,16 @@
 """Agent manager — thin coordination hub that wires agents, tools, and state.
 
-Responsibilities kept here:
+Responsibilities:
   - :meth:`__init__` — initialises all shared resources (LLM, terminals, metrics).
   - :meth:`_create_agent` — factory: maps a ``TaskType`` to the right agent class.
-  - Public delegation shims — ``execute_graph``, ``execute_with_lifecycle``,
-    ``execute_with_checkpoints`` — that preserve the historic public API while
-    delegating implementation to the focused sub-modules:
-
-      * :class:`~core.task_dispatcher.TaskDispatcher` — task-graph execution
-      * :class:`~core.lifecycle_orchestrator.LifecycleOrchestrator` — per-file
-        lifecycle FSM + global DAG hand-off
-
-The static helpers ``_build_lifecycle_metadata`` and ``_extract_event_data`` are
-kept as forwarding aliases so any code that calls ``AgentManager._build…``
-continues to work without modification.
+  - :meth:`execute_graph` — global DAG execution via :class:`TaskDispatcher`.
+  - :meth:`_execute_lifecycle_phase` — runs one lifecycle phase for a single file
+    (used by :class:`~core.simple_loop_executor.SimpleLoopExecutor`).
 """
 
 from __future__ import annotations
 
 import logging
-import warnings
 from typing import Any, TYPE_CHECKING
 
 import asyncio
@@ -30,32 +21,53 @@ from core.context_builder import ContextBuilder
 from core.event_bus import AgentEvent, BusEventType
 from core.observability import record_agent_start, record_agent_end
 
-from agents.architect_agent import ArchitectAgent
 from agents.base_agent import BaseAgent
-from agents.build_verifier_agent import BuildVerifierAgent
-from agents.coder_agent import CoderAgent
-from agents.deploy_agent import DeployAgent
-from agents.integration_test_agent import IntegrationTestAgent
-from agents.patch_agent import PatchAgent
-from agents.reviewer_agent import ReviewerAgent
-from agents.security_agent import SecurityAgent
-from agents.test_agent import TestAgent
-from agents.planner_agent import PlannerAgent
-from agents.writer_agent import WriterAgent
-# ── Fullstack / Frontend agents ───────────────────────────────────────────────
-from agents.product_planner_agent import ProductPlannerAgent
-from agents.api_contract_agent import APIContractAgent
-from agents.design_parser_agent import DesignParserAgent
-from agents.component_planner_agent import ComponentPlannerAgent
-from agents.component_dag_agent import ComponentDAGAgent
-from agents.component_generator_agent import ComponentGeneratorAgent
-from agents.api_integration_agent import APIIntegrationAgent
-from agents.state_management_agent import StateManagementAgent
+
+# ── Lazy agent imports ────────────────────────────────────────────────────────
+# Agents are imported on first use via _lazy_import() to avoid loading all 18
+# agent modules (and their transitive dependencies) at startup.  This cuts
+# import time significantly for CLI help, config validation, and runs that
+# only use a subset of agents.
+
+_AGENT_IMPORT_MAP: dict[str, tuple[str, str]] = {
+    "ArchitectAgent":           ("agents.architect_agent",           "ArchitectAgent"),
+    "BuildVerifierAgent":       ("agents.build_verifier_agent",      "BuildVerifierAgent"),
+    "CoderAgent":               ("agents.coder_agent",               "CoderAgent"),
+    "DeployAgent":              ("agents.deploy_agent",              "DeployAgent"),
+    "IntegrationTestAgent":     ("agents.integration_test_agent",    "IntegrationTestAgent"),
+    "PatchAgent":               ("agents.patch_agent",               "PatchAgent"),
+    "ReviewerAgent":            ("agents.reviewer_agent",            "ReviewerAgent"),
+    "SecurityAgent":            ("agents.security_agent",            "SecurityAgent"),
+    "TestAgent":                ("agents.test_agent",                "TestAgent"),
+    "PlannerAgent":             ("agents.planner_agent",             "PlannerAgent"),
+    "WriterAgent":              ("agents.writer_agent",              "WriterAgent"),
+    "ProductPlannerAgent":      ("agents.product_planner_agent",     "ProductPlannerAgent"),
+    "APIContractAgent":         ("agents.api_contract_agent",        "APIContractAgent"),
+    "DesignParserAgent":        ("agents.design_parser_agent",       "DesignParserAgent"),
+    "ComponentPlannerAgent":    ("agents.component_planner_agent",   "ComponentPlannerAgent"),
+    "ComponentDAGAgent":        ("agents.component_dag_agent",       "ComponentDAGAgent"),
+    "ComponentGeneratorAgent":  ("agents.component_generator_agent", "ComponentGeneratorAgent"),
+    "APIIntegrationAgent":      ("agents.api_integration_agent",     "APIIntegrationAgent"),
+    "StateManagementAgent":     ("agents.state_management_agent",    "StateManagementAgent"),
+}
+
+_agent_cache: dict[str, type[BaseAgent]] = {}
+
+
+def _lazy_import(class_name: str) -> type[BaseAgent]:
+    """Import and cache an agent class on first access."""
+    if class_name in _agent_cache:
+        return _agent_cache[class_name]
+    module_path, attr = _AGENT_IMPORT_MAP[class_name]
+    import importlib
+    module = importlib.import_module(module_path)
+    cls = getattr(module, attr)
+    _agent_cache[class_name] = cls
+    return cls
 from config.settings import Settings
 from core.event_bus import EventBus
 from core.file_lock_manager import FileLockManager
 from core.language import detect_language_from_blueprint
-from core.lifecycle_orchestrator import LifecycleOrchestrator
 from core.llm_client import LLMClient
 from core.models import (
     APIContract,
@@ -66,7 +78,6 @@ from core.repository_manager import RepositoryManager
 from core.state_machine import LifecycleEngine
 from core.task_dispatcher import TaskDispatcher
 from core.task_engine import TaskGraph
-from core.tier_scheduler import Tier
 from tools.terminal_tools import TerminalTools
 from core.mcp_client import MCPClient
 
@@ -78,43 +89,43 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Mapping from task type to agent class.  Consulted by _create_agent() and
-# available to tests / callers that need to inspect the registry directly.
-TASK_AGENT_MAP: dict[TaskType, type[BaseAgent]] = {
-    TaskType.GENERATE_FILE: CoderAgent,
-    TaskType.REVIEW_FILE: ReviewerAgent,
-    TaskType.REVIEW_MODULE: ReviewerAgent,
-    TaskType.REVIEW_ARCHITECTURE: ReviewerAgent,
-    TaskType.GENERATE_TEST: TestAgent,
-    TaskType.SECURITY_SCAN: SecurityAgent,
-    TaskType.GENERATE_DEPLOY: DeployAgent,
-    TaskType.GENERATE_DOCS: WriterAgent,
-    TaskType.FIX_CODE: CoderAgent,
-    TaskType.SECURITY_FIX: CoderAgent,
-    TaskType.MODIFY_FILE: PatchAgent,
-    TaskType.GENERATE_INTEGRATION_TEST: IntegrationTestAgent,
-    TaskType.DESIGN_ARCHITECTURE: ArchitectAgent,
-    TaskType.CREATE_PLAN: PlannerAgent,
-    TaskType.VERIFY_BUILD: BuildVerifierAgent,
+# Mapping from task type to agent class name (string).  Resolved lazily via
+# _lazy_import() to avoid importing all agent modules at startup.
+TASK_AGENT_MAP: dict[TaskType, str] = {
+    TaskType.GENERATE_FILE: "CoderAgent",
+    TaskType.REVIEW_FILE: "ReviewerAgent",
+    TaskType.REVIEW_MODULE: "ReviewerAgent",
+    TaskType.REVIEW_ARCHITECTURE: "ReviewerAgent",
+    TaskType.GENERATE_TEST: "TestAgent",
+    TaskType.SECURITY_SCAN: "SecurityAgent",
+    TaskType.GENERATE_DEPLOY: "DeployAgent",
+    TaskType.GENERATE_DOCS: "WriterAgent",
+    TaskType.FIX_CODE: "CoderAgent",
+    TaskType.SECURITY_FIX: "CoderAgent",
+    TaskType.MODIFY_FILE: "PatchAgent",
+    TaskType.GENERATE_INTEGRATION_TEST: "IntegrationTestAgent",
+    TaskType.DESIGN_ARCHITECTURE: "ArchitectAgent",
+    TaskType.CREATE_PLAN: "PlannerAgent",
+    TaskType.VERIFY_BUILD: "BuildVerifierAgent",
     # ── Fullstack / Frontend task types ──────────────────────────────────────
-    TaskType.PLAN_PRODUCT: ProductPlannerAgent,
-    TaskType.GENERATE_API_CONTRACT: APIContractAgent,
-    TaskType.PARSE_DESIGN: DesignParserAgent,
-    TaskType.PLAN_COMPONENTS: ComponentPlannerAgent,
-    TaskType.BUILD_COMPONENT_DAG: ComponentDAGAgent,
-    TaskType.GENERATE_COMPONENT: ComponentGeneratorAgent,
-    TaskType.FIX_COMPONENT: ComponentGeneratorAgent,
-    TaskType.INTEGRATE_API: APIIntegrationAgent,
-    TaskType.MANAGE_STATE: StateManagementAgent,
+    TaskType.PLAN_PRODUCT: "ProductPlannerAgent",
+    TaskType.GENERATE_API_CONTRACT: "APIContractAgent",
+    TaskType.PARSE_DESIGN: "DesignParserAgent",
+    TaskType.PLAN_COMPONENTS: "ComponentPlannerAgent",
+    TaskType.BUILD_COMPONENT_DAG: "ComponentDAGAgent",
+    TaskType.GENERATE_COMPONENT: "ComponentGeneratorAgent",
+    TaskType.FIX_COMPONENT: "ComponentGeneratorAgent",
+    TaskType.INTEGRATE_API: "APIIntegrationAgent",
+    TaskType.MANAGE_STATE: "StateManagementAgent",
 }
 
 
 class AgentManager:
-    """Thin coordination hub: initialises shared state and delegates execution.
+    """Coordination hub: initialises shared state and delegates execution.
 
-    All long-running execution logic lives in :class:`~core.task_dispatcher.TaskDispatcher`
-    and :class:`~core.lifecycle_orchestrator.LifecycleOrchestrator`.  The public
-    method signatures below are preserved verbatim for backward compatibility.
+    Execution lives in :class:`~core.simple_loop_executor.SimpleLoopExecutor`
+    (per-file generate→build→fix loop) and :class:`~core.task_dispatcher.TaskDispatcher`
+    (global advisory DAG).
     """
 
     def __init__(
@@ -173,39 +184,34 @@ class AgentManager:
         }
         self._file_locks = FileLockManager()
 
-        # Execution collaborators — owned here so each call doesn't re-allocate.
+        # Global DAG executor (deploy, docs, etc.)
         self._dispatcher = TaskDispatcher(self)
-        self._orchestrator = LifecycleOrchestrator(self)
 
     def _create_agent(self, task_type: TaskType) -> BaseAgent:
-        agent_cls = TASK_AGENT_MAP.get(task_type)
-        if agent_cls is None:
+        agent_class_name = TASK_AGENT_MAP.get(task_type)
+        if agent_class_name is None:
             raise ValueError(f"No agent registered for task type: {task_type}")
 
-        # TestAgent / IntegrationTestAgent → test terminal (no-network sandbox).
-        # SecurityAgent → build terminal (bandit needs the full env).
-        if agent_cls in (TestAgent, IntegrationTestAgent):
-            return agent_cls(
-                llm_client=self.llm,
-                repo_manager=self.repo,
-                terminal=self.test_terminal,
-                mcp_client=self.mcp_client,
-            )
-        if agent_cls is SecurityAgent:
-            return agent_cls(
-                llm_client=self.llm,
-                repo_manager=self.repo,
-                terminal=self.build_terminal,
-                mcp_client=self.mcp_client,
-            )
-        if agent_cls is BuildVerifierAgent:
-            return agent_cls(
-                llm_client=self.llm,
-                repo_manager=self.repo,
-                terminal=self.build_terminal,
-                mcp_client=self.mcp_client,
-            )
-        return agent_cls(llm_client=self.llm, repo_manager=self.repo, mcp_client=self.mcp_client)
+        agent_cls = _lazy_import(agent_class_name)
+
+        # Pick the right terminal: test agents use the sandboxed test terminal,
+        # security/build agents use the build terminal, others get no terminal.
+        _test_agent_names = {"TestAgent", "IntegrationTestAgent"}
+        _terminal_agent_names = {"SecurityAgent", "BuildVerifierAgent"}
+
+        if agent_class_name in _test_agent_names:
+            terminal = self.test_terminal
+        elif agent_class_name in _terminal_agent_names:
+            terminal = self.build_terminal
+        else:
+            return agent_cls(llm_client=self.llm, repo_manager=self.repo, mcp_client=self.mcp_client)
+
+        return agent_cls(
+            llm_client=self.llm,
+            repo_manager=self.repo,
+            terminal=terminal,
+            mcp_client=self.mcp_client,
+        )
 
     # ── Public execution API — all implementation lives in the collaborators ──
 
@@ -217,30 +223,11 @@ class AgentManager:
         return await self._dispatcher.execute_graph(task_graph)
 
     async def _execute_task(self, task: Any, task_graph: TaskGraph) -> None:
-        """Execute a single task — kept for backward compatibility with tests.
+        """Execute a single task.
 
         Delegates to :class:`~core.task_dispatcher.TaskDispatcher`.
         """
         return await self._dispatcher._execute_task(task, task_graph)
-
-    async def execute_with_lifecycle(
-        self,
-        engine: LifecycleEngine,
-        global_graph: TaskGraph,
-    ) -> dict[str, Any]:
-        """Drive per-file lifecycle FSM then run the global DAG.
-
-        .. deprecated::
-            Prefer calling :class:`~core.pipeline_executor.PipelineExecutor`
-            directly.  This shim is kept for backward compatibility only.
-        """
-        warnings.warn(
-            "AgentManager.execute_with_lifecycle is deprecated. "
-            "Use PipelineExecutor.execute() directly.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return await self._orchestrator.execute_with_lifecycle(engine, global_graph)
 
     async def _execute_lifecycle_phase(
         self,
@@ -514,13 +501,6 @@ class AgentManager:
         Graceful degradation: exceptions during review or fix phases must not
         hard-fail a file.  Only generation-level failures result in
         ``RETRIES_EXHAUSTED`` and a ``tasks_failed`` increment.
-
-        Behaviour by phase:
-
-        * ``REVIEWING`` — auto-pass review so the file can continue.
-        * ``FIXING``    — fire ``FIX_APPLIED`` to re-enter the review cycle.
-        * Any other     — fire ``RETRIES_EXHAUSTED`` and increment
-          ``tasks_failed``.
         """
         logger.exception("[%s] %s unhandled error: %s", file_path, phase.value, exc)
         if phase == FilePhase.REVIEWING:
@@ -532,61 +512,39 @@ class AgentManager:
             self._metrics["tasks_failed"] += 1
 
     def _get_agent_name_for_task_type(self, task_type: TaskType) -> str:
-        """Return the agent class name registered for *task_type*.
-
-        Derived directly from ``TASK_AGENT_MAP`` so there is a single source
-        of truth — adding a new agent to the registry automatically makes it
-        discoverable here.
-        """
+        """Return the agent class name registered for *task_type*."""
         agent_cls = TASK_AGENT_MAP.get(task_type)
         if agent_cls is None:
             return "UnknownAgent"
         return agent_cls.__name__
 
-    async def execute_with_checkpoints(
-        self,
-        engine: LifecycleEngine,
-        global_graph: TaskGraph,
-        *,
-        tiers: list[Tier] | None = None,
-        pipeline_def: Any = None,
-    ) -> dict[str, Any]:
-        """Tier-scheduled execution with repo-level build checkpoints.
-
-        .. deprecated::
-            Prefer calling :class:`~core.pipeline_executor.PipelineExecutor`
-            directly.  This shim is kept for backward compatibility only.
-        """
-        warnings.warn(
-            "AgentManager.execute_with_checkpoints is deprecated. "
-            "Use PipelineExecutor.execute() directly.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return await self._orchestrator.execute_with_checkpoints(
-            engine,
-            global_graph,
-            tiers=tiers,
-            pipeline_def=pipeline_def,
-        )
-
-    # ── Static helpers — shared with LifecycleOrchestrator ───────────────────
+    # ── Static helpers ───────────────────────────────────────────────────────
 
     @staticmethod
     def _build_lifecycle_metadata(lc: Any) -> dict[str, Any]:
-        """Build task metadata from lifecycle state for downstream agents.
-
-        Delegates to :meth:`LifecycleOrchestrator._build_lifecycle_metadata`
-        so both callers share a single canonical implementation.
-        """
-        return LifecycleOrchestrator._build_lifecycle_metadata(lc)
+        """Build task metadata from lifecycle state for downstream agents."""
+        meta: dict[str, Any] = {}
+        if lc.fix_trigger == "review":
+            meta["review_errors"] = lc.review_findings
+            meta["review_output"] = lc.review_output
+            meta["fix_trigger"] = "review"
+        elif lc.fix_trigger == "test":
+            meta["test_errors"] = lc.test_errors
+            meta["fix_trigger"] = "test"
+            meta["test_fix_target"] = lc.test_fix_target
+        elif lc.fix_trigger == "build":
+            meta["build_errors"] = lc.build_errors
+            meta["fix_trigger"] = "build"
+        return meta
 
     @staticmethod
-    def _extract_event_data(result: Any, task_type: Any) -> dict[str, Any]:
-        """Extract event data from agent result for lifecycle FSM transitions.
-
-        Delegates to :meth:`LifecycleOrchestrator._extract_event_data`
-        so both callers share a single canonical implementation.
-        """
-        return LifecycleOrchestrator._extract_event_data(result, task_type)
+    def _extract_event_data(result: Any, task_type: TaskType) -> dict[str, Any]:
+        """Extract event data from agent result for lifecycle FSM transitions."""
+        data: dict[str, Any] = {}
+        if task_type == TaskType.GENERATE_TEST:
+            if not result.success:
+                data["errors"] = "\n".join(result.errors) if result.errors else result.output
+        if task_type == TaskType.VERIFY_BUILD:
+            data["errors"] = "\n".join(result.errors) if result.errors else result.output
+        return data
 

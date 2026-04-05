@@ -34,9 +34,8 @@
    - 5.3 [EnhancePipeline (enhance)](#53-enhancepipeline-enhance-mode)
    - 5.4 [FullstackPipeline (fullstack)](#54-fullstackpipeline-fullstack-mode)
    - 5.5 [FrontendPipeline](#55-frontendpipeline)
-   - 5.6 [PipelineExecutor](#56-pipelineexecutor)
+   - 5.6 [SimpleLoopExecutor](#56-simpleloopexecutor)
    - 5.7 [AgentManager](#57-agentmanager)
-   - 5.8 [LifecycleOrchestrator](#58-lifecycleorchestrator)
 6. [Per-File State Machine](#6-per-file-state-machine)
 7. [Dependency-Tier Scheduling](#7-dependency-tier-scheduling)
 8. [Build Checkpoints](#8-build-checkpoints)
@@ -90,7 +89,7 @@ The orchestrator is:
 | `enhance` | `Pipeline.enhance()` | Modify an existing repository |
 | `fullstack` | `Pipeline.run_fullstack()` | Backend + React/Next.js frontend |
 
-All three modes share the same `PipelineExecutor` as the core execution
+All three modes share the same `SimpleLoopExecutor` as the core execution
 engine, ensuring consistent checkpoint, tier, and fix-loop behaviour.
 
 ---
@@ -145,12 +144,12 @@ This section covers two flows:
     - test_sandbox:  network-isolated (tests must not make external calls)
 
 ══════════════════════════════════════════════════════════════════
-  PHASE 3 — TIERED EXECUTION (PipelineExecutor)
+  PHASE 3 — TIERED EXECUTION (SimpleLoopExecutor)
 ══════════════════════════════════════════════════════════════════
 
   For each Tier 0 … Tier N:
   ┌──────────────────────────────────────────────────────────────┐
-  │  PipelineExecutor._run_tier_lifecycles(engine, tier)         │
+  │  SimpleLoopExecutor._run_tier_lifecycles(engine, tier)         │
   │                                                              │
   │  All files in the tier run concurrently (up to              │
   │  max_concurrent_agents = 4 by default) with asyncio tasks   │
@@ -337,7 +336,7 @@ This section covers two flows:
   │                             │   │  FE Phase 4 — COMPONENT GENERATION   │
   │                             │   │    ComponentGeneratorAgent           │
   │                             │   │    Runs tier-by-tier (same model     │
-  │                             │   │    as backend PipelineExecutor)      │
+  │                             │   │    as backend SimpleLoopExecutor)      │
   │                             │   │    All components in a tier run      │
   │                             │   │    concurrently via asyncio.gather   │
   │                             │   │    Writes .tsx / .vue files to       │
@@ -481,7 +480,7 @@ class FileBlueprint:
 - `LifecycleEngine`: orchestrates all per-file FSMs, knows which files are ready to execute based on dependency resolution
 - `TaskGraph`: a DAG of global tasks (security, deploy, docs, integration tests)
 
-**Connected to:** `RunPipeline` passes both to `PipelineExecutor`
+**Connected to:** `RunPipeline` passes both to `SimpleLoopExecutor`
 
 ---
 
@@ -595,7 +594,7 @@ class FileBlueprint:
 |---|---|
 | **Role** | `AgentRole.BUILD_VERIFIER` |
 | **Task type** | `VERIFY_BUILD` |
-| **Invoked by** | `PipelineExecutor._run_checkpoint()` via fix dispatch |
+| **Invoked by** | `SimpleLoopExecutor._run_checkpoint()` via fix dispatch |
 | **Languages** | Java, Go, Rust, TypeScript, C# only — skipped for Python |
 
 **Input:** `AgentContext` + `TerminalTools` (build sandbox)
@@ -625,7 +624,7 @@ class FileBlueprint:
 |---|---|
 | **Role** | `AgentRole.TESTER` |
 | **Task type** | `GENERATE_TEST` |
-| **Invoked by** | `PipelineExecutor._run_test_phase()` |
+| **Invoked by** | `SimpleLoopExecutor._run_test_phase()` |
 | **Sandbox** | `test_sandbox` (network-isolated Docker container) |
 
 **Input:** `AgentContext` containing:
@@ -981,7 +980,7 @@ This agent mirrors the role of `TierScheduler` on the backend side.
 4. Writes the file via `RepositoryManager` (atomic write)
 5. `EmbeddingStore` indexes each component as it is written (for later-tier semantic context)
 
-**Concurrency:** All components in the same generation tier run via `asyncio.gather` — same pattern as the backend `PipelineExecutor`.
+**Concurrency:** All components in the same generation tier run via `asyncio.gather` — same pattern as the backend `SimpleLoopExecutor`.
 
 **Output:** `TaskResult` with `files_modified=[component.file_path]`
 
@@ -1065,7 +1064,7 @@ async with Pipeline(settings) as p:
 |-------|-------------|
 | 1 Architecture | `ArchitectAgent` → `RepositoryBlueprint` |
 | 2 Planning | `PlannerAgent` → `LifecycleEngine` + `TaskGraph` + `TierScheduler` → `tiers[]` + `SandboxOrchestrator.setup()` |
-| 3 Execution | `PipelineExecutor.execute(engine, global_graph, tiers, pipeline_def=GENERATE_PIPELINE)` |
+| 3 Execution | `SimpleLoopExecutor.execute(engine, global_graph, tiers, pipeline_def=GENERATE_PIPELINE)` |
 | 4 Finalise | `index_workspace()` + `RunReporter.write_run_report()` + sandbox teardown |
 
 The `GENERATE_PIPELINE` definition:
@@ -1090,7 +1089,7 @@ Global tasks: [SECURITY_SCAN, GENERATE_DEPLOY, GENERATE_DOCS, GENERATE_INTEGRATI
 | 1 Analysis | `RepositoryAnalyzerAgent` → `RepoAnalysis` |
 | 2 Change Planning | `ChangePlannerAgent` → `ChangePlan` (+ optional human approval) |
 | 3 Lifecycle Plan | `EnhanceLifecyclePlanBuilder.build(change_plan)` → `LifecycleEngine` with MODIFY_FILE tasks |
-| 4 Execution | `PipelineExecutor.execute(engine, global_graph, tiers, pipeline_def=ENHANCE_PIPELINE)` |
+| 4 Execution | `SimpleLoopExecutor.execute(engine, global_graph, tiers, pipeline_def=ENHANCE_PIPELINE)` |
 | 5 Finalise | Re-index workspace + `RunReporter.write_modify_report()` |
 
 Before Phase 4, a `WorkspaceSnapshot` is taken so the workspace can be rolled
@@ -1147,25 +1146,47 @@ workspace/
 
 ---
 
-### 5.6 PipelineExecutor
+### 5.6 SimpleLoopExecutor
 
-`core/pipeline_executor.py` — The core unified execution engine. Used by all modes.
+`core/simple_loop_executor.py` — the core unified execution engine. Used by
+all modes.
+
+`SimpleLoopExecutor` implements a tight **generate → build → fix** loop per
+file, replacing the earlier multi-phase FSM with far fewer LLM calls:
+
+```
+LLM calls per file: 1 (generate) + 0-4 (fixes) = 1-5
+vs. old:            1 (generate) + 1 (review) + 1-2 (fix) + 1-2 (build) = 4-6
+```
 
 Responsibilities:
 1. Wire `EventBus` subscribers for cross-file re-verification
 2. For each tier (in order):
-   - Call `_run_tier_lifecycles(engine, tier)` — parallel per-file FSM
-   - If compiled language: create forward-reference stubs for next tier
-   - Run `BuildCheckpoint` → attribute errors → dispatch fix tasks → retry up to N times
-3. After all tiers: call `_run_test_phase(engine)`
-4. Complete global DAG via `AgentManager.execute_graph(global_graph)`
-5. Collect and return execution stats, checkpoint results, bus failure report
+   - Process files concurrently within the tier (bounded by `max_concurrent_agents`)
+   - Per file: generate → write → build → fix (up to `MAX_ATTEMPTS=5`)
+   - **Per-module build locks** — files in independent directories build
+     concurrently; files in the same module serialize to avoid conflicts
+   - **Shared context cache** — dependency files read once per tier and
+     reused across all files in that tier; cache cleared between tiers
+   - **Cross-file fix learning** — when file A fixes error X, file B
+     hitting the same error class receives the resolution as a hint
+   - **Smart escalation** — detects stalled progress via exact hash match,
+     fuzzy line-overlap (>60% similarity), or oscillation between error
+     states (A→B→A), and escalates with a different-approach prompt
+3. After all tiers: run a global build as a final sanity check
+4. If global build fails: dispatch cross-file fixes and retry once
+5. Run test generation phase (optional)
+6. Complete global DAG via `AgentManager.execute_graph(global_graph)`
+7. Collect and return execution stats, checkpoint results, bus failure report
 
 Key correctness guarantees:
-- A tier does not start until the previous tier's checkpoint passes (or is declared unrecoverable)
+- A tier does not start until the previous tier completes
 - Files whose deps are ALL broken are themselves failed rather than hung PENDING
-- Stale detection: if files are stuck PENDING with no in-flight tasks for `2× phase_timeout`, they are force-failed to prevent deadlock
-- Reverify queue: files already in BUILDING/TESTING/PASSED that receive an upstream FILE_WRITTEN event are re-queued for verification at the next checkpoint
+- Cascade failures: if tier N files fail, downstream tiers are cascade-failed
+- **Error context budget**: `MAX_ERROR_CHARS=8000` per fix prompt (sufficient
+  for full type-mismatch details in Java/TypeScript compiler output)
+- **Fix memory persistence**: `FixMemoryStore` records every failed attempt and
+  successful resolution to disk, surviving across runs
 
 ---
 
@@ -1188,20 +1209,6 @@ Key correctness guarantees:
 5. **`_get_agent_name_for_task_type(task_type)`** — derived from `TASK_AGENT_MAP` (single source of truth)
 
 `TASK_AGENT_MAP` is a module-level dict mapping every `TaskType` to an agent class — the canonical registry for all agent routing.
-
----
-
-### 5.8 LifecycleOrchestrator
-
-`core/lifecycle_orchestrator.py` — Delegates to `AgentManager`:
-
-- `execute_with_lifecycle(engine, graph)` — *(deprecated)* FSM event loop without checkpoints
-- `execute_with_checkpoints(engine, graph, tiers, pipeline_def)` — *(deprecated)* delegates to `PipelineExecutor`
-- `_execute_lifecycle_phase(engine, file_path, phase)` — thin shim calling `AgentManager._execute_lifecycle_phase`
-- Static helpers `_build_lifecycle_metadata` and `_extract_event_data` — used by tests and `AgentManager` for backward compatibility
-
-Both `execute_with_*` methods emit a `DeprecationWarning`. All production code
-uses `PipelineExecutor.execute()` directly.
 
 ---
 
@@ -1363,11 +1370,46 @@ full source.
 Total context is capped at `MAX_CONTEXT_CHARS = 120,000` characters across
 all related files to prevent context overflow.
 
+**Dependency context budget:** Related files receive up to **12,000 characters**
+each (≈ 3,000 tokens) — enough to include complete method signatures, type
+definitions, and import blocks. The previous 4,000 character limit routinely
+truncated the exact symbols the coder agent needed.
+
+**Context compaction** (`core/context_compaction.py`): When the agentic
+tool-use conversation grows beyond the token budget (120K tokens / 420K chars),
+older messages are compacted. The compactor preserves:
+- The **first** message (task prompt) — always kept verbatim
+- The **last 10** messages (recent tool interactions) — always kept verbatim
+- A **summary marker** replacing the middle, listing which files were read
+  and written in the removed section so the model avoids redundant reads
+
+**Shared context cache** (`core/context_cache.py`): Within a processing tier,
+dependency file reads are cached by content hash. When 10 files all depend on
+the same 3 models, the models are read once and served from cache for the
+remaining 9 — avoiding redundant I/O and AST extraction.
+
 ---
 
 ## 10. Memory Stores
 
-Three complementary memory layers are maintained throughout execution:
+Four complementary memory layers are maintained throughout execution:
+
+### FixMemoryStore (`memory/fix_memory_store.py`)
+
+A JSON-backed persistent store of fix attempts and resolutions per file.
+
+Used for:
+- Preventing the fix loop from repeating the same failed strategy
+- **Cross-file learning**: when file A resolves error hash `abc123`, the
+  resolution summary is stored in a global pattern table. When file B hits
+  the same `abc123` error, the fix agent receives file A's resolution as
+  a hint (via `get_cross_file_hints(error_hash)`).
+- Recording up to 5 error attempts and 3 resolutions per file
+- Error text is preserved at 2,400 characters (sufficient for full compiler
+  messages including type-mismatch details)
+
+Updated by `SimpleLoopExecutor._fix_file()` on every fix attempt and
+resolution. Persisted to `.simple_loop_memory.json` in the workspace root.
 
 ### DependencyGraphStore (`memory/dependency_graph.py`)
 
@@ -1410,11 +1452,11 @@ Key events:
 
 | Event | Published by | Subscribed by |
 |-------|-------------|---------------|
-| `FILE_WRITTEN` | `AgentManager` after any file write | `PipelineExecutor` re-verification handler |
+| `FILE_WRITTEN` | `AgentManager` after any file write | `SimpleLoopExecutor` re-verification handler |
 | `REVIEW_PASSED` | `AgentManager` after review | Observability / logging |
 | `REVIEW_FAILED` | `AgentManager` after review | Observability / logging |
 | `TASK_COMPLETED` | `AgentManager` after any task success | Observability |
-| `TASK_FAILED` | `AgentManager` / `PipelineExecutor` on build failure | Observability |
+| `TASK_FAILED` | `AgentManager` / `SimpleLoopExecutor` on build failure | Observability |
 | `TEST_PASSED` | `AgentManager` after test success | Observability |
 | `TEST_FAILED` | `AgentManager` after test failure | Observability |
 
@@ -1424,7 +1466,7 @@ This is the mechanism that propagates "an upstream file changed" to files
 that may now have stale/broken imports.
 
 Critical subscribers (like the re-verification handler) record failures
-instead of swallowing them. `PipelineExecutor` checks `event_bus.has_failures()`
+instead of swallowing them. `SimpleLoopExecutor` checks `event_bus.has_failures()`
 at the end of execution and includes them in the result.
 
 ---
@@ -1502,10 +1544,9 @@ multi-agent-claude/
 │   ├── pipeline_enhance.py   Repository modification workflow
 │   ├── pipeline_fullstack.py Full-stack workflow
 │   ├── pipeline_frontend.py  Frontend half of fullstack
-│   ├── pipeline_executor.py  Tier-based execution engine + checkpoints
+│   ├── simple_loop_executor.py  Tier-based execution engine + checkpoints
 │   ├── pipeline_definition.py  Declarative GENERATE_PIPELINE / ENHANCE_PIPELINE
 │   ├── agent_manager.py      Agent factory + per-file lifecycle + metrics
-│   ├── lifecycle_orchestrator.py  FSM event loop (delegates to AgentManager)
 │   ├── state_machine.py      FileLifecycle FSM, FilePhase, EventType
 │   ├── tier_scheduler.py     Dependency-tier computation
 │   ├── task_engine.py        LifecyclePlanBuilder, TaskGraph, EnhanceLifecyclePlanBuilder
@@ -1531,12 +1572,17 @@ multi-agent-claude/
 │   ├── circuit_breaker.py    LLM call circuit breaker
 │   ├── live_console.py       Rich live dashboard (FilePhase progress bars)
 │   ├── import_validator.py   Import resolution validation
+│   ├── simple_loop_executor.py  Tight generate→build→fix per-file loop
+│   ├── tool_dispatcher.py    Extracted tool dispatch + QualityChecker
+│   ├── context_cache.py      Shared tier-level context cache (dedup file reads)
+│   ├── context_compaction.py Message history compaction (120K budget, 10-tail)
 │   └── api.py                FastAPI HTTP server
 │
 ├── memory/
 │   ├── dependency_graph.py   networkx digraph (file → file deps)
 │   ├── embedding_store.py    ChromaDB vector store + sentence-transformers
-│   └── repo_index.py         Structural file catalog
+│   ├── repo_index.py         Structural file catalog
+│   └── fix_memory_store.py   Fix-attempt persistence + cross-file learning
 │
 ├── config/
 │   └── settings.py           Pydantic settings (reads from environment)

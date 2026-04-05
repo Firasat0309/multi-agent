@@ -14,6 +14,8 @@ from core.agent_manager import AgentManager
 from core.event_bus import EventBus
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient, LLMConfigError, calculate_cost
+from core.errors import BlueprintValidationError
+from core.feature_flags import feature
 from core.models import APIContract, RepositoryBlueprint, TokenCost
 from core.run_reporter import RunReporter
 from core.sandbox_orchestrator import SandboxOrchestrator, SandboxUnavailableError
@@ -73,6 +75,11 @@ class RunPipeline:
 
         errors: list[str] = []
 
+        # ── Prompt Guard ──────────────────────────────────────────────────────
+        if feature("PROMPT_GUARD"):
+            from core.prompt_guard import guard_prompt
+            user_prompt = guard_prompt(user_prompt, label="project description")
+
         # ── Observability ─────────────────────────────────────────────────────
         try:
             if self._settings.observability.enable_tracing:
@@ -115,39 +122,76 @@ class RunPipeline:
                 mcp_client=mcp_client,
             )
 
-            # Timeout the architecture LLM call so the pipeline never hangs
-            # indefinitely if the API endpoint stalls.
-            try:
-                blueprint = await asyncio.wait_for(
-                    architect.design_architecture(user_prompt),
-                    timeout=_arch_timeout,
+            # Retry loop: validate blueprint and re-attempt with feedback on failure.
+            _blueprint_max_retries = (
+                self._settings.execution.blueprint_max_retries
+                if feature("BLUEPRINT_RETRY") else 1
+            )
+            _last_validation_errors: list[str] = []
+
+            for _bp_attempt in range(_blueprint_max_retries):
+                # Build the prompt, optionally including validation feedback
+                _arch_prompt = user_prompt
+                if _last_validation_errors:
+                    _feedback = "\n".join(f"- {e}" for e in _last_validation_errors)
+                    _arch_prompt = (
+                        f"{user_prompt}\n\n"
+                        f"IMPORTANT: Your previous blueprint had these issues:\n"
+                        f"{_feedback}\n\n"
+                        f"Please fix these issues in the new blueprint."
+                    )
+
+                try:
+                    blueprint = await asyncio.wait_for(
+                        architect.design_architecture(_arch_prompt),
+                        timeout=_arch_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    msg = (
+                        f"Architecture design timed out after {_arch_timeout}s. "
+                        "The LLM provider may be overloaded — try again later."
+                    )
+                    logger.error(msg)
+                    self._fail_phase("Architecture Design", msg)
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=self._settings.workspace_dir,
+                        errors=[msg],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+                except (LLMConfigError, Exception) as e:
+                    is_config = isinstance(e, LLMConfigError)
+                    if not is_config:
+                        logger.exception("Architecture design failed")
+                    else:
+                        logger.error(str(e))
+                    self._fail_phase("Architecture Design", str(e))
+                    return PipelineResult(
+                        success=False,
+                        workspace_path=self._settings.workspace_dir,
+                        errors=[f"Architecture design failed: {e}"],
+                        elapsed_seconds=time.monotonic() - start_time,
+                    )
+
+                # Validate the blueprint
+                _validation_errors = self._validate_blueprint(blueprint)
+                if not _validation_errors:
+                    break  # Blueprint is valid
+
+                logger.warning(
+                    "[Phase 1] Blueprint validation failed (attempt %d/%d): %s",
+                    _bp_attempt + 1, _blueprint_max_retries,
+                    "; ".join(_validation_errors),
                 )
-            except asyncio.TimeoutError:
-                msg = (
-                    f"Architecture design timed out after {_arch_timeout}s. "
-                    "The LLM provider may be overloaded — try again later."
-                )
-                logger.error(msg)
-                self._fail_phase("Architecture Design", msg)
-                return PipelineResult(
-                    success=False,
-                    workspace_path=self._settings.workspace_dir,
-                    errors=[msg],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
-            except (LLMConfigError, Exception) as e:
-                is_config = isinstance(e, LLMConfigError)
-                if not is_config:
-                    logger.exception("Architecture design failed")
-                else:
-                    logger.error(str(e))
-                self._fail_phase("Architecture Design", str(e))
-                return PipelineResult(
-                    success=False,
-                    workspace_path=self._settings.workspace_dir,
-                    errors=[f"Architecture design failed: {e}"],
-                    elapsed_seconds=time.monotonic() - start_time,
-                )
+                _last_validation_errors = _validation_errors
+
+                if _bp_attempt >= _blueprint_max_retries - 1:
+                    # Exhausted retries — proceed with best-effort blueprint
+                    logger.warning(
+                        "[Phase 1] Blueprint retries exhausted — proceeding with "
+                        "last blueprint despite validation issues",
+                    )
+                    break
 
         lang_profile = detect_language_from_blueprint(blueprint.tech_stack)
         try:
@@ -495,6 +539,38 @@ class RunPipeline:
     def _fail_phase(self, name: str, msg: str) -> None:
         if self._live:
             self._live.fail_phase(name, msg)
+
+    @staticmethod
+    def _validate_blueprint(blueprint: RepositoryBlueprint) -> list[str]:
+        """Validate a blueprint and return a list of issues (empty = valid)."""
+        errors: list[str] = []
+        if not blueprint.file_blueprints:
+            errors.append("Blueprint has no file_blueprints")
+        if not blueprint.name:
+            errors.append("Blueprint has no name")
+        if not blueprint.tech_stack:
+            errors.append("Blueprint has no tech_stack")
+        # Check for duplicate file paths
+        paths = [fb.path for fb in blueprint.file_blueprints]
+        dupes = [p for p in paths if paths.count(p) > 1]
+        if dupes:
+            errors.append(f"Duplicate file paths: {', '.join(set(dupes))}")
+        # Check for circular dependencies
+        path_set = set(paths)
+        for fb in blueprint.file_blueprints:
+            for dep in fb.depends_on:
+                if dep not in path_set:
+                    errors.append(
+                        f"{fb.path} depends on {dep} which is not in the blueprint"
+                    )
+
+        # Deep consistency checks (import/export coherence, layer violations, etc.)
+        if feature("BLUEPRINT_CONSISTENCY"):
+            from core.blueprint_validator import BlueprintConsistencyValidator
+            consistency_issues = BlueprintConsistencyValidator().validate(blueprint)
+            errors.extend(consistency_issues)
+
+        return errors
 
     async def _execute_resume(self, user_prompt: str, start_time: float) -> "PipelineResult":
         """Resume a previous run from the last checkpoint.

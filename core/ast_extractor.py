@@ -741,7 +741,10 @@ _DECL_HEADER_RE = re.compile(
     r"|func\s+"                             # Go top-level func
     r"|fn\s+"                               # Rust fn
     r"|function\s+"                         # TS/JS function
+    r"|declare\s+(?:function|class|interface|type|const|enum|module)\s+"  # TS ambient
+    r"|(?:export\s+)?(?:const|let)\s+\w+\s*(?::\s*\S.*)?\s*=\s*(?:async\s+)?\("  # TS arrow fn
     r"|(?:public|private|protected|internal|static)\s+"  # C# member prefix
+    r"|record\s+"                           # C# record types
     r")"
     r".+",
     re.MULTILINE,
@@ -886,7 +889,7 @@ def _is_type_declaration(line: str) -> bool:
     ).strip()
     return bool(re.match(
         r"(?:"
-        r"(?:class|interface|struct|enum|trait|impl|namespace|module)\s"
+        r"(?:class|interface|struct|enum|trait|impl|namespace|module|record)\s"
         r"|type\s+\w+\s*=\s*\{"       # TS: type X = {
         r"|type\s+\w+\s+(?:struct|interface)\s"  # Go: type X struct {
         r")",
@@ -904,7 +907,10 @@ def _is_member_signature(line: str) -> bool:
         r"|(?:pub(?:\(crate\))?\s+)?fn\s+\w+"  # Rust methods
         r"|\w+\s*\(.*\)\s*(?::\s*\w+)?"  # TS method shorthand: name(...): Type
         r"|[a-zA-Z_]\w*\s+[*&]?[a-zA-Z_][\w.<>\[\]*&]*"  # Go struct fields: name Type
-        r"|(?:pub\s+)?[a-zA-Z_]\w*\s*:\s*\S+"  # Rust struct fields: name: Type
+        r"|(?:pub\s+)?[a-zA-Z_]\w*\s*:\s*\S+"  # Rust struct fields / TS interface props
+        r"|\w+\s*\?\s*:\s*\S+"  # TS optional props: name?: Type
+        r"|\[\w+:\s*\w+\]\s*:\s*\S+"  # TS index signature: [key: string]: Type
+        r"|(?:export\s+)?(?:const|let)\s+\w+\s*="  # TS const inside namespace
         r")",
         line,
     ))

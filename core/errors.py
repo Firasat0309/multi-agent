@@ -172,3 +172,66 @@ class CostLimitExceededError(PipelineError):
         super().__init__(message, context=context)
         self.spent_usd = spent_usd
         self.limit_usd = limit_usd
+
+
+# ── Context overflow errors ──────────────────────────────────────────────────
+
+class ContextOverflowError(PipelineError):
+    """LLM API returned a prompt-too-long / context-length-exceeded error.
+
+    Caught by the agentic loop to trigger reactive compaction instead of
+    crashing the entire file generation.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        estimated_tokens: int = 0,
+        context: dict | None = None,
+    ) -> None:
+        super().__init__(message, context=context)
+        self.estimated_tokens = estimated_tokens
+
+
+class TokenBudgetExceededError(PipelineError):
+    """Per-file token budget has been exhausted.
+
+    Raised when a file's cumulative LLM token usage exceeds the configured
+    budget.  The file is accepted in its current state rather than burning
+    more tokens.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        file_path: str = "",
+        tokens_used: int = 0,
+        budget: int = 0,
+        context: dict | None = None,
+    ) -> None:
+        super().__init__(message, context=context)
+        self.file_path = file_path
+        self.tokens_used = tokens_used
+        self.budget = budget
+
+
+class BlueprintValidationError(PipelineError):
+    """Blueprint produced by ArchitectAgent failed validation.
+
+    Carries the validation errors so the retry logic can feed them back
+    to the LLM for correction.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        validation_errors: list[str] | None = None,
+        raw_output: str = "",
+        context: dict | None = None,
+    ) -> None:
+        super().__init__(message, context=context)
+        self.validation_errors = validation_errors or []
+        self.raw_output = raw_output

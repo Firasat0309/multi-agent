@@ -345,7 +345,7 @@ class LifecycleEngine:
         self._compiled = compiled
         self._max_build_fixes = max_build_fixes
         # When True, BUILDING is handled by repo-level checkpoints in
-        # PipelineExecutor, not per-file.  The REVIEW_PASSED transition
+        # SimpleLoopExecutor, not per-file.  The REVIEW_PASSED transition
         # still goes to BUILDING, but it's immediately auto-passed unless
         # the checkpoint explicitly manages it.
         self._checkpoint_mode = checkpoint_mode
@@ -420,7 +420,7 @@ class LifecycleEngine:
             logger.info("[%s] build step skipped (interpreted language)", file_path)
 
         # In checkpoint mode, BUILDING is handled at repo level by
-        # PipelineExecutor.  The file stays in BUILDING until the
+        # SimpleLoopExecutor.  The file stays in BUILDING until the
         # checkpoint explicitly triggers BUILD_PASSED or BUILD_FAILED.
         # For non-checkpoint mode (legacy), the per-file BuildVerifierAgent
         # handles it as before.
@@ -499,6 +499,12 @@ class LifecycleEngine:
         status transitively through the dependency graph so dependents don't
         wait for the staleness timeout.
 
+        When the ``SELECTIVE_CASCADE`` feature flag is enabled, only DIRECT
+        dependents of failed files are cascade-failed, not the full transitive
+        closure.  This preserves more work — files that depend on the
+        direct dependents still get a chance to generate (their immediate
+        dependency hasn't failed yet).
+
         Uses a single-pass BFS from currently-FAILED files through the
         reverse dependency graph, instead of the previous O(n²) while-loop.
 
@@ -509,6 +515,10 @@ class LifecycleEngine:
         Returns:
             List of file paths that were cascade-failed.
         """
+        from core.feature_flags import feature
+
+        selective = feature("SELECTIVE_CASCADE")
+
         # Use cached reverse dependency map
         reverse_deps = self._get_reverse_deps()
 
@@ -546,8 +556,11 @@ class LifecycleEngine:
                     "failed_deps": [failed_file],
                 })
                 cascaded.append(dependent)
-                # This dependent is now FAILED — propagate to its dependents
-                queue.append(dependent)
+                # In selective mode, don't propagate further — only direct
+                # dependents are failed.  In full cascade mode, propagate
+                # transitively.
+                if not selective:
+                    queue.append(dependent)
 
         return cascaded
 

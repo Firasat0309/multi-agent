@@ -15,7 +15,7 @@ Each pipeline run creates a session directory containing:
 Resume flow:
   1. ``PipelineSession.load_latest_checkpoint()`` finds the most recent tier
   2. ``LifecycleEngine`` is reconstructed from the checkpoint state
-  3. ``PipelineExecutor.execute()`` skips completed tiers
+  3. ``SimpleLoopExecutor.execute()`` skips completed tiers
 
 Usage::
 

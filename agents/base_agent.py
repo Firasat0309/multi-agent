@@ -14,8 +14,17 @@ from typing import Any
 _READ_CHUNK_LINES = 150
 
 from core.agent_tools import ToolDefinition, validate_tool_input, validate_tool_input_strict
+from core.agent_tools import (
+    READ_FILE_TOOL, WRITE_FILE_TOOL, SEARCH_CODE_TOOL,
+    FIND_DEFINITION_TOOL, LIST_FILES_TOOL, APPLY_PATCH_TOOL,
+)
 from config.settings import ExecutionConfig
 from core.context_compaction import compact_messages
+from core.errors import ContextOverflowError, TokenBudgetExceededError
+from core.feature_flags import feature
+from core.file_state_cache import FileStateCache
+from core.loop_guards import build_budget_nudge, build_end_turn_reminder, check_stagnation
+from core.messages import UserMessage, AssistantMessage, ToolResult as MsgToolResult, TextBlock as MsgTextBlock
 from core.language import get_language_profile
 from core.llm_client import LLMClient, LLMConfigError, ToolCall
 from core.models import AgentContext, AgentRole, TaskResult
@@ -54,6 +63,49 @@ class BaseAgent(ABC):
         self._code_search = CodeSearch(repo_manager.workspace)
         self._file_tools = FileTools(repo_manager.workspace)
 
+        # ── File state cache ──────────────────────────────────────────────
+        self._file_cache: FileStateCache | None = None
+        if feature("FILE_STATE_CACHE"):
+            self._file_cache = FileStateCache()
+
+        # ── Tool registry integration ─────────────────────────────────────
+        self._tool_registry = None
+        if feature("TOOL_REGISTRY"):
+            self._tool_registry = self._register_native_tools()
+
+    def _register_native_tools(self):
+        """Create a per-instance ToolRegistry with native tool handlers.
+
+        Each handler is wrapped to match the ``ToolHandler`` signature
+        ``(inp, ctx) -> str`` while delegating to the existing bound methods.
+        """
+        from core.tool_registry import ToolRegistry
+
+        registry = ToolRegistry()  # per-instance, not the global default
+
+        # Map tool definitions to their handler methods
+        _TOOL_HANDLERS = [
+            (READ_FILE_TOOL,       self._tool_read_file),
+            (WRITE_FILE_TOOL,      self._tool_write_file),
+            (SEARCH_CODE_TOOL,     self._tool_search_code),
+            (FIND_DEFINITION_TOOL, self._tool_find_definition),
+            (LIST_FILES_TOOL,      self._tool_list_files),
+            (APPLY_PATCH_TOOL,     self._tool_apply_patch),
+        ]
+        for defn, bound_method in _TOOL_HANDLERS:
+            # Wrap bound method to match ToolHandler(inp, ctx) -> str
+            async def _handler(inp: dict, ctx, _fn=bound_method):
+                return await _fn(inp)
+
+            registry.register(
+                name=defn.name,
+                description=defn.description,
+                input_schema=defn.input_schema,
+                handler=_handler,
+                is_concurrency_safe=defn.is_concurrency_safe,
+            )
+        return registry
+
     @abstractmethod
     async def execute(self, context: AgentContext) -> TaskResult:
         """Execute the agent's task with the given context."""
@@ -70,12 +122,53 @@ class BaseAgent(ABC):
             "Output only the requested content with no extra commentary."
         )
 
+    def get_system_blocks(self, context: AgentContext | None = None) -> list[dict]:
+        """Return structured system prompt blocks for prompt caching.
+
+        The first block contains the agent's static role/rules (cacheable
+        across all files). The second block contains project-level blueprint
+        info (cacheable within the same pipeline run). Subclasses can
+        override to add more cacheable blocks.
+
+        When PROMPT_CACHING is disabled, falls back to a single block.
+        """
+        blocks = [
+            {
+                "type": "text",
+                "text": self.system_prompt,
+                "cache_control": {"type": "ephemeral"},
+            },
+        ]
+        # Add blueprint summary as a separate cacheable block
+        if context and context.blueprint:
+            bp = context.blueprint
+            tech = bp.tech_stack or {}
+            bp_summary = (
+                f"PROJECT: {bp.name}\n"
+                f"DESCRIPTION: {bp.description}\n"
+                f"ARCHITECTURE: {bp.architecture_style}\n"
+                f"TECH STACK: {', '.join(f'{k}={v}' for k, v in tech.items())}\n"
+                f"FILES: {len(bp.file_blueprints)} total\n"
+            )
+            if bp.architecture_doc:
+                # Include first 2000 chars of arch doc as cacheable context
+                arch_excerpt = bp.architecture_doc[:2000]
+                bp_summary += f"\nARCHITECTURE DOC:\n{arch_excerpt}"
+            blocks.append({
+                "type": "text",
+                "text": bp_summary,
+                "cache_control": {"type": "ephemeral"},
+            })
+        return blocks
+
     # ── Agentic tool-use loop ─────────────────────────────────────────────────
 
     @property
     def tools(self) -> list[ToolDefinition]:
         """Tools available to this agent. Override in subclasses to add tools.
         If an MCP client is attached, its dynamically fetched tools are appended."""
+        if self._tool_registry is not None:
+            return self._tool_registry.all_definitions() + self._mcp_tools
         base_tools = []
         return base_tools + self._mcp_tools
 
@@ -137,7 +230,7 @@ class BaseAgent(ABC):
             return self._parse_agentic_result(context, content, [])
 
         messages: list[dict] = [
-            {"role": "user", "content": self._build_prompt(context)}
+            UserMessage.from_text(self._build_prompt(context)).to_dict()
         ]
         files_written: list[str] = []
         max_iterations = self.max_iterations
@@ -171,12 +264,46 @@ class BaseAgent(ABC):
 
             hb = asyncio.create_task(_heartbeat())
             try:
-                resp = await self.llm.generate_with_tools(
-                    messages=messages,
-                    tools=self.tools,
-                    system_prompt=self.system_prompt,
-                    max_tokens=_max_tokens,
-                )
+                # Determine tool_choice for structured output mode
+                _tool_choice = None
+                if feature("STRUCTURED_OUTPUT") and hasattr(self, '_get_tool_choice'):
+                    _tool_choice = self._get_tool_choice(iteration, files_written, context)
+
+                # Build structured system blocks for Anthropic prompt caching
+                _system_blocks = None
+                if feature("PROMPT_CACHING") and hasattr(self, 'get_system_blocks'):
+                    _system_blocks = self.get_system_blocks(context)
+
+                # Determine model override for tiered model routing
+                _model_ctx = None
+                if feature("MODEL_ROUTING") and context.file_blueprint:
+                    from core.model_router import ModelRouter
+                    _router = ModelRouter(self.llm.config.provider.value)
+                    _tier, _model = _router.route_and_resolve(context.file_blueprint)
+                    if _model != self.llm.config.model:
+                        _model_ctx = self.llm.use_model(_model)
+                        _model_ctx.__enter__()
+
+                try:
+                    if feature("STREAMING_LLM"):
+                        resp = await self.llm.generate_with_tools_streaming(
+                            messages=messages,
+                            tools=self.tools,
+                            system_prompt=self.system_prompt,
+                            max_tokens=_max_tokens,
+                        )
+                    else:
+                        resp = await self.llm.generate_with_tools(
+                            messages=messages,
+                            tools=self.tools,
+                            system_prompt=self.system_prompt,
+                            max_tokens=_max_tokens,
+                            tool_choice=_tool_choice,
+                            system_blocks=_system_blocks,
+                        )
+                finally:
+                    if _model_ctx is not None:
+                        _model_ctx.__exit__(None, None, None)
             finally:
                 hb.cancel()
                 try:
@@ -205,14 +332,51 @@ class BaseAgent(ABC):
         _llm_errors = 0  # track consecutive LLM API errors
         _MAX_LLM_ERRORS = 3  # give up after this many consecutive failures
 
+        _session_tokens = 0  # cumulative tokens across all iterations
+        _agent_token_budget = self._exec.agent_token_budget
+        _compaction_threshold = self._exec.compaction_threshold_tokens
+        _overflow_compactions = 0  # number of reactive compactions performed
+        _MAX_OVERFLOW_COMPACTIONS = 3  # cap to prevent infinite compact-retry loops
+
         for iteration in range(max_iterations):
             # Compact message history if it has grown too large for the
             # context window.  This preserves the initial prompt and the
             # most recent tool interactions.
-            messages = compact_messages(messages)
+            messages = compact_messages(messages, char_budget=_compaction_threshold * 4)
+
+            # Check agent token budget before calling the LLM
+            if feature("TOKEN_BUDGETS") and _agent_token_budget > 0 and _session_tokens >= _agent_token_budget:
+                logger.warning(
+                    "%s: agent token budget exhausted (%d/%d tokens used) — "
+                    "accepting current state for %s",
+                    self.__class__.__name__, _session_tokens,
+                    _agent_token_budget, _target,
+                )
+                return self._parse_agentic_result(context, "", files_written)
 
             try:
                 response = await _llm_call_with_heartbeat(iteration)
+            except ContextOverflowError:
+                # Reactive compaction: aggressively shrink the messages and retry
+                if not feature("REACTIVE_COMPACTION"):
+                    raise
+                _overflow_compactions += 1
+                if _overflow_compactions > _MAX_OVERFLOW_COMPACTIONS:
+                    logger.error(
+                        "%s: context overflow persists after %d compactions — giving up",
+                        self.__class__.__name__, _overflow_compactions,
+                    )
+                    raise
+                # Cut budget to half the current size to ensure we fit
+                aggressive_budget = max(20_000, len(str(messages)) // 3)
+                logger.warning(
+                    "%s: context overflow on iter %d — reactive compaction #%d "
+                    "(budget=%d chars)",
+                    self.__class__.__name__, iteration,
+                    _overflow_compactions, aggressive_budget,
+                )
+                messages = compact_messages(messages, char_budget=aggressive_budget)
+                continue
             except (LLMConfigError, KeyboardInterrupt, SystemExit):
                 # Non-retryable errors surface immediately.
                 raise
@@ -233,6 +397,9 @@ class BaseAgent(ABC):
             self._metrics["llm_calls"] += 1
             self._metrics["tokens_used"] += sum(response.usage.values())
 
+            # Track cumulative session tokens
+            _session_tokens += sum(response.usage.values())
+
             # ── end_turn: LLM stopped without tool calls ──────────────────
             if response.stop_reason == "end_turn":
                 _file_missing = (
@@ -242,10 +409,14 @@ class BaseAgent(ABC):
                     and iteration < max_iterations - 1
                 )
                 if _file_missing:
-                    code_block = self._extract_code_block(response.content or "")
-
-                    if _end_turn_reminders < _MAX_END_TURN_REMINDERS:
-                        # First attempts: ask the LLM to use write_file.
+                    reminder, is_exhausted = build_end_turn_reminder(
+                        target_file=target_file,
+                        response_content=response.content or "",
+                        end_turn_reminders=_end_turn_reminders,
+                        max_reminders=_MAX_END_TURN_REMINDERS,
+                        extract_code_block_fn=self._extract_code_block,
+                    )
+                    if reminder:
                         _end_turn_reminders += 1
                         logger.warning(
                             "%s: end_turn reached but %s not yet written — "
@@ -254,31 +425,17 @@ class BaseAgent(ABC):
                             _end_turn_reminders, _MAX_END_TURN_REMINDERS,
                             iteration,
                         )
-                        code_hint = ""
-                        if code_block:
-                            code_hint = (
-                                "\n\nIt looks like you already wrote the code "
-                                "as plain text. Use exactly that code as the "
-                                "content argument to write_file."
-                            )
-                        messages.append({
-                            "role": "assistant",
-                            "content": response.raw_content,
-                        })
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                f"You have not called write_file yet. "
-                                f"Please call write_file with "
-                                f"path='{target_file}' and the complete file "
-                                f"content now. Do NOT respond with plain text "
-                                f"— use the write_file tool.{code_hint}"
-                            ),
-                        })
+                        messages.append(
+                            AssistantMessage.from_raw_content(response.raw_content).to_dict()
+                        )
+                        messages.append(
+                            UserMessage.from_text(reminder).to_dict()
+                        )
                         continue
 
                     # Reminders exhausted — auto-write the code block if
                     # one was found, rather than wasting more iterations.
+                    code_block = self._extract_code_block(response.content or "")
                     if code_block:
                         logger.warning(
                             "%s: end_turn reminders exhausted for %s — "
@@ -312,16 +469,17 @@ class BaseAgent(ABC):
                         "requesting continuation (iter %d)",
                         self.__class__.__name__, response.stop_reason, iteration,
                     )
-                    messages.append({"role": "assistant", "content": response.raw_content})
-                    messages.append({
-                        "role": "user",
-                        "content": (
+                    messages.append(
+                        AssistantMessage.from_raw_content(response.raw_content).to_dict()
+                    )
+                    messages.append(
+                        UserMessage.from_text(
                             "Your response was cut off before you could call any tools. "
                             "Please continue and call the appropriate tool (e.g. write_file) "
                             "to complete the task. Do NOT repeat what you already said — "
                             "pick up from where you left off."
-                        ),
-                    })
+                        ).to_dict()
+                    )
                     continue
 
             if not response.tool_calls:
@@ -340,14 +498,17 @@ class BaseAgent(ABC):
             _has_write_call = any(
                 tc.name == "write_file" for tc in response.tool_calls
             )
-            nudge_text: str | None = None
-            if (
-                target_file
-                and iteration >= max_iterations // 2
-                and not self._path_in_written(target_file, files_written)
-                and not _has_write_call
-                and _consecutive_nudges < _MAX_CONSECUTIVE_NUDGES
-            ):
+            nudge_text = build_budget_nudge(
+                target_file=target_file,
+                iteration=iteration,
+                max_iterations=max_iterations,
+                files_written=files_written,
+                has_write_call=_has_write_call,
+                consecutive_nudges=_consecutive_nudges,
+                max_consecutive_nudges=_MAX_CONSECUTIVE_NUDGES,
+                path_in_written_fn=self._path_in_written,
+            )
+            if nudge_text and target_file:
                 _consecutive_nudges += 1
                 logger.warning(
                     "%s: iteration %d/%d with no write to %s — "
@@ -355,20 +516,11 @@ class BaseAgent(ABC):
                     self.__class__.__name__, iteration, max_iterations, target_file,
                     _consecutive_nudges, _MAX_CONSECUTIVE_NUDGES,
                 )
-                nudge_text = (
-                    f"WARNING: You have used {iteration + 1} of {max_iterations} iterations "
-                    f"and still have not written the target file '{target_file}'. "
-                    f"You MUST call write_file with path='{target_file}' on this turn. "
-                    f"Do NOT read more files or deliberate further — write the complete "
-                    f"component now using write_file."
-                )
             elif _has_write_call or not (
                 target_file
                 and iteration >= max_iterations // 2
                 and not self._path_in_written(target_file, files_written)
             ):
-                # Reset only when the LLM is actively writing or the nudge
-                # condition no longer applies (before halfway, or file written).
                 _consecutive_nudges = 0
 
             # Execute tool calls: safe tools run concurrently, unsafe ones sequentially.
@@ -404,56 +556,20 @@ class BaseAgent(ABC):
                     written_path = tc.input.get("path", "")
                     if written_path:
                         files_written.append(written_path)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": tc.tool_use_id,
-                    "content": result,
-                })
-
-            # ── Multi-file budget nudge (target_file is None agents) ─────
-            # When no single target file is set (e.g. StateManagementAgent,
-            # APIIntegrationAgent), the standard budget guard never fires.
-            # Inject a wrap-up nudge past halfway to avoid exhausting all
-            # iterations without the LLM signalling end_turn.
-            if (
-                target_file is None
-                and files_written
-                and iteration >= max_iterations // 2
-                and not nudge_text
-            ):
-                nudge_text = (
-                    f"You have written {len(files_written)} file(s) so far: "
-                    f"{', '.join(files_written[-5:])}. "
-                    f"You have used {iteration + 1} of {max_iterations} iterations. "
-                    "If you still have files to write, write them NOW using write_file. "
-                    "When ALL files are written, stop — do not call any more tools."
-                )
-
-            # ── Zero-writes nudge for multi-file agents ──────────────────
-            # If a multi-file agent has spent the first third of its budget
-            # only reading files without writing anything, nudge it to start
-            # producing output so it doesn't exhaust all iterations.
-            if (
-                target_file is None
-                and not files_written
-                and iteration >= max_iterations // 3
-                and not nudge_text
-            ):
-                nudge_text = (
-                    f"WARNING: You have used {iteration + 1} of {max_iterations} iterations "
-                    "and have NOT written any files yet. "
-                    "You MUST start calling write_file NOW to produce the required files. "
-                    "Do not read more files — use the context you already have."
+                tool_results.append(
+                    MsgToolResult(tool_use_id=tc.tool_use_id, content=result).to_dict()
                 )
 
             # Append nudge as a text block inside the same user message
             # to maintain strict assistant/user role alternation.
             if nudge_text:
-                tool_results.append({"type": "text", "text": nudge_text})
+                tool_results.append(MsgTextBlock(text=nudge_text).to_dict())
 
             # Extend the conversation: assistant turn + user turn (results + optional nudge)
-            messages.append({"role": "assistant", "content": response.raw_content})
-            messages.append({"role": "user", "content": tool_results})
+            messages.append(
+                AssistantMessage.from_raw_content(response.raw_content).to_dict()
+            )
+            messages.append(UserMessage(content=tool_results).to_dict())
 
             # If the target file was just written, return immediately — unless
             # the code was detected as truncated, in which case keep going so
@@ -474,7 +590,7 @@ class BaseAgent(ABC):
             # After _MAX_STAGNANT_ITERATIONS consecutive stagnant iters, treat
             # the agent as done rather than raising RuntimeError.
             if target_file is None and files_written:
-                _stagnant_iterations, should_stop = self._check_stagnation(
+                _stagnant_iterations, should_stop = check_stagnation(
                     response.tool_calls or [],
                     results if response.tool_calls else [],
                     _stagnant_iterations,
@@ -563,50 +679,16 @@ class BaseAgent(ABC):
     def _check_stagnation(
         tool_calls: list,
         results: list[str],
-        stagnant_count: int,
+        stagnant_count: float,
         max_stagnant: int,
         agent_name: str,
         files_written: list[str],
-    ) -> tuple[int, bool]:
-        """Update stagnation counter and return (new_count, should_stop).
-
-        A stagnant iteration is one where the agent has files written but
-        produces no new writes this turn AND made no read/search calls
-        (i.e., it's truly doing nothing productive).  Read-only iterations
-        are treated as research, not stagnation.
-        """
-        wrote_this_iter = any(
-            tc.name == "write_file" and not result.startswith("Error")
-            for tc, result in zip(tool_calls, results)
+    ) -> tuple[float, bool]:
+        """Delegate to ``core.loop_guards.check_stagnation``."""
+        return check_stagnation(
+            tool_calls, results, stagnant_count,
+            max_stagnant, agent_name, files_written,
         )
-        if wrote_this_iter:
-            return 0, False
-
-        # If the agent made read/search calls this turn, it's actively
-        # researching — only count as half-stagnant (requires 2× the
-        # limit of idle iterations to trigger).
-        read_calls = sum(
-            1 for tc in tool_calls
-            if tc.name in ("read_file", "search_code", "find_definition", "list_files")
-        )
-        if read_calls > 0:
-            # Still doing research — increase counter at half rate
-            stagnant_count += 0.5  # type: ignore[assignment]
-        else:
-            stagnant_count += 1
-
-        stagnant_int = int(stagnant_count)
-        logger.warning(
-            "%s: no new file written this iteration (%.1f/%d stagnant, %d files so far)",
-            agent_name, stagnant_count, max_stagnant, len(files_written),
-        )
-        if stagnant_int >= max_stagnant:
-            logger.info(
-                "%s: stagnation limit reached — treating %d written file(s) as complete",
-                agent_name, len(files_written),
-            )
-            return stagnant_count, True  # type: ignore[return-value]
-        return stagnant_count, False  # type: ignore[return-value]
 
     async def _dispatch_tool(self, context: AgentContext, tc: ToolCall) -> str:
         """Dispatch a tool call to the appropriate handler.
@@ -632,6 +714,22 @@ class BaseAgent(ABC):
             logger.warning("Tool input validation failed for %s: %s", tc.name, validation_err)
             return f"Error: {validation_err}"
 
+        # ── Registry-based dispatch (single source of truth) ──────────────
+        if self._tool_registry is not None and self._tool_registry.has(tc.name):
+            from core.tool_registry import ToolContext
+
+            ctx = ToolContext(
+                repo=self.repo,
+                workspace=str(self.repo.workspace),
+                permission_checker=self._permission_checker,
+                agent_name=self.role.value if hasattr(self, "role") else "unknown",
+            )
+            return await self._tool_registry.dispatch(
+                tc.name, tc.input, ctx,
+                timeout=self._exec.tool_timeout_seconds,
+            )
+
+        # ── Fallback: hardcoded handler map ───────────────────────────────
         handlers = {
             "read_file":       self._tool_read_file,
             "write_file":      self._tool_write_file,
@@ -681,7 +779,10 @@ class BaseAgent(ABC):
         if not path:
             return "Error: 'path' is required"
 
-        content = await self.repo.async_read_file(path)
+        if self._file_cache is not None:
+            content = await self._file_cache.read(self.repo, path)
+        else:
+            content = await self.repo.async_read_file(path)
         if content is None:
             return f"File not found: {path}"
 
@@ -845,7 +946,10 @@ class BaseAgent(ABC):
         # full file content with the class repeated multiple times.
         content = self._deduplicate_content(content)
         # Security: async_write_file is scoped to workspace root
-        await self.repo.async_write_file(path, content)
+        if self._file_cache is not None:
+            await self._file_cache.write(self.repo, path, content)
+        else:
+            await self.repo.async_write_file(path, content)
         msg = f"Written {len(content)} bytes to {path}"
         # Detect truncated code (unbalanced braces) and warn the LLM
         trunc_warning = self._detect_truncated_code(content, path)
@@ -1349,11 +1453,15 @@ class BaseAgent(ABC):
             # Determine the primary file path to give it full content
             primary_path = context.file_blueprint.path if context.file_blueprint else None
             for path, content in context.related_files.items():
-                # Primary file gets full content; dependencies get truncated
+                # Primary file gets full content; dependencies get a generous
+                # window (12 000 chars ≈ 3 000 tokens) so that method signatures,
+                # type definitions and import blocks are never truncated — the
+                # previous 4 000-char limit routinely cut off the exact symbols
+                # the coder agent needed, causing import / type-mismatch errors.
                 if path == primary_path:
                     truncated = content
                 else:
-                    truncated = content[:4000] if len(content) > 4000 else content
+                    truncated = content[:12000] if len(content) > 12000 else content
                 # Detect language from file extension for correct code fencing
                 lang_name = ""
                 if context.file_blueprint:

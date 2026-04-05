@@ -231,7 +231,26 @@ class CoderAgent(BaseAgent):
 
     @property
     def tools(self) -> list[ToolDefinition]:
+        if self._tool_registry is not None:
+            return self._tool_registry.all_definitions() + self._mcp_tools
         return CODER_TOOLS
+
+    def _get_tool_choice(
+        self, iteration: int, files_written: list[str], context: "AgentContext"
+    ) -> dict | None:
+        """Return tool_choice constraint for structured output mode.
+
+        On the first iteration (generation), if the target file hasn't been
+        written yet, force the LLM to call write_file. This eliminates the
+        nudge/recovery loop when the model forgets to use the tool.
+
+        On subsequent iterations (after reading deps), allow any tool.
+        """
+        target = context.file_blueprint.path if context.file_blueprint else None
+        if target and target not in files_written and iteration >= 1:
+            # After at least one read iteration, force write_file
+            return {"type": "tool", "name": "write_file"}
+        return None
 
     def _get_source_system_prompt(self, language: str) -> str:
         profile = get_language_profile(language)

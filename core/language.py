@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,26 @@ class LanguageProfile:
     code_fence_name: str = ""           # "python", "java", "go", "typescript"
     source_root: str = ""               # subdirectory under workspace where source files live
     test_root: str = ""                 # subdirectory under workspace where test files live
+    # Extended configurable paths: multiple source/test roots for projects with
+    # non-standard layouts (e.g. Maven+Gradle, monorepos).  When set, these
+    # take precedence over the scalar source_root/test_root values.
+    source_roots: tuple[str, ...] = ()  # e.g. ("src/main/java", "src/main/resources")
+    test_roots: tuple[str, ...] = ()    # e.g. ("src/test/java", "src/test/resources")
     cache_paths: list[str] = field(default_factory=list)  # container paths for dependency caches
+
+    @property
+    def all_source_roots(self) -> list[str]:
+        """Return all source roots, preferring source_roots if set."""
+        if self.source_roots:
+            return list(self.source_roots)
+        return [self.source_root] if self.source_root else []
+
+    @property
+    def all_test_roots(self) -> list[str]:
+        """Return all test roots, preferring test_roots if set."""
+        if self.test_roots:
+            return list(self.test_roots)
+        return [self.test_root] if self.test_root else []
 
     def matches_extension(self, path: str) -> bool:
         return any(path.endswith(ext) for ext in self.file_extensions)
@@ -214,6 +235,8 @@ JAVA = LanguageProfile(
     code_fence_name="java",
     source_root="src/main",
     test_root="src/test",
+    source_roots=("src/main/java", "src/main/resources"),
+    test_roots=("src/test/java", "src/test/resources"),
     cache_paths=["/root/.m2"],
 )
 
@@ -320,6 +343,86 @@ LANGUAGE_PROFILES: dict[str, LanguageProfile] = {
     "csharp": CSHARP,
     "c#": CSHARP,
 }
+
+
+def load_language_profiles_yaml(path: str | Path | None = None) -> int:
+    """Load language profile overrides from a YAML file.
+
+    Each top-level key is a language name.  If the language already exists in
+    ``LANGUAGE_PROFILES``, its fields are patched.  Otherwise a new profile is
+    registered (requires at minimum ``name``, ``display_name``,
+    ``file_extensions``, ``glob_pattern``, ``docker_image``, ``test_command``,
+    ``lint_command``, ``type_check_command``, ``security_scan_command``,
+    ``build_command``).
+
+    Returns the number of profiles patched or added.
+    """
+    import dataclasses
+    from pathlib import Path as _Path
+
+    if path is None:
+        path = _Path(__file__).resolve().parent.parent / "config" / "language_profiles.yaml"
+    else:
+        path = _Path(path)
+
+    if not path.is_file():
+        logger.debug("No language_profiles.yaml at %s — using built-in profiles.", path)
+        return 0
+
+    try:
+        import yaml
+    except ImportError:
+        logger.warning("PyYAML not installed — cannot load language_profiles.yaml.")
+        return 0
+
+    with open(path, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh)
+
+    if not isinstance(data, dict):
+        return 0
+
+    count = 0
+    for lang_key, overrides in data.items():
+        if not isinstance(overrides, dict):
+            continue
+        lang_key_lower = lang_key.lower().strip()
+        existing = LANGUAGE_PROFILES.get(lang_key_lower)
+
+        if existing is not None:
+            # Patch: replace only the fields specified in the YAML
+            field_names = {f.name for f in dataclasses.fields(existing)}
+            replacements: dict[str, Any] = {}
+            for k, v in overrides.items():
+                if k not in field_names:
+                    logger.warning("Unknown LanguageProfile field '%s' for %s — skipped.", k, lang_key)
+                    continue
+                # Convert lists to tuples for tuple-typed fields
+                if k in ("source_roots", "test_roots") and isinstance(v, list):
+                    v = tuple(v)
+                replacements[k] = v
+            if replacements:
+                patched = dataclasses.replace(existing, **replacements)
+                LANGUAGE_PROFILES[lang_key_lower] = patched
+                count += 1
+                logger.info("Patched language profile '%s' with %d fields.", lang_key, len(replacements))
+        else:
+            # New profile — construct from YAML.  Convert list fields as needed.
+            for tuple_field in ("source_roots", "test_roots"):
+                if tuple_field in overrides and isinstance(overrides[tuple_field], list):
+                    overrides[tuple_field] = tuple(overrides[tuple_field])
+            for list_field in ("file_extensions", "allowed_commands", "import_patterns",
+                               "definition_patterns", "cache_paths"):
+                if list_field in overrides and not isinstance(overrides[list_field], list):
+                    overrides[list_field] = [overrides[list_field]]
+            try:
+                new_profile = LanguageProfile(**overrides)
+                LANGUAGE_PROFILES[lang_key_lower] = new_profile
+                count += 1
+                logger.info("Registered new language profile '%s'.", lang_key)
+            except TypeError as exc:
+                logger.error("Failed to create profile '%s': %s", lang_key, exc)
+
+    return count
 
 
 # File-type tags that are NOT programming languages — suppress warnings for these.

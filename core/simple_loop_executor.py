@@ -1,7 +1,6 @@
 """Simple loop executor — tight generate → build → fix per-file loop.
 
-Replaces the complex FSM-driven PipelineExecutor with a minimal per-file
-loop that converges faster with far fewer LLM calls:
+Core execution engine. Minimal per-file loop that converges with few LLM calls:
 
   PLAN (once)
     ↓
@@ -11,16 +10,14 @@ loop that converges faster with far fewer LLM calls:
     ↓
   GLOBAL BUILD → DONE
 
-Key differences from PipelineExecutor:
-  - No ReviewerAgent (compiler is the reviewer)
+Design decisions:
+  - Optional ReviewerAgent pass (feature flag QUICK_REVIEW)
   - No separate review-fix cycle — only build-fix
   - Accumulated error context across fix iterations (memory)
   - Smart retry: escalate prompt when same error repeats
   - Deterministic stopping conditions
-  - Single global build pass at the end
 
 LLM calls per file: 1 (generate) + 0-4 (fixes) = 1-5
-vs. old: 1 (generate) + 1 (review) + 1-2 (fix) + 1-2 (build fix) = 4-6
 """
 
 from __future__ import annotations
@@ -33,14 +30,19 @@ from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
 from core.checkpoint import BuildCheckpoint, CheckpointResult
+from core.context_cache import ContextCache
 from core.error_attributor import (
     CompilerErrorAttributor,
     extract_error_lines,
     extract_referenced_files,
 )
 from core.event_bus import AgentEvent, BusEventType
+from core.fast_validator import FastValidator
+from core.keyed_lock import KeyedLock
 from core.models import AgentContext, Task, TaskResult, TaskType
+from core.feature_flags import feature
 from core.graceful_shutdown import shutdown_requested
+from core.session_state import SessionState
 from core.state_machine import EventType, FilePhase, LifecycleEngine
 from core.tier_scheduler import Tier
 from memory.fix_memory_store import FixMemoryStore
@@ -87,7 +89,9 @@ class SimpleLoopExecutor:
     MAX_ATTEMPTS = 5
 
     # Max errors text per fix prompt to avoid token explosion.
-    MAX_ERROR_CHARS = 4000
+    # Raised from 4000 → 8000: truncating too aggressively caused fix agents
+    # to miss critical type-mismatch details buried later in compiler output.
+    MAX_ERROR_CHARS = 8000
 
     def __init__(
         self,
@@ -103,8 +107,19 @@ class SimpleLoopExecutor:
         self._compiled = bool(lang_profile.build_command)
         self._event_bus = event_bus
         self._attributor = CompilerErrorAttributor()
-        self._build_lock = asyncio.Lock()
+        # Per-module build locks instead of one global lock.
+        # The old single asyncio.Lock() serialized ALL builds across all files
+        # in all tiers, adding ~15-30s per build wait in a 20-file project.
+        # Now each "module" (top-level directory) gets its own lock so builds
+        # for independent modules can run concurrently.
+        self._build_locks = KeyedLock()
         self._fix_memory = FixMemoryStore(self._am.repo.workspace)
+        # Shared context cache — reused within a tier, cleared between tiers
+        self._context_cache = ContextCache()
+        # Fast syntax validator — checks generated code before expensive builds
+        self._fast_validator = FastValidator(self._am.repo.workspace)
+        # Session state for resumable runs (initialised lazily in execute())
+        self._session: SessionState | None = None
 
     # ── Main entry point ────────────────────────────────────────────────
 
@@ -116,12 +131,20 @@ class SimpleLoopExecutor:
         pipeline_def: PipelineDefinition | None = None,
         tiers: list[Tier] | None = None,
     ) -> dict[str, Any]:
-        """Execute the full pipeline using the simple loop strategy.
-
-        Signature-compatible with PipelineExecutor.execute() so it can be
-        swapped in without changing callers.
-        """
+        """Execute the full pipeline using the simple loop strategy."""
         start_time = time.monotonic()
+
+        # ── Session resume ──────────────────────────────────────────────
+        if feature("SESSION_RESUME"):
+            import hashlib as _hl
+            _all = sorted(f for t in (tiers or []) for f in t.files)
+            _run_id = _hl.md5("|".join(_all).encode()).hexdigest()[:12]
+            self._session = SessionState.load_or_create(
+                str(self._am.repo.workspace), _run_id,
+            )
+            logger.info(
+                "Session %s loaded: %s", _run_id, self._session.summary,
+            )
 
         # Default: all files in a single tier
         if tiers is None:
@@ -139,71 +162,12 @@ class SimpleLoopExecutor:
 
         skip_agents = self._settings.skip_agents
 
-        # ── Tier-by-tier file generation + build-fix loop ───────────────
-        for tier_idx, tier in enumerate(tiers):
-            tier_names = [p.rsplit("/", 1)[-1] for p in tier.files]
-            logger.info(
-                "=== Tier %d: %d files === %s",
-                tier.index, len(tier), tier_names,
-            )
-
-            if shutdown_requested():
-                logger.warning("Shutdown requested — aborting at tier %d", tier.index)
-                break
-
-            # Process files concurrently within the tier
-            semaphore = asyncio.Semaphore(self._settings.max_concurrent_agents)
-
-            async def _process_with_sem(fp: str) -> FileLoopResult:
-                async with semaphore:
-                    return await self._process_file(engine, fp)
-
-            results = await asyncio.gather(
-                *[_process_with_sem(f) for f in tier.files],
-                return_exceptions=True,
-            )
-
-            # Collect stats and cascade failures
-            tier_failed = []
-            for file_path, result in zip(tier.files, results):
-                if isinstance(result, Exception):
-                    logger.exception(
-                        "Unexpected error processing %s", file_path,
-                    )
-                    try:
-                        engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
-                    except Exception:
-                        engine.get_lifecycle(file_path).phase = FilePhase.FAILED
-                    stats["failed"] += 1
-                    tier_failed.append(file_path)
-                elif result.success:
-                    stats["passed"] += 1
-                    stats["total_fixes"] += result.fix_count
-                    stats["total_attempts"] += result.attempts
-                else:
-                    stats["failed"] += 1
-                    stats["total_fixes"] += result.fix_count
-                    stats["total_attempts"] += result.attempts
-                    tier_failed.append(file_path)
-
-            # Cascade failures to downstream tiers
-            if tier_failed:
-                logger.warning(
-                    "Tier %d: %d files failed: %s",
-                    tier.index, len(tier_failed), tier_failed,
-                )
-                all_later = {
-                    p for ft in tiers[tier_idx + 1:] for p in ft.files
-                }
-                cascaded = engine.cascade_failures(scope=all_later)
-                if cascaded:
-                    logger.warning(
-                        "Cascade-failed %d downstream file(s): %s",
-                        len(cascaded), cascaded,
-                    )
-                    stats["failed"] += len(cascaded)
-
-            self._save_lifecycle_state(engine)
+        # ── DAG executor: per-file dependency scheduling ────────────────
+        if feature("DAG_EXECUTOR"):
+            dag_stats = await self._execute_dag(engine, tiers)
+            stats.update(dag_stats)
+        else:
+            await self._execute_tiered(engine, tiers, stats)
 
         # ── Global build (one final check) ──────────────────────────────
         global_build_ok = True
@@ -313,6 +277,8 @@ class SimpleLoopExecutor:
 
         error_history: list[dict[str, Any]] = []
         fix_count = 0
+        _file_tokens = 0  # cumulative tokens spent on this file
+        _file_token_budget = self._settings.execution.file_token_budget
 
         for attempt in range(self.MAX_ATTEMPTS):
             if shutdown_requested():
@@ -321,11 +287,29 @@ class SimpleLoopExecutor:
                     fix_count=fix_count, errors=["Shutdown requested"],
                 )
 
+            # Check per-file token budget
+            if feature("TOKEN_BUDGETS") and _file_token_budget > 0 and _file_tokens >= _file_token_budget:
+                logger.warning(
+                    "[%s] Per-file token budget exhausted (%d/%d) — "
+                    "accepting current state after %d attempts",
+                    file_path, _file_tokens, _file_token_budget, attempt,
+                )
+                if not lc.is_terminal:
+                    engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
+                return FileLoopResult(
+                    file_path=file_path, success=False, attempts=attempt,
+                    fix_count=fix_count,
+                    errors=[f"Token budget exhausted ({_file_tokens}/{_file_token_budget})"],
+                )
+
             # Guard: if file became terminal (e.g. DEGRADED), stop
             if lc.is_terminal:
                 break
 
             # ── Step 1: Generate or Fix ─────────────────────────────────
+            _tokens_before = (
+                self._am.llm.total_input_tokens + self._am.llm.total_output_tokens
+            )
             if attempt == 0:
                 # Initial generation
                 gen_ok = await self._generate_file(engine, file_path)
@@ -337,11 +321,32 @@ class SimpleLoopExecutor:
                         errors=["Generation failed"],
                     )
                 # After _execute_lifecycle_phase fires CODE_GENERATED, the
-                # file is in REVIEWING.  Skip review by firing REVIEW_PASSED
-                # which transitions REVIEWING → BUILDING.
+                # file is in REVIEWING.  Optionally run a quick review to
+                # catch semantic issues (null deref, missing error handling,
+                # layer violations) before the build.  When QUICK_REVIEW is
+                # off, skip review by firing REVIEW_PASSED.
                 # If rewrite was rejected, file stays in GENERATING — retry.
                 if lc.phase == FilePhase.REVIEWING:
-                    engine.process_event(file_path, EventType.REVIEW_PASSED)
+                    review_findings = await self._quick_review(engine, file_path)
+                    if review_findings:
+                        # Seed the error history so the fix loop is aware of
+                        # semantic issues even before the first build.
+                        review_text = (
+                            "🔍 CODE REVIEW found semantic issues "
+                            "(these may NOT show up as compiler errors):\n"
+                            + "\n".join(f"  - {f}" for f in review_findings)
+                        )
+                        error_history.append({
+                            "errors_text": review_text,
+                            "error_hash": hashlib.md5(
+                                review_text.encode(),
+                            ).hexdigest()[:8],
+                            "attempt": 0,
+                            "referenced_files": [],
+                        })
+                    if lc.phase == FilePhase.REVIEWING:
+                        # QUICK_REVIEW was off or review already passed
+                        engine.process_event(file_path, EventType.REVIEW_PASSED)
                 elif lc.phase == FilePhase.GENERATING:
                     # Rewrite rejected — will retry on next attempt
                     logger.warning("[%s] Rewrite rejected, retrying", file_path)
@@ -358,6 +363,41 @@ class SimpleLoopExecutor:
                 )
 
             # ── Step 2: Build ───────────────────────────────────────────
+            # Track tokens consumed by the generate/fix step
+            _tokens_after = (
+                self._am.llm.total_input_tokens + self._am.llm.total_output_tokens
+            )
+            _file_tokens += _tokens_after - _tokens_before
+
+            # ── Step 2a: Fast syntax validation (pre-build filter) ──────
+            # When FAST_SYNTAX_CHECK is enabled, run a sub-second syntax
+            # check before the expensive full-project build. If syntax
+            # fails, skip the build entirely and feed errors to fix agent.
+            if feature("FAST_SYNTAX_CHECK") and self._compiled:
+                _lang = self._lang.name if self._lang else ""
+                syntax_ok, syntax_errors = await self._fast_validator.validate_syntax(
+                    file_path, _lang,
+                )
+                if not syntax_ok:
+                    logger.info(
+                        "[%s] Fast syntax check failed — skipping build (attempt %d)",
+                        file_path, attempt + 1,
+                    )
+                    error_hash = hashlib.md5(syntax_errors.encode()).hexdigest()[:8]
+                    error_history.append({
+                        "errors_text": f"SYNTAX ERROR (pre-build):\n{syntax_errors}",
+                        "error_hash": error_hash,
+                        "attempt": attempt + 1,
+                        "referenced_files": [],
+                    })
+                    engine.process_event(
+                        file_path, EventType.BUILD_FAILED,
+                        data={"errors": syntax_errors},
+                    )
+                    if lc.is_terminal:
+                        break
+                    continue  # Skip to fix iteration
+
             # For interpreted languages (no build command), auto-pass
             if not self._compiled:
                 lint_ok = await self._lint_check(file_path)
@@ -385,14 +425,16 @@ class SimpleLoopExecutor:
                 continue
 
             # Run incremental build
-            build_result = await self._run_incremental_build()
+            build_result = await self._run_incremental_build(file_path)
 
             if build_result.passed:
                 engine.process_event(file_path, EventType.BUILD_PASSED)
                 if fix_count > 0 or error_history:
+                    last_hash = error_history[-1]["error_hash"] if error_history else ""
                     await self._fix_memory.record_resolution(
                         file_path,
                         self._build_resolution_summary(error_history),
+                        error_hash=last_hash,
                     )
                 logger.info(
                     "[%s] Build passed (attempt %d, %d fixes)",
@@ -450,6 +492,17 @@ class SimpleLoopExecutor:
                 "referenced_files": referenced_files,
             })
 
+            # ── Streaming fix: extract error signatures for early cancellation ──
+            if feature("STREAMING_FIX"):
+                from core.streaming_fix import extract_error_signature
+                sigs = extract_error_signature(file_errors_text)
+                if sigs:
+                    error_history[-1]["error_signatures"] = sigs
+                    logger.debug(
+                        "[%s] Streaming fix signatures: %s",
+                        file_path, sigs,
+                    )
+
             await self._fix_memory.record_attempt(
                 file_path,
                 errors_text=file_errors_text,
@@ -480,6 +533,275 @@ class SimpleLoopExecutor:
             errors=[h["errors_text"][:200] for h in error_history[-2:]],
         )
 
+    # ── Execution strategies ──────────────────────────────────────────
+
+    async def _execute_tiered(
+        self,
+        engine: LifecycleEngine,
+        tiers: list[Tier],
+        stats: dict[str, Any],
+    ) -> None:
+        """Tier-sequential execution: process tiers in order, files concurrent within tier."""
+        for tier_idx, tier in enumerate(tiers):
+            # Skip entire tier if session says it's complete
+            if self._session and self._session.is_tier_complete(tier.index):
+                skipped = len(tier.files)
+                stats["passed"] += skipped
+                logger.info(
+                    "=== Tier %d: SKIPPED (%d files already passed) ===",
+                    tier.index, skipped,
+                )
+                continue
+
+            tier_names = [p.rsplit("/", 1)[-1] for p in tier.files]
+            logger.info(
+                "=== Tier %d: %d files === %s",
+                tier.index, len(tier), tier_names,
+            )
+
+            if shutdown_requested():
+                logger.warning("Shutdown requested — aborting at tier %d", tier.index)
+                break
+
+            # Filter out files that already passed in a previous session run
+            if self._session:
+                original_count = len(tier.files)
+                tier_files_filtered = [
+                    f for f in tier.files if not self._session.is_file_passed(f)
+                ]
+                if len(tier_files_filtered) < original_count:
+                    logger.info(
+                        "Tier %d: resuming — %d/%d files already passed, %d remaining",
+                        tier.index, original_count - len(tier_files_filtered),
+                        original_count, len(tier_files_filtered),
+                    )
+                    stats["passed"] += original_count - len(tier_files_filtered)
+            else:
+                tier_files_filtered = tier.files
+
+            # ── Batch generation: group small independent files ─────────
+            files_to_process = tier_files_filtered
+            if feature("BATCH_GENERATION"):
+                files_to_process = await self._try_batch_generate(
+                    engine, tier_files_filtered,
+                )
+
+            # Process files concurrently within the tier
+            semaphore = asyncio.Semaphore(self._settings.max_concurrent_agents)
+
+            async def _process_with_sem(fp: str) -> FileLoopResult:
+                async with semaphore:
+                    return await self._process_file(engine, fp)
+
+            results = await asyncio.gather(
+                *[_process_with_sem(f) for f in files_to_process],
+                return_exceptions=True,
+            )
+
+            # Collect stats and cascade failures
+            tier_failed = []
+            for file_path, result in zip(files_to_process, results):
+                if isinstance(result, Exception):
+                    logger.exception(
+                        "Unexpected error processing %s", file_path,
+                    )
+                    try:
+                        engine.process_event(file_path, EventType.RETRIES_EXHAUSTED)
+                    except Exception:
+                        engine.get_lifecycle(file_path).phase = FilePhase.FAILED
+                    stats["failed"] += 1
+                    tier_failed.append(file_path)
+                    if self._session:
+                        self._session.mark_file_failed(file_path, str(result)[:200])
+                elif result.success:
+                    stats["passed"] += 1
+                    stats["total_fixes"] += result.fix_count
+                    stats["total_attempts"] += result.attempts
+                    if self._session:
+                        self._session.mark_file_passed(file_path)
+                else:
+                    stats["failed"] += 1
+                    stats["total_fixes"] += result.fix_count
+                    stats["total_attempts"] += result.attempts
+                    tier_failed.append(file_path)
+                    if self._session:
+                        error_msg = "; ".join(result.errors[:2]) if result.errors else "unknown"
+                        self._session.mark_file_failed(file_path, error_msg)
+
+            # Cascade failures to downstream tiers
+            if tier_failed:
+                logger.warning(
+                    "Tier %d: %d files failed: %s",
+                    tier.index, len(tier_failed), tier_failed,
+                )
+                all_later = {
+                    p for ft in tiers[tier_idx + 1:] for p in ft.files
+                }
+                cascaded = engine.cascade_failures(scope=all_later)
+                if cascaded:
+                    logger.warning(
+                        "Cascade-failed %d downstream file(s): %s",
+                        len(cascaded), cascaded,
+                    )
+                    stats["failed"] += len(cascaded)
+
+            # Mark tier complete and persist session state
+            if self._session and not tier_failed:
+                self._session.mark_tier_complete(tier.index)
+            if self._session:
+                try:
+                    self._session.save()
+                except Exception:
+                    logger.debug("Failed to save session state (non-critical)", exc_info=True)
+
+            self._save_lifecycle_state(engine)
+
+            # Clear shared context cache between tiers so modified files
+            # are re-read with fresh content in downstream tiers.
+            logger.debug("Clearing context cache between tiers (%s)", self._context_cache.stats)
+            self._context_cache.clear()
+
+    async def _execute_dag(
+        self,
+        engine: LifecycleEngine,
+        tiers: list[Tier],
+    ) -> dict[str, Any]:
+        """DAG-driven execution: schedule files by dependency graph, not tiers."""
+        from core.dag_executor import DAGExecutor, build_dag_from_tiers
+        from core.feature_flags import feature
+
+        all_files = build_dag_from_tiers(engine, tiers)
+        logger.info("=== DAG Executor: %d files ===", len(all_files))
+
+        async def _process_fn(fp: str) -> bool:
+            result = await self._process_file(engine, fp)
+            return result.success
+
+        # --- Speculative execution support ---
+        spec_kwargs: dict[str, Any] = {}
+        if feature("SPECULATIVE_EXEC"):
+            blueprint = self._am.repo.blueprint
+            workspace = self._am.repo.workspace
+
+            async def _speculative_generate(fp: str, prompt: str) -> str:
+                """Use the LLM to generate speculative file content."""
+                resp = await self._am.llm.generate(
+                    system_prompt="Generate the requested source file based on the blueprint.",
+                    prompt=prompt,
+                )
+                return resp.content if hasattr(resp, "content") else str(resp)
+
+            def _write_file(fp: str, content: str) -> None:
+                path = workspace / fp
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content, encoding="utf-8")
+
+            def _read_file(fp: str) -> str:
+                return (workspace / fp).read_text(encoding="utf-8")
+
+            spec_kwargs = dict(
+                speculative=True,
+                blueprint=blueprint,
+                speculative_generate_fn=_speculative_generate,
+                write_fn=_write_file,
+                read_fn=_read_file,
+            )
+
+        dag = DAGExecutor(
+            max_concurrency=self._settings.max_concurrent_agents,
+            process_fn=_process_fn,
+            **spec_kwargs,
+        )
+        results = await dag.execute(engine, all_files)
+
+        # Aggregate stats
+        dag_stats: dict[str, Any] = {
+            "passed": sum(1 for v in results.values() if v),
+            "failed": sum(1 for v in results.values() if not v),
+        }
+        self._save_lifecycle_state(engine)
+        return dag_stats
+
+    # ── Batch generation ──────────────────────────────────────────────
+
+    async def _try_batch_generate(
+        self,
+        engine: LifecycleEngine,
+        tier_files: list[str],
+    ) -> list[str]:
+        """Attempt to batch-generate small independent files, returning remaining files.
+
+        Files successfully generated by the batch are transitioned to REVIEWING
+        and excluded from the returned list (they still go through build-fix).
+        Files that fail or aren't eligible are returned for individual processing.
+        """
+        from core.batch_generator import plan_batches, build_batch_prompt, parse_batch_response
+
+        blueprint = self._am.repo.blueprint
+        if blueprint is None:
+            return tier_files
+
+        plan = plan_batches(blueprint, tier_files)
+        if not plan.batches:
+            return tier_files
+
+        tech_summary = ", ".join(f"{k}: {v}" for k, v in blueprint.tech_stack.items())
+        batch_generated: set[str] = set()
+
+        for batch in plan.batches:
+            batch_paths = [fb.path for fb in batch.files]
+            logger.info(
+                "Batch-generating %d files: %s",
+                len(batch.files), batch_paths,
+            )
+            prompt = build_batch_prompt(batch, blueprint, tech_summary)
+
+            try:
+                response = await self._am.llm.generate(
+                    prompt=prompt,
+                    system_prompt=(
+                        f"You are an expert developer generating code for the "
+                        f"{blueprint.name} project ({blueprint.architecture_style}). "
+                        f"Generate complete, production-quality code for each file."
+                    ),
+                    max_tokens=16384,
+                )
+                files = parse_batch_response(response.content)
+                for path, content in files.items():
+                    if path in {fb.path for fb in batch.files}:
+                        # Write the file
+                        await self._am.repo.write_file(path, content)
+                        batch_generated.add(path)
+                        # Transition lifecycle
+                        lc = engine.get_lifecycle(path)
+                        if lc.phase == FilePhase.PENDING:
+                            engine.process_event(path, EventType.DEPS_MET)
+                        if lc.phase == FilePhase.GENERATING:
+                            engine.process_event(path, EventType.CODE_GENERATED)
+                        if lc.phase == FilePhase.REVIEWING:
+                            engine.process_event(path, EventType.REVIEW_PASSED)
+
+                missed = set(batch_paths) - set(files.keys())
+                if missed:
+                    logger.warning(
+                        "Batch missed %d files, will generate individually: %s",
+                        len(missed), missed,
+                    )
+            except Exception:
+                logger.exception(
+                    "Batch generation failed for %s — falling back to individual",
+                    batch_paths,
+                )
+
+        # Return files that still need individual processing (unbatched + missed)
+        remaining = [f for f in tier_files if f not in batch_generated]
+        if batch_generated:
+            logger.info(
+                "Batch generated %d files, %d remaining for individual processing",
+                len(batch_generated), len(remaining),
+            )
+        return remaining
+
     # ── Agent dispatch helpers ──────────────────────────────────────────
 
     async def _generate_file(
@@ -496,6 +818,57 @@ class SimpleLoopExecutor:
         except Exception:
             logger.exception("[%s] Generation phase failed", file_path)
             return False
+
+    async def _quick_review(
+        self,
+        engine: LifecycleEngine,
+        file_path: str,
+    ) -> list[str]:
+        """Run ReviewerAgent for a lightweight pre-build code review.
+
+        Returns a list of critical finding messages (empty if review passed
+        or if QUICK_REVIEW feature is disabled).  The findings are injected
+        into the fix-loop error context so the coder agent can address
+        semantic issues that the compiler wouldn't catch.
+        """
+        if not feature("QUICK_REVIEW"):
+            return []
+
+        try:
+            await self._am._execute_lifecycle_phase(
+                engine, file_path, FilePhase.REVIEWING,
+            )
+        except Exception:
+            logger.warning("[%s] Quick review failed, skipping", file_path)
+            # On failure, force through to BUILDING so we don't stall
+            if not engine.get_lifecycle(file_path).is_terminal:
+                try:
+                    engine.process_event(file_path, EventType.REVIEW_PASSED)
+                except Exception:
+                    pass
+            return []
+
+        lc = engine.get_lifecycle(file_path)
+
+        # ReviewerAgent fires REVIEW_PASSED or REVIEW_FAILED via
+        # AgentManager._handle_phase_result, which updates the lifecycle.
+        # If review failed, the lifecycle transitioned to FIXING with
+        # findings stored on the lifecycle object.
+        if lc.phase == FilePhase.FIXING:
+            findings = list(lc.review_findings or [])
+            logger.info(
+                "[%s] Quick review found %d critical issue(s) — "
+                "will include in fix context",
+                file_path, len(findings),
+            )
+            # Move back to BUILDING so the normal build step runs.
+            # The review findings will be injected as pre-seeded error context.
+            lc.phase = FilePhase.BUILDING
+            lc.fix_trigger = ""
+            return findings
+
+        # Review passed — file is now in BUILDING (normal path)
+        return []
 
     async def _fix_file(
         self,
@@ -518,22 +891,99 @@ class SimpleLoopExecutor:
         referenced_files = latest.get("referenced_files", [])
         persistent_memory = await self._fix_memory.get_summary(file_path)
 
-        # Smart retry: detect stalled progress
+        # Cross-file learning: check if other files already resolved this
+        # same error class and inject their resolution as a hint.
+        error_hash = latest.get("error_hash", "")
+        cross_file_hints = ""
+        if error_hash:
+            cross_file_hints = await self._fix_memory.get_cross_file_hints(error_hash)
+
+        # Enhanced fix memory: semantic category matching for broader hints
+        if feature("ENHANCED_FIX_MEMORY") and errors_text and not cross_file_hints:
+            semantic_hints = await self._fix_memory.get_semantic_hints(errors_text)
+            if semantic_hints:
+                cross_file_hints = semantic_hints
+
+        # Smart retry: detect stalled progress (exact hash OR similar errors)
         escalate = False
         if len(error_history) >= 2:
-            if error_history[-1]["error_hash"] == error_history[-2]["error_hash"]:
+            prev_hash = error_history[-2]["error_hash"]
+            curr_hash = error_history[-1]["error_hash"]
+            if curr_hash == prev_hash:
+                # Exact same errors — definitely stalled
                 escalate = True
-                errors_text = (
-                    "⚠️ PREVIOUS FIX ATTEMPT DID NOT RESOLVE THE ERRORS — "
-                    "THE SAME BUILD ERRORS PERSIST.\n"
-                    "You MUST try a COMPLETELY DIFFERENT approach:\n"
-                    "- If you changed a method call, check the actual method signature "
-                    "in the Related Files section\n"
-                    "- If an import is wrong, check the actual package path\n"
-                    "- If a type mismatch, read the full error to understand which types "
-                    "are incompatible\n\n"
-                    + errors_text
-                )
+            elif len(error_history) >= 3:
+                # Check if we're oscillating between two error states
+                # (fix A introduces error B, fix B reintroduces error A)
+                recent_hashes = [h["error_hash"] for h in error_history[-3:]]
+                if len(set(recent_hashes)) <= 2:
+                    escalate = True
+                    logger.warning(
+                        "[%s] Oscillating between %d error states — escalating",
+                        file_path, len(set(recent_hashes)),
+                    )
+            if not escalate:
+                # Fuzzy check: if the error text shares >60% of its lines
+                # with the previous attempt, treat as semantically similar
+                prev_lines = set(error_history[-2].get("errors_text", "").splitlines())
+                curr_lines = set(errors_text.splitlines())
+                if prev_lines and curr_lines:
+                    overlap = len(prev_lines & curr_lines)
+                    total = max(len(prev_lines), len(curr_lines))
+                    if total > 0 and overlap / total > 0.6:
+                        escalate = True
+                        logger.warning(
+                            "[%s] Error similarity %.0f%% — escalating",
+                            file_path, 100 * overlap / total,
+                        )
+            if escalate:
+                # Strategy rotation: cycle through escalation approaches
+                # based on how many consecutive stalled attempts we've seen.
+                stall_count = 0
+                for i in range(len(error_history) - 1, 0, -1):
+                    if error_history[i]["error_hash"] == error_history[i - 1]["error_hash"]:
+                        stall_count += 1
+                    else:
+                        break
+
+                if stall_count >= 3:
+                    # Strategy 3: Radical simplification
+                    escalation_prefix = (
+                        "⚠️ FIX LOOP STALLED ({n} identical attempts). "
+                        "RADICAL SIMPLIFICATION REQUIRED:\n"
+                        "- Strip the failing section to the SIMPLEST possible "
+                        "implementation that compiles\n"
+                        "- Use stub/TODO implementations for complex logic\n"
+                        "- Remove any clever abstractions — use plain, direct code\n"
+                        "- If a dependency is causing issues, remove it and "
+                        "hard-code the value\n\n"
+                    ).format(n=stall_count + 1)
+                elif stall_count >= 2:
+                    # Strategy 2: Complete method rewrite
+                    escalation_prefix = (
+                        "⚠️ FIX LOOP STALLED ({n} identical attempts). "
+                        "REWRITE FROM SCRATCH:\n"
+                        "- Do NOT patch the existing code — delete the failing "
+                        "method/block entirely and rewrite it\n"
+                        "- Re-read the dependency signatures in Related Files "
+                        "and match them EXACTLY\n"
+                        "- If the approach is fundamentally wrong, use an "
+                        "alternative algorithm or pattern\n\n"
+                    ).format(n=stall_count + 1)
+                else:
+                    # Strategy 1: Standard escalation (different approach)
+                    escalation_prefix = (
+                        "⚠️ PREVIOUS FIX ATTEMPT DID NOT RESOLVE THE ERRORS — "
+                        "THE SAME BUILD ERRORS PERSIST.\n"
+                        "You MUST try a COMPLETELY DIFFERENT approach:\n"
+                        "- If you changed a method call, check the actual method "
+                        "signature in the Related Files section\n"
+                        "- If an import is wrong, check the actual package path\n"
+                        "- If a type mismatch, read the full error to understand "
+                        "which types are incompatible\n\n"
+                    )
+
+                errors_text = escalation_prefix + errors_text
 
         # Build error history summary for context (memory)
         history_summary = ""
@@ -554,6 +1004,11 @@ class SimpleLoopExecutor:
                 history_summary + "\n\n" if history_summary else ""
             ) + persistent_memory
 
+        if cross_file_hints:
+            history_summary = (
+                history_summary + "\n\n" if history_summary else ""
+            ) + cross_file_hints
+
         fix_metadata = {
             "build_errors": errors_text + ("\n\n" + history_summary if history_summary else ""),
             "fix_trigger": "build",
@@ -564,6 +1019,26 @@ class SimpleLoopExecutor:
             fix_metadata["referenced_files"] = referenced_files
         if escalate:
             fix_metadata["escalate_fix"] = True
+
+        # Streaming fix: inject error signatures for early-cancel awareness
+        if feature("STREAMING_FIX") and error_history:
+            all_sigs = []
+            for h in error_history:
+                all_sigs.extend(h.get("error_signatures", []))
+            if all_sigs:
+                # Deduplicate while preserving order
+                seen_sigs: set[str] = set()
+                unique_sigs = []
+                for s in all_sigs:
+                    if s not in seen_sigs:
+                        seen_sigs.add(s)
+                        unique_sigs.append(s)
+                fix_metadata["known_bad_patterns"] = unique_sigs[:5]
+                fix_metadata["build_errors"] = (
+                    fix_metadata["build_errors"]
+                    + "\n\n⚠️ KNOWN BAD PATTERNS (do NOT reproduce these in your fix):\n"
+                    + "\n".join(f"  • {s}" for s in unique_sigs[:5])
+                )
 
         # Build task and context
         task = Task(
@@ -707,7 +1182,19 @@ class SimpleLoopExecutor:
 
     # ── Build helpers ───────────────────────────────────────────────────
 
-    async def _run_incremental_build(self) -> CheckpointResult:
+    async def _get_build_lock(self, file_path: str = "__global__") -> asyncio.Lock:
+        """Get or create a per-module build lock.
+
+        Files are grouped by their top-level directory (e.g. 'src/', 'lib/').
+        This allows independent modules to build concurrently while still
+        serializing builds within the same module to avoid conflicts.
+        """
+        # Derive module key from first path component
+        parts = file_path.replace("\\", "/").split("/")
+        module_key = parts[0] if len(parts) > 1 else "__root__"
+        return await self._build_locks._get(module_key)
+
+    async def _run_incremental_build(self, file_path: str = "__global__") -> CheckpointResult:
         """Run the lightest safe verification command for the current language."""
         build_command = self._lang.type_check_command or self._lang.build_command
         if not build_command:
@@ -717,7 +1204,8 @@ class SimpleLoopExecutor:
         for fb in self._am.blueprint.file_blueprints:
             known_files.add(fb.path)
 
-        async with self._build_lock:
+        lock = await self._get_build_lock(file_path)
+        async with lock:
             checkpoint = BuildCheckpoint(
                 build_command=build_command,
                 terminal=self._am.build_terminal,
@@ -740,7 +1228,9 @@ class SimpleLoopExecutor:
         for fb in self._am.blueprint.file_blueprints:
             known_files.add(fb.path)
 
-        async with self._build_lock:
+        lock = await self._get_build_lock("__global__")
+
+        async with lock:
             checkpoint = BuildCheckpoint(
                 build_command=build_command,
                 terminal=self._am.build_terminal,

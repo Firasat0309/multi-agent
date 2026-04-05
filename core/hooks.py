@@ -199,6 +199,77 @@ class HookRegistry:
         else:
             self._handlers.pop(event, None)
 
+    # ── Plugin loading ───────────────────────────────────────────────
+
+    def load_plugin(self, plugin: "HookPlugin") -> None:
+        """Register all hooks declared by a plugin.
+
+        A plugin is any object with ``hook_events`` returning an iterable
+        of ``(event, handler)`` pairs.  This allows packaging related hooks
+        into a single unit for clean enable/disable.
+        """
+        for event, handler in plugin.hook_events():
+            self.register(event, handler)
+        logger.info("Loaded plugin: %s", plugin.name)
+
+    def fire_sync(self, event: HookEvent, **kwargs: Any) -> HookResult:
+        """Synchronous variant of ``fire()`` for non-async contexts.
+
+        Runs handlers in a new event loop if one is not already running.
+        Falls back to direct sync calls if no event loop exists.
+        """
+        handlers = self._handlers.get(event, [])
+        if not handlers:
+            return HookResult(event=event, handlers_run=0, handlers_failed=0, elapsed_ms=0.0)
+
+        start = time.monotonic()
+        failed = 0
+        errors: list[str] = []
+
+        for handler in handlers:
+            try:
+                result = handler(**kwargs)
+                if asyncio.iscoroutine(result):
+                    result.close()  # discard — can't await in sync context
+            except Exception as exc:
+                failed += 1
+                errors.append(f"{getattr(handler, '__qualname__', repr(handler))}: {exc}")
+
+        elapsed = (time.monotonic() - start) * 1000
+        return HookResult(event=event, handlers_run=len(handlers), handlers_failed=failed, elapsed_ms=elapsed, errors=errors)
+
+
+# ── Plugin protocol ──────────────────────────────────────────────────────────
+
+class HookPlugin:
+    """Base class for hook plugins.
+
+    Subclass and implement ``hook_events()`` to return the hooks this
+    plugin provides.
+
+    Usage::
+
+        class MetricsPlugin(HookPlugin):
+            name = "metrics"
+
+            def hook_events(self):
+                return [
+                    (HookEvent.POST_AGENT_EXECUTE, self._record_agent),
+                    (HookEvent.POST_BUILD_CHECKPOINT, self._record_build),
+                ]
+
+            async def _record_agent(self, **kwargs):
+                ...
+
+        hooks = HookRegistry()
+        hooks.load_plugin(MetricsPlugin())
+    """
+    name: str = "unnamed"
+
+    def hook_events(self) -> list[tuple[HookEvent, HookHandler | AsyncHookHandler]]:
+        """Return (event, handler) pairs for this plugin."""
+        return []
+
     def reset(self) -> None:
         """Remove ALL handlers for ALL events (for testing)."""
         self._handlers.clear()

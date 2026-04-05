@@ -10,7 +10,7 @@ from core.models import (
     TaskStatus,
     TaskType,
 )
-from core.task_engine import TaskGraph, TaskGraphBuilder, LifecyclePlanBuilder, EnhanceLifecyclePlanBuilder
+from core.task_engine import TaskGraph, LifecyclePlanBuilder, EnhanceLifecyclePlanBuilder
 
 
 class TestTaskGraph:
@@ -107,13 +107,8 @@ class TestTaskGraph:
         assert stats["pending"] == 1
 
 
-class TestTaskGraphBuilder:
-    """TaskGraphBuilder no longer provides build_from_blueprint() — tests migrated to LifecyclePlanBuilder."""
-
-    def test_builder_instantiation(self):
-        """TaskGraphBuilder can still be instantiated (used internally by ModificationTaskGraphBuilder)."""
-        builder = TaskGraphBuilder()
-        assert builder is not None
+class TestLifecyclePlanBuilderBasic:
+    """LifecyclePlanBuilder.build() creates a LifecycleEngine + global TaskGraph."""
 
     def test_lifecycle_replaces_legacy_build_from_blueprint(self):
         """LifecyclePlanBuilder.build() replaces the removed build_from_blueprint()."""

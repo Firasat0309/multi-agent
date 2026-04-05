@@ -13,7 +13,7 @@ This file governs all AI-assisted work on this repository: a **production-grade,
 - Prefer **adding a new module** over editing a large existing one when introducing new responsibilities.
 
 ### 2. Backward Compatibility
-- Never remove or rename public method signatures on `BaseAgent`, `PipelineExecutor`, `AgentManager`, `RepositoryManager`, or any `core/models.py` dataclass without an explicit migration plan.
+- Never remove or rename public method signatures on `BaseAgent`, `AgentManager`, `RepositoryManager`, or any `core/models.py` dataclass without an explicit migration plan.
 - Deprecate before deleting: add a `DeprecationWarning` and keep the old symbol for at least one commit cycle.
 - New fields added to `RepositoryBlueprint`, `FileBlueprint`, `AgentContext`, or `TaskResult` must have safe defaults so existing call sites continue to work.
 
@@ -37,16 +37,23 @@ Each agent owns exactly one concern. Never add logic that belongs to another age
 Do **not** add file-write logic to `ReviewerAgent`, orchestration logic to `CoderAgent`, or any LLM calls inside pipeline coordinators.
 
 ### 4. Pipeline & Orchestration
-- The three-layer facade is **non-negotiable**: `pipeline.py` (facade) → `pipeline_run.py` / `pipeline_enhance.py` (workflow) → `pipeline_executor.py` (execution engine). Do not flatten these layers.
+- The three-layer facade is **non-negotiable**: `pipeline.py` (facade) → `pipeline_run.py` / `pipeline_enhance.py` (workflow) → `simple_loop_executor.py` (execution engine). Do not flatten these layers.
 - All cross-file coordination must go through `EventBus`; agents must not call other agents directly.
 - Tier-based execution order (via `TierScheduler`) must be preserved — never process a dependent file before its dependency tier has passed a build checkpoint (compiled languages).
 - State transitions must only happen through `LifecycleEngine.process_event(path, EventType)` — never mutate file states directly.
 
 ### 5. Extensibility Patterns
 - **New agent**: subclass `BaseAgent`, declare `role: AgentRole`, implement `async execute(context: AgentContext) -> TaskResult`. Register in `AgentManager._create_agent()` and `AgentRole` enum. No other files need to change.
-- **New tool for agents**: add a `_tool_<name>` method to `BaseAgent` (or override in the subclass) and append a `ToolDefinition` entry to the `tools` property.
-- **New pipeline phase**: add a phase constant, implement a `_run_<phase>_phase` method in `PipelineExecutor`, wire into the phase sequence list. Do not inline phase logic in the `run()` method.
+- **New tool for agents**: add a `_tool_<name>` method to `BaseAgent` (or override in the subclass) and append a `ToolDefinition` entry to the `tools` property. Tool dispatch logic lives in `core/tool_dispatcher.py` (`ToolDispatcher` + `QualityChecker`).
+- **New pipeline phase**: add a phase constant, implement a `_run_<phase>_phase` method in `SimpleLoopExecutor`, wire into the phase sequence list. Do not inline phase logic in the `run()` method.
 - **New language support**: extend `core/language.py` and `core/ast_extractor.py`; no pipeline code should need to change.
+
+### 6. Key Internal Modules
+- `core/simple_loop_executor.py` — tight generate→build→fix loop with per-module build locks, shared context cache, and cross-file fix learning. This is the sole execution engine.
+- `core/tool_dispatcher.py` — `ToolDispatcher` (routes tool calls with permission checks, concurrent batch execution) and `QualityChecker` (strip prose, deduplicate code, detect stubs/truncation).
+- `core/context_cache.py` — in-memory TTL cache for dependency file reads within a tier.
+- `core/context_compaction.py` — compacts agentic conversation history when it exceeds the 120K-token budget, preserving file-read/write tracking in the summary.
+- `memory/fix_memory_store.py` — JSON-backed fix persistence with cross-file learning via global error patterns.
 
 ---
 

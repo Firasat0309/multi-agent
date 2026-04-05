@@ -15,6 +15,7 @@ import logging
 from agents.base_agent import BaseAgent
 from core.language import get_language_profile
 from core.models import AgentContext, AgentRole, TaskResult
+from core.prompt_templates import PromptTemplates
 from tools.file_tools import FileTools
 
 logger = logging.getLogger(__name__)
@@ -35,23 +36,26 @@ class PatchAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
-        return (
-            "You are a surgical code modification agent. "
-            "You generate ONLY unified diff patches — never rewrite entire files.\n\n"
-            "Output format — standard unified diff:\n"
-            "--- a/path/to/file.py\n"
-            "+++ b/path/to/file.py\n"
-            "@@ -LINE,COUNT +LINE,COUNT @@\n"
-            " context line\n"
-            "-removed line\n"
-            "+added line\n"
-            " context line\n\n"
-            "Rules:\n"
-            "- Include 3 lines of context before and after each change\n"
-            "- Change ONLY what is specified — preserve all other code exactly\n"
-            "- Output the raw diff only, no explanation, no markdown fences\n"
-            "- Line numbers in @@ headers MUST match the actual file content\n"
-            "- Do NOT add, remove, or rearrange any lines outside the diff hunks"
+        return PromptTemplates.compose(
+            PromptTemplates.role("surgical code modification agent"),
+            PromptTemplates.output_diff(),
+            (
+                "Output format — standard unified diff:\n"
+                "--- a/path/to/file.py\n"
+                "+++ b/path/to/file.py\n"
+                "@@ -LINE,COUNT +LINE,COUNT @@\n"
+                " context line\n"
+                "-removed line\n"
+                "+added line\n"
+                " context line\n\n"
+                "Rules:\n"
+                "- Include 3 lines of context before and after each change\n"
+                "- Change ONLY what is specified — preserve all other code exactly\n"
+                "- Output the raw diff only, no explanation, no markdown fences\n"
+                "- Line numbers in @@ headers MUST match the actual file content\n"
+                "- Do NOT add, remove, or rearrange any lines outside the diff hunks"
+            ),
+            PromptTemplates.no_hallucination(),
         )
 
     async def execute(self, context: AgentContext) -> TaskResult:

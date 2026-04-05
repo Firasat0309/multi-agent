@@ -1,0 +1,41 @@
+# Language profile overrides.
+#
+# Each top-level key must match a registered language name (e.g. "python",
+# "java", "typescript") to override its built-in profile, or introduce a
+# new language name to register a custom profile.
+#
+# Only the fields you specify are overridden — omitted fields keep their
+# built-in defaults.
+#
+# Example — switch Java to Gradle and add a custom Kotlin profile:
+#
+#   java:
+#     build_command: "gradle build -x test"
+#     test_command: "gradle test"
+#     docker_image: "gradle:8.5-jdk21-alpine"
+#     source_roots:
+#       - "src/main/java"
+#       - "src/main/kotlin"
+#     test_roots:
+#       - "src/test/java"
+#       - "src/test/kotlin"
+#
+#   kotlin:
+#     name: kotlin
+#     display_name: Kotlin
+#     file_extensions: [".kt", ".kts"]
+#     glob_pattern: "**/*.kt"
+#     docker_image: "gradle:8.5-jdk21-alpine"
+#     test_command: "gradle test"
+#     lint_command: "ktlint"
+#     type_check_command: ""
+#     security_scan_command: ""
+#     build_command: "gradle build -x test"
+#     module_separator: "."
+#     code_fence_name: kotlin
+#     source_roots:
+#       - "src/main/kotlin"
+#     test_roots:
+#       - "src/test/kotlin"
+
+# -- Add your overrides below this line --

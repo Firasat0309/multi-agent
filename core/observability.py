@@ -123,5 +123,91 @@ class _NoOpSpan:
     def set_status(self, status: Any) -> None:
         pass
 
-    def record_exception(self, exc: BaseException) -> None:
+    def record_exception(self, exception: BaseException) -> None:
         pass
+
+
+# ── Decorators for automatic span instrumentation ────────────────────────────
+
+def traced(
+    span_name: str | None = None,
+    *,
+    attributes: dict[str, Any] | None = None,
+) -> Any:
+    """Decorator that wraps an async function in an OpenTelemetry span.
+
+    Usage::
+
+        @traced("llm_generate", attributes={"model": "claude"})
+        async def generate(self, prompt):
+            ...
+
+    When OpenTelemetry is unavailable, the function runs unmodified.
+    """
+    import functools
+
+    def decorator(fn: Any) -> Any:
+        name = span_name or f"{fn.__module__}.{fn.__qualname__}"
+
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            tracer = get_tracer(fn.__module__)
+            with tracer.start_as_current_span(name) as span:
+                if attributes:
+                    for k, v in attributes.items():
+                        span.set_attribute(k, v)
+                try:
+                    result = await fn(*args, **kwargs)
+                    return result
+                except Exception as exc:
+                    span.record_exception(exc)
+                    raise
+
+        return wrapper
+    return decorator
+
+
+# ── Pipeline-level metrics helpers ───────────────────────────────────────────
+
+_file_timings: dict[str, dict[str, float]] = {}
+
+
+def record_file_phase_start(file_path: str, phase: str) -> None:
+    """Record when a file enters a pipeline phase (generate, fix, build, test)."""
+    import time
+    key = f"{file_path}:{phase}"
+    _file_timings[key] = {"start": time.monotonic()}
+
+
+def record_file_phase_end(file_path: str, phase: str, success: bool = True) -> None:
+    """Record when a file exits a pipeline phase and emit metrics."""
+    import time
+    key = f"{file_path}:{phase}"
+    timing = _file_timings.pop(key, None)
+    if timing:
+        duration = time.monotonic() - timing["start"]
+        record_task_completion(phase, "success" if success else "failure", duration)
+        logger.debug(
+            "File %s phase %s completed in %.1fs (success=%s)",
+            file_path, phase, duration, success,
+        )
+
+
+def check_cost_warning(
+    spent_usd: float,
+    limit_usd: float,
+    warning_pct: float = 0.8,
+) -> bool:
+    """Log a warning if spending exceeds the warning threshold.
+
+    Returns True if the warning was triggered (so callers can take action).
+    """
+    if limit_usd <= 0:
+        return False
+    if spent_usd >= limit_usd * warning_pct:
+        logger.warning(
+            "COST WARNING: $%.2f spent of $%.2f limit (%.0f%% — threshold: %.0f%%)",
+            spent_usd, limit_usd, 100 * spent_usd / limit_usd, 100 * warning_pct,
+        )
+        return True
+    return False

@@ -13,7 +13,7 @@ from typing import Any
 
 from config.settings import ExecutionConfig, LLMConfig, LLMProvider
 from core.circuit_breaker import CircuitBreaker, CircuitOpenError
-from core.errors import CostLimitExceededError
+from core.errors import ContextOverflowError, CostLimitExceededError
 from core.observability import get_tracer
 
 logger = logging.getLogger(__name__)
@@ -79,7 +79,7 @@ def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
     )
 
 
-@dataclass
+@dataclass(slots=True)
 class LLMResponse:
     content: str
     usage: dict[str, int]
@@ -100,7 +100,7 @@ class ToolDefinition:
     is_concurrency_safe: bool = True
 
 
-@dataclass
+@dataclass(slots=True)
 class ToolCall:
     """A single tool invocation requested by the LLM."""
     tool_use_id: str
@@ -108,7 +108,7 @@ class ToolCall:
     input: dict
 
 
-@dataclass
+@dataclass(slots=True)
 class LLMResponseWithTools:
     """Response from a tool-use enabled generate call."""
     content: str                  # concatenated text blocks (may be empty)
@@ -174,9 +174,12 @@ _RETRYABLE_CATEGORIES = frozenset({
     LLMErrorCategory.SERVER_OVERLOADED,
     LLMErrorCategory.TIMEOUT,
     LLMErrorCategory.TRANSIENT_SERVER,
-    LLMErrorCategory.CONTEXT_LENGTH,
     LLMErrorCategory.CONTENT_FILTERED,
 })
+
+# Context-length errors are NOT in _RETRYABLE_CATEGORIES: retrying with the
+# same oversized context never helps.  Instead, callers should catch
+# ContextOverflowError and compact before retrying.
 
 
 def classify_llm_error(error_msg: str) -> LLMErrorCategory:
@@ -195,6 +198,11 @@ def classify_llm_error(error_msg: str) -> LLMErrorCategory:
     if "429" in error_msg or "rate_limit" in msg or "ratelimit" in msg or "too many requests" in msg:
         return LLMErrorCategory.RATE_LIMITED
 
+    # Server overloaded (check before quota — "RESOURCE_EXHAUSTED: quota exceeded"
+    # is a transient overload, not a permanent billing block)
+    if "overloaded" in msg or "resource_exhausted" in msg or "529" in error_msg:
+        return LLMErrorCategory.SERVER_OVERLOADED
+
     # Quota / billing
     if "quota" in msg or "billing" in msg or "insufficient_quota" in msg:
         return LLMErrorCategory.QUOTA_EXCEEDED
@@ -206,10 +214,6 @@ def classify_llm_error(error_msg: str) -> LLMErrorCategory:
     # Content filtering
     if "content_filter" in msg or "blocked" in msg or "safety" in msg or "harmful" in msg:
         return LLMErrorCategory.CONTENT_FILTERED
-
-    # Server overloaded
-    if "overloaded" in msg or "resource_exhausted" in msg or "529" in error_msg:
-        return LLMErrorCategory.SERVER_OVERLOADED
 
     # Transient server errors
     if any(tok in error_msg for tok in ("500", "502", "503")):
@@ -224,6 +228,29 @@ def classify_llm_error(error_msg: str) -> LLMErrorCategory:
         return LLMErrorCategory.INVALID_REQUEST
 
     return LLMErrorCategory.UNKNOWN
+
+
+class _ModelOverrideCtx:
+    """Context manager for temporarily overriding the LLM model."""
+
+    def __init__(self, client: "LLMClient", model_name: str) -> None:
+        self._client = client
+        self._model_name = model_name
+        self._previous: str | None = None
+
+    def __enter__(self) -> "_ModelOverrideCtx":
+        self._previous = self._client._model_override
+        self._client._model_override = self._model_name
+        return self
+
+    def __exit__(self, *args: Any) -> None:
+        self._client._model_override = self._previous
+
+    async def __aenter__(self) -> "_ModelOverrideCtx":
+        return self.__enter__()
+
+    async def __aexit__(self, *args: Any) -> None:
+        self.__exit__()
 
 
 class LLMClient:
@@ -265,7 +292,27 @@ class LLMClient:
         self.total_output_tokens: int = 0
         # Per-session cost cap (0 = unlimited). Set by the pipeline entry point.
         self.max_cost_usd: float = 0.0
+        # Optional callback ``(spent_usd, limit_usd) -> None`` invoked on each
+        # cost check.  Set by the pipeline to update the LiveConsole display.
+        self.on_cost_update: Any | None = None
+        # Temporary model override — set via ``use_model()`` context manager.
+        self._model_override: str | None = None
         self._validate_config()
+
+    @property
+    def _effective_model(self) -> str:
+        """Return the active model name (override if set, else config default)."""
+        return self._model_override or self.config.model
+
+    def use_model(self, model_name: str) -> "_ModelOverrideCtx":
+        """Context manager to temporarily override the model for LLM calls.
+
+        Usage::
+
+            async with llm.use_model("claude-haiku-4-20250414"):
+                response = await llm.generate(...)
+        """
+        return _ModelOverrideCtx(self, model_name)
 
     def _validate_config(self) -> None:
         """Validate LLM configuration before use."""
@@ -444,6 +491,16 @@ class LLMClient:
                 error_msg = str(e)
                 error_type = type(e).__name__
 
+                # Context-length errors should surface immediately so the
+                # caller (agentic loop) can compact and retry.
+                cat = classify_llm_error(error_msg)
+                if cat == LLMErrorCategory.CONTEXT_LENGTH:
+                    raise ContextOverflowError(
+                        f"Context too long for {self.config.provider.value}/{self.config.model}: "
+                        f"{error_msg[:200]}",
+                        estimated_tokens=self.total_input_tokens,
+                    ) from e
+
                 is_rate_limit, is_transient = _classify_error(error_msg)
 
                 if is_transient and attempt < _max_attempts - 1:
@@ -494,7 +551,11 @@ class LLMClient:
                     model=self.config.model,
                     max_tokens=max_tokens,
                     temperature=temperature,
-                    system=system,
+                    system=[{
+                        "type": "text",
+                        "text": system,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
                     messages=[{"role": "user", "content": user}],
                 )
             except TypeError as e:
@@ -663,7 +724,11 @@ class LLMClient:
                     model=self.config.model,
                     max_tokens=tokens,
                     temperature=self.config.temperature,
-                    system=system_prompt,
+                    system=[{
+                        "type": "text",
+                        "text": system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
                     messages=[{"role": "user", "content": user_prompt}],
                 ) as stream:
                     for text in stream.text_stream:
@@ -863,6 +928,12 @@ class LLMClient:
         spent = calculate_cost(
             self.config.model, self.total_input_tokens, self.total_output_tokens,
         )
+        # Notify the UI (LiveConsole) of current cost
+        if self.on_cost_update is not None:
+            try:
+                self.on_cost_update(spent, self.max_cost_usd)
+            except Exception:
+                pass  # Never let a display callback break the pipeline
         if spent > self.max_cost_usd:
             raise CostLimitExceededError(
                 f"Session cost ${spent:.4f} exceeds cap ${self.max_cost_usd:.2f}",
@@ -876,6 +947,8 @@ class LLMClient:
         tools: list[ToolDefinition],
         system_prompt: str = "",
         max_tokens: int = 16384,
+        tool_choice: dict | None = None,
+        system_blocks: list[dict] | None = None,
     ) -> LLMResponseWithTools:
         """Multi-turn tool-use call — supported for all three providers.
 
@@ -893,18 +966,165 @@ class LLMClient:
         ``raw_content`` in the returned ``LLMResponseWithTools`` is always a
         list of plain normalized dicts so it can be safely re-fed on the next
         iteration without provider-specific objects in the history.
+
+        Args:
+            tool_choice: Optional tool choice constraint.  Supported formats:
+                - ``{"type": "tool", "name": "write_file"}`` — force a specific tool
+                - ``{"type": "auto"}`` — let the model decide (default)
+                - ``{"type": "any"}`` — force the model to use some tool
+                Ignored for Gemini (structured-prompt simulation).
+            system_blocks: Optional list of structured system prompt blocks
+                with cache_control for Anthropic prompt caching. When provided
+                and using Anthropic, these are used instead of system_prompt.
         """
         if self.config.provider == LLMProvider.ANTHROPIC:
             return await self._anthropic_generate_with_tools(
                 messages, tools, system_prompt, max_tokens,
+                tool_choice=tool_choice, system_blocks=system_blocks,
             )
         if self.config.provider == LLMProvider.OPENAI:
             return await self._openai_generate_with_tools(
-                messages, tools, system_prompt, max_tokens,
+                messages, tools, system_prompt, max_tokens, tool_choice=tool_choice,
             )
-        # Gemini — structured-prompt simulation
+        # Gemini — structured-prompt simulation (tool_choice not supported)
         return await self._gemini_generate_with_tools(
             messages, tools, system_prompt, max_tokens,
+        )
+
+    async def generate_with_tools_streaming(
+        self,
+        messages: list[dict],
+        tools: list[ToolDefinition],
+        system_prompt: str = "",
+        max_tokens: int = 16384,
+        on_text: Any | None = None,
+    ) -> LLMResponseWithTools:
+        """Streaming variant of ``generate_with_tools``.
+
+        For Anthropic, uses the native streaming API and calls *on_text(delta)*
+        for each text chunk.  For other providers, falls back to the non-streaming
+        ``generate_with_tools()``.
+
+        Args:
+            on_text: Optional callback ``(delta: str) -> None`` invoked for each
+                     streamed text fragment.
+        """
+        if self.config.provider == LLMProvider.OPENAI:
+            return await self._openai_generate_with_tools_streaming(
+                messages, tools, system_prompt, max_tokens, on_text,
+            )
+        if self.config.provider != LLMProvider.ANTHROPIC:
+            # Gemini: no streaming support, fall back to non-streaming
+            return await self.generate_with_tools(
+                messages, tools, system_prompt, max_tokens,
+            )
+
+        client = self._get_client()
+        api_tools = [
+            {"name": t.name, "description": t.description, "input_schema": t.input_schema}
+            for t in tools
+        ]
+
+        collected_text: list[str] = []
+        tool_calls: list[ToolCall] = []
+        normalized: list[dict] = []
+        usage: dict[str, int] = {}
+        stop_reason_holder: list[str] = ["end_turn"]
+
+        # Track current tool_use block being streamed
+        current_tool: dict[str, Any] = {}
+
+        def _stream_sync() -> None:
+            kwargs: dict[str, Any] = dict(
+                model=self.config.model,
+                max_tokens=max_tokens,
+                tools=api_tools,
+                messages=messages,
+            )
+            if system_prompt:
+                kwargs["system"] = [{
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+
+            with client.messages.stream(**kwargs) as stream:
+                for event in stream:
+                    etype = getattr(event, "type", "")
+
+                    if etype == "content_block_start":
+                        block = getattr(event, "content_block", None)
+                        if block and getattr(block, "type", None) == "tool_use":
+                            current_tool.clear()
+                            current_tool["id"] = block.id
+                            current_tool["name"] = block.name
+                            current_tool["input_json"] = ""
+
+                    elif etype == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta:
+                            dtype = getattr(delta, "type", "")
+                            if dtype == "text_delta":
+                                txt = getattr(delta, "text", "")
+                                collected_text.append(txt)
+                                if on_text is not None:
+                                    on_text(txt)
+                            elif dtype == "input_json_delta":
+                                current_tool["input_json"] = current_tool.get("input_json", "") + getattr(delta, "partial_json", "")
+
+                    elif etype == "content_block_stop":
+                        if current_tool.get("id"):
+                            try:
+                                inp = json.loads(current_tool.get("input_json", "{}"))
+                            except json.JSONDecodeError:
+                                inp = {}
+                            tool_calls.append(ToolCall(
+                                tool_use_id=current_tool["id"],
+                                name=current_tool["name"],
+                                input=inp,
+                            ))
+                            normalized.append({
+                                "type": "tool_use",
+                                "id": current_tool["id"],
+                                "name": current_tool["name"],
+                                "input": inp,
+                            })
+                            current_tool.clear()
+
+                final = stream.get_final_message()
+                usage["input_tokens"] = final.usage.input_tokens
+                usage["output_tokens"] = final.usage.output_tokens
+                stop_reason_holder[0] = final.stop_reason
+
+        try:
+            await self._circuit.call(lambda: asyncio.to_thread(_stream_sync))
+        except CircuitOpenError as exc:
+            raise LLMClientError(str(exc)) from exc
+        except Exception as e:
+            cat = classify_llm_error(str(e))
+            if cat == LLMErrorCategory.CONTEXT_LENGTH:
+                raise ContextOverflowError(
+                    f"Context too long during streaming: {str(e)[:200]}",
+                    estimated_tokens=self.total_input_tokens,
+                ) from e
+            raise
+
+        # Add text blocks to normalized content
+        text_content = "".join(collected_text)
+        if text_content:
+            normalized.insert(0, {"type": "text", "text": text_content})
+
+        self.total_input_tokens += usage.get("input_tokens", 0)
+        self.total_output_tokens += usage.get("output_tokens", 0)
+        self._update_metrics(usage)
+        self._check_cost_cap()
+
+        return LLMResponseWithTools(
+            content=text_content,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason_holder[0],
+            usage=usage,
+            raw_content=normalized,
         )
 
     # ── Per-provider tool-use implementations ────────────────────────────────
@@ -915,6 +1135,9 @@ class LLMClient:
         tools: list[ToolDefinition],
         system_prompt: str,
         max_tokens: int,
+        *,
+        tool_choice: dict | None = None,
+        system_blocks: list[dict] | None = None,
     ) -> LLMResponseWithTools:
         client = self._get_client()
         api_tools = [
@@ -924,19 +1147,37 @@ class LLMClient:
 
         def _sync() -> Any:
             kwargs: dict[str, Any] = dict(
-                model=self.config.model,
+                model=self._effective_model,
                 max_tokens=max_tokens,
                 tools=api_tools,
                 messages=messages,
             )
-            if system_prompt:
-                kwargs["system"] = system_prompt
+            # Use structured system_blocks (with cache_control) if provided,
+            # otherwise fall back to wrapping the plain system_prompt string.
+            if system_blocks:
+                kwargs["system"] = system_blocks
+            elif system_prompt:
+                kwargs["system"] = [{
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }]
+            if tool_choice is not None:
+                kwargs["tool_choice"] = tool_choice
             return client.messages.create(**kwargs)
 
         try:
             response = await self._circuit.call(lambda: asyncio.to_thread(_sync))
         except CircuitOpenError as exc:
             raise LLMClientError(str(exc)) from exc
+        except Exception as e:
+            cat = classify_llm_error(str(e))
+            if cat == LLMErrorCategory.CONTEXT_LENGTH:
+                raise ContextOverflowError(
+                    f"Context too long for Anthropic tool-use: {str(e)[:200]}",
+                    estimated_tokens=self.total_input_tokens,
+                ) from e
+            raise
 
         self.total_input_tokens += response.usage.input_tokens
         self.total_output_tokens += response.usage.output_tokens
@@ -975,12 +1216,150 @@ class LLMClient:
             raw_content=normalized,
         )
 
+    async def _openai_generate_with_tools_streaming(
+        self,
+        messages: list[dict],
+        tools: list[ToolDefinition],
+        system_prompt: str,
+        max_tokens: int,
+        on_text: Any | None = None,
+    ) -> LLMResponseWithTools:
+        """OpenAI streaming with tool-use support.
+
+        Uses the OpenAI streaming API to emit text deltas via *on_text* while
+        accumulating tool_call chunks into complete ToolCall objects.
+        """
+        client = self._get_client()
+        oai_tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.input_schema,
+                },
+            }
+            for t in tools
+        ]
+        oai_messages = self._translate_messages_to_openai(messages, system_prompt)
+
+        collected_text: list[str] = []
+        # tool_call chunks indexed by their list position
+        tool_chunks: dict[int, dict[str, str]] = {}
+        finish_reason_holder: list[str] = ["stop"]
+        usage_holder: dict[str, int] = {}
+
+        def _stream_sync() -> None:
+            response = client.chat.completions.create(
+                model=self.config.model,
+                max_tokens=max_tokens,
+                tools=oai_tools,
+                tool_choice="auto",
+                messages=oai_messages,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+            for chunk in response:
+                if chunk.usage:
+                    usage_holder["input_tokens"] = chunk.usage.prompt_tokens
+                    usage_holder["output_tokens"] = chunk.usage.completion_tokens
+
+                if not chunk.choices:
+                    continue
+
+                choice = chunk.choices[0]
+                if choice.finish_reason:
+                    finish_reason_holder[0] = choice.finish_reason
+
+                delta = choice.delta
+                if delta is None:
+                    continue
+
+                # Text content
+                if delta.content:
+                    collected_text.append(delta.content)
+                    if on_text is not None:
+                        on_text(delta.content)
+
+                # Tool call deltas
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tool_chunks:
+                            tool_chunks[idx] = {
+                                "id": "",
+                                "name": "",
+                                "arguments": "",
+                            }
+                        entry = tool_chunks[idx]
+                        if tc_delta.id:
+                            entry["id"] = tc_delta.id
+                        if tc_delta.function:
+                            if tc_delta.function.name:
+                                entry["name"] = tc_delta.function.name
+                            if tc_delta.function.arguments:
+                                entry["arguments"] += tc_delta.function.arguments
+
+        try:
+            await self._circuit.call(lambda: asyncio.to_thread(_stream_sync))
+        except CircuitOpenError as exc:
+            raise LLMClientError(str(exc)) from exc
+        except Exception as e:
+            cat = classify_llm_error(str(e))
+            if cat == LLMErrorCategory.CONTEXT_LENGTH:
+                raise ContextOverflowError(
+                    f"Context too long during OpenAI streaming: {str(e)[:200]}",
+                    estimated_tokens=self.total_input_tokens,
+                ) from e
+            raise
+
+        # Build normalized content and ToolCall list
+        normalized: list[dict] = []
+        tool_calls: list[ToolCall] = []
+        text = "".join(collected_text)
+        if text:
+            normalized.append({"type": "text", "text": text})
+
+        for idx in sorted(tool_chunks.keys()):
+            entry = tool_chunks[idx]
+            try:
+                inp = json.loads(entry["arguments"])
+            except json.JSONDecodeError:
+                inp = {}
+            tool_calls.append(ToolCall(
+                tool_use_id=entry["id"],
+                name=entry["name"],
+                input=inp,
+            ))
+            normalized.append({
+                "type": "tool_use",
+                "id": entry["id"],
+                "name": entry["name"],
+                "input": inp,
+            })
+
+        self.total_input_tokens += usage_holder.get("input_tokens", 0)
+        self.total_output_tokens += usage_holder.get("output_tokens", 0)
+        self._update_metrics(usage_holder)
+        self._check_cost_cap()
+
+        stop_reason = "tool_use" if finish_reason_holder[0] == "tool_calls" else "end_turn"
+        return LLMResponseWithTools(
+            content=text,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+            usage=usage_holder,
+            raw_content=normalized,
+        )
+
     async def _openai_generate_with_tools(
         self,
         messages: list[dict],
         tools: list[ToolDefinition],
         system_prompt: str,
         max_tokens: int,
+        *,
+        tool_choice: dict | None = None,
     ) -> LLMResponseWithTools:
         client = self._get_client()
         oai_tools = [
@@ -996,12 +1375,22 @@ class LLMClient:
         ]
         oai_messages = self._translate_messages_to_openai(messages, system_prompt)
 
+        # Translate tool_choice from Anthropic format to OpenAI format
+        oai_tool_choice: str | dict = "auto"
+        if tool_choice is not None:
+            tc_type = tool_choice.get("type", "auto")
+            if tc_type == "tool" and "name" in tool_choice:
+                oai_tool_choice = {"type": "function", "function": {"name": tool_choice["name"]}}
+            elif tc_type == "any":
+                oai_tool_choice = "required"
+            # else: "auto" stays as default
+
         def _sync() -> Any:
             return client.chat.completions.create(
-                model=self.config.model,
+                model=self._effective_model,
                 max_tokens=max_tokens,
                 tools=oai_tools,
-                tool_choice="auto",
+                tool_choice=oai_tool_choice,
                 messages=oai_messages,
             )
 
@@ -1009,6 +1398,14 @@ class LLMClient:
             response = await self._circuit.call(lambda: asyncio.to_thread(_sync))
         except CircuitOpenError as exc:
             raise LLMClientError(str(exc)) from exc
+        except Exception as e:
+            cat = classify_llm_error(str(e))
+            if cat == LLMErrorCategory.CONTEXT_LENGTH:
+                raise ContextOverflowError(
+                    f"Context too long for OpenAI tool-use: {str(e)[:200]}",
+                    estimated_tokens=self.total_input_tokens,
+                ) from e
+            raise
 
         self.total_input_tokens += response.usage.prompt_tokens
         self.total_output_tokens += response.usage.completion_tokens

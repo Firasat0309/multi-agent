@@ -85,10 +85,7 @@ class DependencyGraphStore:
         # Reverse topological order: process leaves first
         for node in reversed(ordered):
             successors = list(self._graph.successors(node))
-            if not successors:
-                layers[node] = 0
-            else:
-                layers[node] = max(layers.get(s, 0) for s in successors) + 1
+            layers[node] = max((layers.get(s, 0) for s in successors), default=-1) + 1
         return layers
 
     def get_graph(self) -> nx.DiGraph:

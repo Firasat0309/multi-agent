@@ -10,7 +10,7 @@ from typing import Any
 # ── Blueprint Models ──────────────────────────────────────────────────────────
 
 
-@dataclass
+@dataclass(slots=True)
 class FileBlueprint:
     path: str
     purpose: str
@@ -75,7 +75,7 @@ class TaskStatus(str, Enum):
     BLOCKED = "blocked"
 
 
-@dataclass
+@dataclass(slots=True)
 class Task:
     task_id: int
     task_type: TaskType
@@ -90,7 +90,7 @@ class Task:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(slots=True)
 class TaskResult:
     success: bool
     output: str = ""
@@ -146,7 +146,7 @@ class AgentContext:
 # ── Repository Knowledge Models ──────────────────────────────────────────────
 
 
-@dataclass
+@dataclass(slots=True)
 class FileIndex:
     path: str
     exports: list[str] = field(default_factory=list)
