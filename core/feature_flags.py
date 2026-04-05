@@ -32,6 +32,16 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "feature",
+    "set_feature",
+    "freeze_features",
+    "get_all_features",
+    "reset_features",
+    "init_features_from_env",
+    "init_defaults",
+]
+
 # ── Global flag store ────────────────────────────────────────────────────────
 # Flags are set once at startup and never change during a run.
 # This is intentionally a module-level dict, not a class, for zero-overhead

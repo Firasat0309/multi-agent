@@ -40,6 +40,8 @@ from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["HookEvent", "HookRegistry", "HookPlugin"]
+
 
 # ── Hook events ──────────────────────────────────────────────────────────────
 

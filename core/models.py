@@ -6,6 +6,31 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+__all__ = [
+    "FileBlueprint",
+    "RepositoryBlueprint",
+    "TaskType",
+    "TaskStatus",
+    "Task",
+    "TaskResult",
+    "AgentRole",
+    "AgentContext",
+    "FileIndex",
+    "RepositoryIndex",
+    "ModuleInfo",
+    "RepoAnalysis",
+    "FilePatch",
+    "ChangeActionType",
+    "ChangeAction",
+    "ChangePlan",
+    "TokenCost",
+    "ReviewLevel",
+    "ReviewFinding",
+    "ReviewResult",
+    "ProductRequirements",
+    "APIContract",
+]
+
 
 # ── Blueprint Models ──────────────────────────────────────────────────────────
 
@@ -19,6 +44,9 @@ class FileBlueprint:
     language: str = ""  # Resolved from tech_stack at blueprint parse time
     layer: str = ""  # controller, service, repository, model, test, config
 
+    def __repr__(self) -> str:
+        return f"FileBlueprint({self.path!r}, lang={self.language!r}, deps={len(self.depends_on)})"
+
 
 @dataclass
 class RepositoryBlueprint:
@@ -29,6 +57,12 @@ class RepositoryBlueprint:
     folder_structure: list[str] = field(default_factory=list)
     file_blueprints: list[FileBlueprint] = field(default_factory=list)
     architecture_doc: str = ""
+
+    def __repr__(self) -> str:
+        return (
+            f"RepositoryBlueprint({self.name!r}, style={self.architecture_style!r}, "
+            f"files={len(self.file_blueprints)})"
+        )
 
 
 # ── Task Models ───────────────────────────────────────────────────────────────
@@ -89,6 +123,12 @@ class Task:
     max_retries: int = 3
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __repr__(self) -> str:
+        return (
+            f"Task(id={self.task_id}, type={self.task_type.value}, "
+            f"file={self.file!r}, status={self.status.value})"
+        )
+
 
 @dataclass(slots=True)
 class TaskResult:
@@ -97,6 +137,12 @@ class TaskResult:
     errors: list[str] = field(default_factory=list)
     files_modified: list[str] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
+
+    def __repr__(self) -> str:
+        return (
+            f"TaskResult(success={self.success}, errors={len(self.errors)}, "
+            f"files={len(self.files_modified)})"
+        )
 
 
 # ── Agent Models ──────────────────────────────────────────────────────────────
@@ -141,6 +187,13 @@ class AgentContext:
     # (CoderAgent, ReviewerAgent) can see the exact endpoint schemas they must
     # implement / verify rather than relying on implicit conventions.
     api_contract: "APIContract | None" = None
+
+    def __repr__(self) -> str:
+        return (
+            f"AgentContext(task={self.task.task_id}, "
+            f"file={self.file_blueprint.path if self.file_blueprint else None!r}, "
+            f"related={len(self.related_files)})"
+        )
 
 
 # ── Repository Knowledge Models ──────────────────────────────────────────────
@@ -287,6 +340,9 @@ class ReviewFinding:
     line: int | None = None
     message: str = ""
     suggestion: str = ""
+
+    def __repr__(self) -> str:
+        return f"ReviewFinding({self.severity}, {self.file!r}:{self.line}, {self.message[:60]!r})"
 
 
 @dataclass

@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import re
 
+__all__ = ["SecretRedactionFilter", "redact"]
+
 
 # Patterns matching common API key formats.  Each pattern is compiled once.
 _REDACT_PATTERNS: list[re.Pattern[str]] = [

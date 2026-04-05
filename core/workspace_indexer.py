@@ -109,10 +109,18 @@ def index_workspace(repo_manager: RepositoryManager, settings: Settings) -> None
 
     dep_store.save()
     index_store.save()
+
+    # ── Prune stale embeddings for deleted files ───────────────────────────
+    existing_paths = {f.path for f in repo_index.files}
+    pruned = embedding_store.prune_deleted_files(existing_paths)
+    if pruned:
+        logger.info("Pruned embeddings for %d deleted file(s)", len(pruned))
+
     logger.info(
-        "Workspace indexed: %d files (%d re-embedded), %d dependency edges",
+        "Workspace indexed: %d files (%d re-embedded, %d pruned), %d dependency edges",
         len(repo_index.files),
         len(files_to_embed),
+        len(pruned),
         sum(1 for _ in dep_store.get_graph().edges()),
     )
 

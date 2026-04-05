@@ -464,16 +464,99 @@ def get_language_profile(name: str) -> LanguageProfile:
 
 
 def detect_language_from_blueprint(tech_stack: dict[str, str]) -> LanguageProfile:
-    """Detect language from a blueprint's tech_stack."""
+    """Detect language from a blueprint's tech_stack.
+
+    After resolving the base language profile, applies framework-specific
+    refinements (e.g. Vue → ``vue-tsc``, Next.js → ``next build``).
+    """
     lang = tech_stack.get("language", "")
     if lang:
-        return get_language_profile(lang)
+        profile = get_language_profile(lang)
+    else:
+        framework = tech_stack.get("framework", "")
+        if framework:
+            profile = get_language_profile(framework)
+        else:
+            profile = PYTHON
 
-    framework = tech_stack.get("framework", "")
-    if framework:
-        return get_language_profile(framework)
+    return _refine_profile_for_framework(profile, tech_stack)
 
-    return PYTHON
+
+# ── Framework-specific command overrides ─────────────────────────────────────
+
+# Maps (profile.name, framework-keyword) → field overrides.
+# Checked in order; first match wins.  Keywords are tested case-insensitively
+# against the combined ``framework`` + ``language`` + ``frontend`` values.
+_FRAMEWORK_OVERRIDES: list[tuple[str, list[str], dict[str, str]]] = [
+    # Vue.js uses vue-tsc for type-checking instead of tsc
+    ("typescript", ["vue", "nuxt"], {
+        "type_check_command": "npx vue-tsc --noEmit",
+        "build_command": "npx vue-tsc --noEmit && npx vite build",
+    }),
+    # Next.js has its own build
+    ("typescript", ["next", "nextjs", "next.js"], {
+        "type_check_command": "npx tsc --noEmit",
+        "build_command": "npx next build",
+    }),
+    # Vite (non-Vue) — still uses tsc but build via vite
+    ("typescript", ["vite"], {
+        "build_command": "npx tsc && npx vite build",
+    }),
+    # Angular uses ng build
+    ("typescript", ["angular"], {
+        "type_check_command": "npx tsc --noEmit",
+        "build_command": "npx ng build",
+    }),
+    # Svelte / SvelteKit
+    ("typescript", ["svelte", "sveltekit"], {
+        "type_check_command": "npx svelte-check --tsconfig ./tsconfig.json",
+        "build_command": "npx vite build",
+    }),
+    # Spring Boot — ensure mvn package is used
+    ("java", ["spring", "spring-boot", "springboot"], {
+        "build_command": "mvn package -DskipTests -q",
+        "test_command": "mvn test -q",
+    }),
+    # Gradle-based Java
+    ("java", ["gradle"], {
+        "build_command": "gradle build -x test -q",
+        "test_command": "gradle test",
+    }),
+]
+
+
+def _refine_profile_for_framework(
+    profile: LanguageProfile,
+    tech_stack: dict[str, str],
+) -> LanguageProfile:
+    """Apply framework-specific command overrides to a base language profile.
+
+    Inspects the ``framework``, ``frontend``, and ``language`` values in
+    *tech_stack* for known framework keywords and returns a patched copy
+    of *profile* with adjusted build/type-check/test commands.
+    """
+    import dataclasses
+
+    # Collect all values that might hint at a framework
+    hints = " ".join(
+        str(tech_stack.get(k, ""))
+        for k in ("framework", "frontend", "language", "build_tool", "ui")
+    ).lower()
+
+    if not hints.strip():
+        return profile
+
+    for lang_name, keywords, overrides in _FRAMEWORK_OVERRIDES:
+        if profile.name != lang_name:
+            continue
+        if any(kw in hints for kw in keywords):
+            logger.info(
+                "Applying framework overrides for %s: %s",
+                keywords, list(overrides.keys()),
+            )
+            return dataclasses.replace(profile, **overrides)
+
+    return profile
 
 
 def detect_language_from_extensions(ext_counts: dict[str, int]) -> LanguageProfile:

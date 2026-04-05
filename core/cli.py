@@ -15,7 +15,7 @@ from rich.table import Table
 
 from config.settings import Settings, LLMConfig, LLMProvider, SandboxConfig, SandboxType
 from core.feature_flags import init_features_from_env, freeze_features
-from core.log_redact import SecretRedactionFilter
+from core.log_config import configure_logging
 from core.pipeline import Pipeline, PipelineResult
 from core.llm_client import LLMConfigError
 from core.shutdown import install_signal_handlers
@@ -24,15 +24,7 @@ console = Console()
 
 
 def setup_logging(verbose: bool = False) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
-    handler = RichHandler(console=console, rich_tracebacks=True)
-    handler.addFilter(SecretRedactionFilter())
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=[handler],
-    )
+    configure_logging(verbose=verbose)
 
 
 @click.group()

@@ -217,3 +217,128 @@ async def compact_messages_with_summary(
     }
 
     return head + [summary] + tail
+
+
+# ── File-state restoration ──────────────────────────────────────────────
+
+# After compaction, recently-referenced files may have been discussed in
+# the removed section.  The model no longer "sees" their contents.  This
+# mirrors Claude Code's approach of re-injecting the current state of
+# recently-referenced files so the agent doesn't operate on stale context.
+
+_MAX_RESTORE_FILES = 5
+_MAX_RESTORE_CHARS = 5_000  # per file
+
+
+def _extract_recent_file_paths(messages: list[dict], *, max_files: int = _MAX_RESTORE_FILES) -> list[str]:
+    """Extract file paths recently referenced in tool-use messages.
+
+    Scans from newest to oldest and returns paths in most-recent-first order,
+    deduplicated.
+    """
+    import re
+    paths: list[str] = []
+    seen: set[str] = set()
+
+    for msg in reversed(messages):
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            texts = []
+            for block in content:
+                if isinstance(block, dict):
+                    texts.append(block.get("text", "") or block.get("content", ""))
+                elif isinstance(block, str):
+                    texts.append(block)
+            content = "\n".join(texts)
+
+        # Match common patterns: "Written N bytes to <path>", "[File: <path>", tool input paths
+        for pattern in [
+            r"Written \d+ bytes to (.+?)[\n\r]",
+            r"\[File: ([^\]\|]+)",
+            r'"file(?:_path|name)?"\s*:\s*"([^"]+)"',
+        ]:
+            for match in re.finditer(pattern, content):
+                path = match.group(1).strip()
+                if path and path not in seen and "/" in path:
+                    seen.add(path)
+                    paths.append(path)
+                    if len(paths) >= max_files:
+                        return paths
+    return paths
+
+
+def restore_file_state(
+    compacted_messages: list[dict],
+    read_file_fn: "Callable[[str], str | None]",
+    *,
+    max_files: int = _MAX_RESTORE_FILES,
+    max_chars_per_file: int = _MAX_RESTORE_CHARS,
+) -> list[dict]:
+    """Re-inject current file contents after compaction.
+
+    Scans the *tail* messages for recently-referenced files, reads their
+    current contents via *read_file_fn*, and inserts a restoration message
+    right after the compaction summary so the agent has fresh context.
+
+    Args:
+        compacted_messages: Output from ``compact_messages`` or
+            ``compact_messages_with_summary``.
+        read_file_fn: Synchronous callable ``(path) -> content | None``.
+            Should return ``None`` for missing/unreadable files.
+        max_files: Maximum files to restore (default 5).
+        max_chars_per_file: Truncate each file to this many characters.
+
+    Returns:
+        New message list with an optional file-restoration message inserted.
+    """
+    if len(compacted_messages) < 3:
+        return compacted_messages
+
+    # Only act if there's a compaction marker
+    has_marker = any(
+        "[" in (m.get("content", "") if isinstance(m.get("content"), str) else "")
+        and "messages removed" in (m.get("content", "") if isinstance(m.get("content"), str) else "")
+        for m in compacted_messages[:3]
+    )
+    if not has_marker:
+        return compacted_messages
+
+    # Extract paths from the tail portion (everything after the summary marker)
+    tail_start = 2  # head + summary
+    tail_messages = compacted_messages[tail_start:]
+    paths = _extract_recent_file_paths(tail_messages, max_files=max_files)
+
+    if not paths:
+        return compacted_messages
+
+    # Read current file contents
+    restorations: list[str] = []
+    for path in paths:
+        try:
+            content = read_file_fn(path)
+            if content is None:
+                continue
+            if len(content) > max_chars_per_file:
+                content = content[:max_chars_per_file] + "\n... [truncated]"
+            restorations.append(f"### {path} (current state)\n```\n{content}\n```")
+        except Exception:
+            logger.debug("Could not restore %s", path, exc_info=True)
+
+    if not restorations:
+        return compacted_messages
+
+    logger.info(
+        "Restoring %d file states after compaction (%s)",
+        len(restorations), [p for p in paths[:len(restorations)]],
+    )
+
+    restore_msg = {
+        "role": "user",
+        "content": (
+            "[File context restoration — current contents of recently-modified files:]\n\n"
+            + "\n\n".join(restorations)
+        ),
+    }
+
+    # Insert after the compaction summary (position 2) and before tail
+    return compacted_messages[:tail_start] + [restore_msg] + compacted_messages[tail_start:]

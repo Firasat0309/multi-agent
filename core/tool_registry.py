@@ -35,6 +35,8 @@ from core.llm_client import ToolDefinition
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["ToolRegistry", "ToolContext", "tool"]
+
 
 # ── Tool context (injected into handlers) ────────────────────────────────────
 

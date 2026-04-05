@@ -182,6 +182,63 @@ _RETRYABLE_CATEGORIES = frozenset({
 # ContextOverflowError and compact before retrying.
 
 
+@dataclass(frozen=True)
+class RetryStrategy:
+    """Per-error-category retry policy.
+
+    Each ``LLMErrorCategory`` maps to a strategy that controls:
+      - ``max_retries``: how many times to retry (0 = never)
+      - ``base_delay``: initial delay in seconds (doubles each attempt)
+      - ``use_retry_after``: honour the ``Retry-After`` header if present
+      - ``abort``: raise immediately, don't retry
+      - ``trigger_compaction``: signal the caller to compact and retry
+    """
+    max_retries: int = 3
+    base_delay: float = 2.0
+    use_retry_after: bool = False
+    abort: bool = False
+    trigger_compaction: bool = False
+
+
+RETRY_STRATEGIES: dict[LLMErrorCategory, RetryStrategy] = {
+    LLMErrorCategory.RATE_LIMITED:      RetryStrategy(max_retries=6, base_delay=5.0, use_retry_after=True),
+    LLMErrorCategory.SERVER_OVERLOADED: RetryStrategy(max_retries=4, base_delay=10.0),
+    LLMErrorCategory.TIMEOUT:           RetryStrategy(max_retries=3, base_delay=2.0),
+    LLMErrorCategory.TRANSIENT_SERVER:  RetryStrategy(max_retries=3, base_delay=2.0),
+    LLMErrorCategory.CONTENT_FILTERED:  RetryStrategy(max_retries=2, base_delay=1.0),
+    LLMErrorCategory.CONTEXT_LENGTH:    RetryStrategy(max_retries=1, trigger_compaction=True),
+    LLMErrorCategory.AUTH_FAILED:       RetryStrategy(max_retries=0, abort=True),
+    LLMErrorCategory.MODEL_NOT_FOUND:   RetryStrategy(max_retries=0, abort=True),
+    LLMErrorCategory.INVALID_REQUEST:   RetryStrategy(max_retries=0, abort=True),
+    LLMErrorCategory.QUOTA_EXCEEDED:    RetryStrategy(max_retries=0, abort=True),
+    LLMErrorCategory.UNKNOWN:           RetryStrategy(max_retries=2, base_delay=2.0),
+}
+
+
+def _extract_retry_after(error: Exception) -> float | None:
+    """Extract ``Retry-After`` seconds from an API error if present."""
+    # Anthropic/OpenAI SDKs store headers on the response attribute
+    resp = getattr(error, "response", None)
+    if resp is not None:
+        headers = getattr(resp, "headers", {})
+        val = headers.get("retry-after") or headers.get("Retry-After")
+        if val:
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                pass
+    # Also check the error message for "retry after N" patterns
+    msg = str(error).lower()
+    import re as _re
+    m = _re.search(r"retry.?after\D*(\d+\.?\d*)", msg)
+    if m:
+        try:
+            return float(m.group(1))
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
 def classify_llm_error(error_msg: str) -> LLMErrorCategory:
     """Map an error message string to a fine-grained :class:`LLMErrorCategory`."""
     msg = error_msg.lower()
@@ -448,13 +505,15 @@ class LLMClient:
                 self.total_output_tokens += response.usage.get("output_tokens", 0)
                 self._check_cost_cap()
                 return response
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as e:
+                cat = LLMErrorCategory.TIMEOUT
+                strategy = RETRY_STRATEGIES[cat]
                 logger.error(
                     "LLM request timed out after %ds (attempt %d/%d)",
                     _REQUEST_TIMEOUT + 30, attempt + 1, _max_attempts,
                 )
-                if attempt < _max_attempts - 1:
-                    delay = _base_delay * (2 ** attempt)
+                if attempt < min(strategy.max_retries, _max_attempts) - 1:
+                    delay = strategy.base_delay * (2 ** attempt)
                     await asyncio.sleep(delay)
                     continue
                 raise LLMClientError(
@@ -475,11 +534,13 @@ class LLMClient:
                 raise LLMClientError(str(e)) from e
             except LLMRetryableError as e:
                 # Explicitly retryable (e.g. Gemini blocked/invalid function call)
-                if attempt < _max_attempts - 1:
-                    delay = _base_delay * (2 ** attempt)
+                cat = classify_llm_error(str(e))
+                strategy = RETRY_STRATEGIES.get(cat, RETRY_STRATEGIES[LLMErrorCategory.UNKNOWN])
+                if attempt < min(strategy.max_retries, _max_attempts) - 1:
+                    delay = strategy.base_delay * (2 ** attempt)
                     logger.warning(
-                        "LLM retryable error on attempt %d/%d — retrying in %.1fs: %s",
-                        attempt + 1, _max_attempts, delay, str(e)[:120],
+                        "LLM retryable error [%s] on attempt %d/%d — retrying in %.1fs: %s",
+                        cat.value, attempt + 1, _max_attempts, delay, str(e)[:120],
                     )
                     await asyncio.sleep(delay)
                     continue
@@ -490,49 +551,63 @@ class LLMClient:
             except Exception as e:
                 error_msg = str(e)
                 error_type = type(e).__name__
+                cat = classify_llm_error(error_msg)
+                strategy = RETRY_STRATEGIES.get(cat, RETRY_STRATEGIES[LLMErrorCategory.UNKNOWN])
 
                 # Context-length errors should surface immediately so the
                 # caller (agentic loop) can compact and retry.
-                cat = classify_llm_error(error_msg)
-                if cat == LLMErrorCategory.CONTEXT_LENGTH:
+                if strategy.trigger_compaction:
                     raise ContextOverflowError(
                         f"Context too long for {self.config.provider.value}/{self.config.model}: "
                         f"{error_msg[:200]}",
                         estimated_tokens=self.total_input_tokens,
                     ) from e
 
-                is_rate_limit, is_transient = _classify_error(error_msg)
+                # Abort-class errors (auth, bad model, quota) → raise immediately
+                if strategy.abort:
+                    if cat == LLMErrorCategory.AUTH_FAILED:
+                        raise LLMConfigError(
+                            f"❌ Authentication failed for {self.config.provider.value}\n\n"
+                            f"Your API key may be invalid or expired.\n"
+                            f"Please check your {self.config.provider.value.upper()}_API_KEY environment variable."
+                        ) from e
+                    elif cat == LLMErrorCategory.MODEL_NOT_FOUND:
+                        raise LLMConfigError(
+                            f"❌ Model '{self.config.model}' not found or no longer available\n\n"
+                            f"Valid models for {self.config.provider.value}:\n"
+                            f"  {', '.join(self.VALID_MODELS.get(self.config.provider, []))}\n\n"
+                            f"Use: codegen \"prompt\" --provider {self.config.provider.value} --model <valid-model>"
+                        ) from e
+                    elif cat == LLMErrorCategory.INVALID_REQUEST:
+                        if "is not supported" in error_msg.lower():
+                            raise LLMConfigError(
+                                f"❌ Model '{self.config.model}' is not supported for this operation\n\n"
+                                f"Try a different model: {', '.join(self.VALID_MODELS.get(self.config.provider, []))}"
+                            ) from e
+                        raise LLMClientError(
+                            f"Invalid request to {self.config.provider.value}: {error_msg[:200]}"
+                        ) from e
+                    raise LLMClientError(
+                        f"Non-retryable error ({cat.value}): {error_msg[:200]}"
+                    ) from e
 
-                if is_transient and attempt < _max_attempts - 1:
-                    delay = _base_delay * (2 ** attempt)
+                # Retryable: use category-specific strategy
+                effective_max = min(strategy.max_retries, _max_attempts)
+                if attempt < effective_max - 1:
+                    # Honour Retry-After header for rate-limit errors
+                    if strategy.use_retry_after:
+                        retry_after = _extract_retry_after(e)
+                        delay = retry_after if retry_after else strategy.base_delay * (2 ** attempt)
+                    else:
+                        delay = strategy.base_delay * (2 ** attempt)
                     logger.warning(
-                        "LLM %s on attempt %d/%d — retrying in %.1fs: %s",
-                        "rate-limit" if is_rate_limit else "transient error",
+                        "LLM %s [%s] on attempt %d/%d — retrying in %.1fs: %s",
+                        cat.value, error_type,
                         attempt + 1, _max_attempts,
                         delay, error_msg[:120],
                     )
                     await asyncio.sleep(delay)
                     continue
-
-                # Permanent or exhausted — translate to domain errors
-                if "401" in error_msg or "Unauthorized" in error_msg or "Unauthenticated" in error_type:
-                    raise LLMConfigError(
-                        f"❌ Authentication failed for {self.config.provider.value}\n\n"
-                        f"Your API key may be invalid or expired.\n"
-                        f"Please check your {self.config.provider.value.upper()}_API_KEY environment variable."
-                    ) from e
-                elif "NotFound" in error_type or "404" in error_msg or "not found" in error_msg.lower():
-                    raise LLMConfigError(
-                        f"❌ Model '{self.config.model}' not found or no longer available\n\n"
-                        f"Valid models for {self.config.provider.value}:\n"
-                        f"  {', '.join(self.VALID_MODELS.get(self.config.provider, []))}\n\n"
-                        f"Use: codegen \"prompt\" --provider {self.config.provider.value} --model <valid-model>"
-                    ) from e
-                elif "is not supported" in error_msg.lower():
-                    raise LLMConfigError(
-                        f"❌ Model '{self.config.model}' is not supported for this operation\n\n"
-                        f"Try a different model: {', '.join(self.VALID_MODELS.get(self.config.provider, []))}"
-                    ) from e
 
                 raise LLMClientError(
                     f"Failed to generate with {self.config.provider.value}: {e}"

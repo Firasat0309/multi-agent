@@ -16,6 +16,8 @@ from core.models import RepositoryBlueprint, ChangePlan, RepoAnalysis, TokenCost
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["PipelineResult", "Pipeline"]
+
 
 @dataclass
 class PipelineResult:

@@ -21,6 +21,24 @@ Hierarchy::
 
 from __future__ import annotations
 
+__all__ = [
+    "PipelineError",
+    "LLMError",
+    "LLMRetryableError",
+    "LLMRateLimitError",
+    "LLMConfigError",
+    "BuildError",
+    "ToolExecutionError",
+    "AgentError",
+    "PermissionDeniedError",
+    "SessionError",
+    "ConfigValidationError",
+    "CostLimitExceededError",
+    "ContextOverflowError",
+    "TokenBudgetExceededError",
+    "BlueprintValidationError",
+]
+
 
 class PipelineError(Exception):
     """Base class for all pipeline errors."""

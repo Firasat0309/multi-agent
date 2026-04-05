@@ -41,6 +41,18 @@ from dataclasses import dataclass, field
 
 from core.models import TaskType
 
+__all__ = [
+    "CheckpointDef",
+    "FileTaskDef",
+    "Phase",
+    "SecurityCheckpointDef",
+    "IntegrationCheckpointDef",
+    "PipelineDefinition",
+    "GENERATE_PIPELINE",
+    "ENHANCE_PIPELINE",
+    "FRONTEND_PIPELINE",
+]
+
 
 @dataclass
 class CheckpointDef:

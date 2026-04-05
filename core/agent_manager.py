@@ -516,6 +516,9 @@ class AgentManager:
         agent_cls = TASK_AGENT_MAP.get(task_type)
         if agent_cls is None:
             return "UnknownAgent"
+        # TASK_AGENT_MAP values are now strings (lazy import), not classes.
+        if isinstance(agent_cls, str):
+            return agent_cls
         return agent_cls.__name__
 
     # ── Static helpers ───────────────────────────────────────────────────────

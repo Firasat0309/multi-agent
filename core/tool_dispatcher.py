@@ -18,6 +18,7 @@ from typing import Any, TYPE_CHECKING
 from core.agent_tools import ToolDefinition, validate_tool_input, validate_tool_input_strict
 from core.llm_client import ToolCall
 from core.permissions import ToolPermissionChecker
+from core.tool_registry import ToolRegistry, ToolContext
 
 if TYPE_CHECKING:
     from core.repository_manager import RepositoryManager
@@ -34,8 +35,14 @@ _READ_CHUNK_LINES = 150
 class ToolDispatcher:
     """Routes tool calls to their implementations with permission checks.
 
+    Dispatch order:
+      1. ToolRegistry (plugin / @tool-registered handlers)
+      2. Built-in handler dict (legacy read_file, write_file, etc.)
+      3. MCP tool fallback
+
     Handles:
-    - Standard tools (read_file, write_file, search_code, etc.)
+    - Registry-registered tools (preferred path)
+    - Built-in tools (read_file, write_file, search_code, etc.)
     - MCP tools (delegated to MCPClient)
     - Concurrent execution of safe tools
     - Permission validation before execution
@@ -51,6 +58,7 @@ class ToolDispatcher:
         mcp_client: MCPClient | None = None,
         permission_checker: ToolPermissionChecker | None = None,
         quality_checker: QualityChecker | None = None,
+        tool_registry: ToolRegistry | None = None,
     ) -> None:
         self.repo = repo
         self._code_search = code_search
@@ -58,17 +66,30 @@ class ToolDispatcher:
         self._mcp_client = mcp_client
         self._permission_checker = permission_checker
         self._quality_checker = quality_checker or QualityChecker()
+        self._registry = tool_registry
 
     async def dispatch(self, tool_call: ToolCall) -> str:
         """Execute a single tool call and return the result string."""
         name = tool_call.name
         inp = tool_call.input
 
-        # Permission check
-        if self._permission_checker and name in ("write_file", "apply_patch"):
-            ok, reason = self._permission_checker.check_write(inp.get("path", ""))
-            if not ok:
-                return f"Error: permission denied — {reason}"
+        # ── Permission checks (all tool types) ──────────────────────────
+        if self._permission_checker:
+            if name in ("write_file", "apply_patch"):
+                ok, reason = self._permission_checker.check_write(inp.get("path", ""))
+                if not ok:
+                    return f"Error: permission denied — {reason}"
+            elif name in ("run_command", "execute_command", "shell"):
+                cmd = inp.get("command", "") or inp.get("cmd", "")
+                ok, reason = self._permission_checker.check_command(cmd)
+                if not ok:
+                    return f"Error: permission denied — {reason}"
+            elif name in ("read_file", "search_code", "find_definition", "list_files"):
+                path = inp.get("path", "") or inp.get("directory", "")
+                if path:
+                    ok, reason = self._permission_checker.check_read(path)
+                    if not ok:
+                        return f"Error: permission denied — {reason}"
 
         # Validate input schema
         validation_error = validate_tool_input(name, inp)
@@ -80,7 +101,15 @@ class ToolDispatcher:
         if strict_error:
             return f"Error: {strict_error}"
 
-        # Route to handler
+        # Route to handler — registry first, then built-in, then MCP
+        if self._registry and self._registry.has(name):
+            ctx = ToolContext(
+                repo=self.repo,
+                workspace=str(self.repo.workspace),
+                permission_checker=self._permission_checker,
+            )
+            return await self._registry.dispatch(name, inp, ctx)
+
         handlers = {
             "read_file": self._tool_read_file,
             "write_file": self._tool_write_file,

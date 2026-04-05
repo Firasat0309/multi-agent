@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agents.architect_agent import ArchitectAgent
 from agents.planner_agent import PlannerAgent
 from config.settings import Settings
 from core.agent_manager import AgentManager
+from core.container import Container
 from core.event_bus import EventBus
 from core.language import detect_language_from_blueprint
 from core.llm_client import LLMClient, LLMConfigError, calculate_cost
@@ -370,6 +372,17 @@ class RunPipeline:
                 api_contract=self._api_contract,
             )
 
+            # ── Composition root ──────────────────────────────────────────
+            container = Container()
+            container.instance(Settings, self._settings)
+            container.instance(LLMClient, self._llm)
+            container.instance(RepositoryManager, repo_manager)
+            container.instance(EventBus, event_bus)
+            container.instance(AgentManager, agent_manager)
+            container.instance(DependencyGraphStore, run_dep_store)
+            container.instance(EmbeddingStore, run_embedding_store)
+            self._container = container
+
             # Compute dependency tiers for incremental build verification.
             # Foundational files (models, interfaces) compile first; dependent
             # files (services, controllers) generate only after their deps pass.
@@ -390,13 +403,24 @@ class RunPipeline:
                 lifecycle_engine.checkpoint_mode = True
 
             try:
+                from core.hooks import HookRegistry
+                from core.plugin_loader import discover_and_load_plugins
                 from core.simple_loop_executor import SimpleLoopExecutor
+
+                hook_registry = HookRegistry()
+                plugins_dir = Path(self._settings.workspace_dir) / "plugins"
+                loaded = discover_and_load_plugins(
+                    hook_registry, plugins_dir=plugins_dir,
+                )
+                if loaded:
+                    logger.info("Loaded %d hook plugins: %s", len(loaded), loaded)
 
                 executor = SimpleLoopExecutor(
                     agent_manager=agent_manager,
                     settings=self._settings,
                     lang_profile=lang_profile,
                     event_bus=event_bus,
+                    hooks=hook_registry,
                 )
                 logger.info("Using SimpleLoopExecutor")
 
@@ -761,13 +785,20 @@ class RunPipeline:
 
             errors: list[str] = []
             try:
+                from core.hooks import HookRegistry
+                from core.plugin_loader import discover_and_load_plugins
                 from core.simple_loop_executor import SimpleLoopExecutor
+
+                hook_registry = HookRegistry()
+                plugins_dir = Path(self._settings.workspace_dir) / "plugins"
+                discover_and_load_plugins(hook_registry, plugins_dir=plugins_dir)
 
                 executor = SimpleLoopExecutor(
                     agent_manager=agent_manager,
                     settings=self._settings,
                     lang_profile=lang_profile,
                     event_bus=event_bus,
+                    hooks=hook_registry,
                 )
                 logger.info("Using SimpleLoopExecutor")
 

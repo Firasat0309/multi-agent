@@ -156,6 +156,74 @@ class EmbeddingStore:
                 })
         return hits
 
+    def delete_file(self, file_path: str) -> int:
+        """Remove all chunks for a file from the vector store.
+
+        Returns the number of chunks deleted.
+        """
+        self._ensure_client()
+        if self._collection is None:
+            return 0
+
+        try:
+            # Query for all chunk IDs belonging to this file
+            results = self._collection.get(
+                where={"file": file_path},
+                include=[],  # Only need IDs
+            )
+            ids = results.get("ids", [])
+            if ids:
+                self._collection.delete(ids=ids)
+                logger.debug("Deleted %d chunks for %s", len(ids), file_path)
+                return len(ids)
+        except Exception as e:
+            logger.warning("Failed to delete chunks for %s: %s", file_path, e)
+        return 0
+
+    def get_indexed_files(self) -> set[str]:
+        """Return the set of file paths currently in the index."""
+        self._ensure_client()
+        if self._collection is None:
+            return set()
+
+        try:
+            results = self._collection.get(include=["metadatas"])
+            files: set[str] = set()
+            for meta in results.get("metadatas", []):
+                if isinstance(meta, dict) and "file" in meta:
+                    files.add(meta["file"])
+            return files
+        except Exception as e:
+            logger.warning("Failed to enumerate indexed files: %s", e)
+            return set()
+
+    def prune_deleted_files(self, existing_files: set[str]) -> list[str]:
+        """Remove embeddings for files that no longer exist in the workspace.
+
+        Args:
+            existing_files: Set of file paths that currently exist.
+
+        Returns:
+            List of file paths whose embeddings were removed.
+        """
+        indexed = self.get_indexed_files()
+        stale = indexed - existing_files
+        if not stale:
+            return []
+
+        pruned: list[str] = []
+        for fp in stale:
+            deleted = self.delete_file(fp)
+            if deleted > 0:
+                pruned.append(fp)
+
+        if pruned:
+            logger.info(
+                "Pruned embeddings for %d deleted file(s): %s",
+                len(pruned), pruned[:10],
+            )
+        return pruned
+
     def _chunk_code(self, content: str, chunk_size: int = 40, file_path: str = "") -> list[str]:
         """Split code into chunks at top-level definition boundaries.
 
