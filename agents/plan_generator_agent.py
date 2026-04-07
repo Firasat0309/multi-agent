@@ -54,7 +54,13 @@ class PlanGeneratorAgent(BaseAgent):
             "section independently — missing information in any phase causes generation failure.\n"
             "- Output ONLY the markdown document — no preamble, no explanation, no fences "
             "wrapping the entire document.\n"
-            "- All six phases (PHASE 0 through PHASE 5) are mandatory. Do NOT skip any.\n\n"
+            "- All six phases (PHASE 0 through PHASE 5) are mandatory. Do NOT skip any.\n"
+            "- DATABASE DEFAULT: If the user does NOT explicitly name a database technology, "
+            "use the appropriate in-memory database for the language:\n"
+            "  * Java/Spring Boot → H2 in-memory (jdbc:h2:mem:testdb). Do NOT use PostgreSQL.\n"
+            "  * Python → SQLite in-memory\n"
+            "  * Go / TypeScript / Rust / C# → SQLite in-memory\n"
+            "  Only use PostgreSQL, MySQL, MongoDB, etc. when the user explicitly requests it.\n\n"
             "REQUIRED DOCUMENT STRUCTURE:\n\n"
             "# <Project Title> — Implementation Plan\n"
             "**Tech Stack:** <Frontend> | <Backend> | <Database> | <Build Tool>\n\n"
@@ -297,10 +303,25 @@ class PlanGeneratorAgent(BaseAgent):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    @staticmethod
-    def _build_generation_prompt(user_prompt: str) -> str:
+    # Reuse the same DB-detection helpers from ArchitectAgent so the
+    # database defaulting logic stays in sync across all planning stages.
+    from agents.architect_agent import ArchitectAgent as _Arch
+    _user_specified_db = _Arch._user_specified_db
+    _default_db_note   = _Arch._default_db_note
+    del _Arch
+
+    @classmethod
+    def _build_generation_prompt(cls, user_prompt: str) -> str:
+        db_hint = ""
+        if not cls._user_specified_db(user_prompt):
+            db_note = cls._default_db_note(user_prompt)
+            db_hint = (
+                f"\n\n[SYSTEM NOTE: The user did not specify a database. {db_note} "
+                "Do NOT use PostgreSQL, MySQL, or any external database. "
+                "Configure it as an embedded in-memory datasource.]"
+            )
         return (
-            f"User request:\n{user_prompt}\n\n"
+            f"User request:\n{user_prompt}{db_hint}\n\n"
             "Generate a complete plan.md document for this project. "
             "The document must include all six phases (PHASE 0 through PHASE 5) "
             "as described in your system prompt. "
