@@ -210,12 +210,23 @@ class BaseAgent(ABC):
 
         return _BASE
 
-    async def execute_agentic(self, context: AgentContext) -> TaskResult:
+    async def execute_agentic(
+        self,
+        context: AgentContext,
+        *,
+        prompt_override: str | None = None,
+    ) -> TaskResult:
         """Tool-use loop: agent may request reads, searches, writes, and MCP extensions.
 
         The loop continues until the LLM returns ``stop_reason == "end_turn"``
         or ``max_iterations`` is reached.  Each tool call is dispatched via
         ``_dispatch_tool()`` and the result is fed back in the next turn.
+
+        Args:
+            context: Agent context with task, blueprint, and related files.
+            prompt_override: If provided, use this as the initial user message
+                instead of calling ``_build_prompt(context)``.  Used by
+                two-pass generation to inject skeleton/implementation prompts.
         """
         # If an MCP client is present, fetch the tools before execution starts
         if self._mcp_client and not self._mcp_tools:
@@ -226,11 +237,13 @@ class BaseAgent(ABC):
 
         if not self.tools:
             # No tools registered — fall back to single-shot call
-            content = await self._call_llm(self._build_prompt(context))
+            _initial_prompt = prompt_override or self._build_prompt(context)
+            content = await self._call_llm(_initial_prompt)
             return self._parse_agentic_result(context, content, [])
 
+        _initial_prompt = prompt_override or self._build_prompt(context)
         messages: list[dict] = [
-            UserMessage.from_text(self._build_prompt(context)).to_dict()
+            UserMessage.from_text(_initial_prompt).to_dict()
         ]
         files_written: list[str] = []
         max_iterations = self.max_iterations

@@ -8,6 +8,7 @@ from typing import Any
 
 from agents.base_agent import BaseAgent
 from core.coverage_runner import CoverageRunner
+from core.feature_flags import feature
 from core.language import get_language_profile, LanguageProfile
 from core.models import AgentContext, AgentRole, TaskResult
 from core.prompt_templates import PromptTemplates
@@ -19,9 +20,17 @@ logger = logging.getLogger(__name__)
 class TestAgent(BaseAgent):
     role = AgentRole.TESTER
 
+    # Shared test template cache (class-level, reused across instances)
+    _template_cache = None
+
     def __init__(self, *args: Any, terminal: TerminalTools | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.terminal = terminal
+        # Lazily initialise the shared template cache
+        if feature("TEST_TEMPLATE_CACHE") and TestAgent._template_cache is None:
+            from core.test_template_cache import TestTemplateCache
+            cache_dir = self.repo.workspace / ".codegen" / "test_templates" if self.repo else None
+            TestAgent._template_cache = TestTemplateCache(cache_dir=cache_dir)
 
     def _get_system_prompt(self, language: str) -> str:
         profile = get_language_profile(language)
@@ -209,6 +218,21 @@ class TestAgent(BaseAgent):
 
         prompt += exports_section
 
+        # ── Inject cached test template scaffold ──────────────────────────
+        # If a template exists for this (language, layer, framework) combo,
+        # inject it to save LLM effort on boilerplate (imports, setup, mocks).
+        _template_section = ""
+        if feature("TEST_TEMPLATE_CACHE") and self._template_cache:
+            _fw = profile.test_command.split()[0] if profile.test_command else "default"
+            _cached = self._template_cache.get(lang, fb.layer or "unknown", _fw)
+            if _cached:
+                _template_section = _cached.to_prompt_section()
+                prompt += (
+                    "REUSABLE TEST SCAFFOLD (from a previously passing test "
+                    "in the same layer — adapt but keep the structure):\n"
+                    f"```\n{_template_section}\n```\n\n"
+                )
+
         prompt += (
             f"{lang_hints}\n\n"
             "MANDATORY CHECKLIST:\n"
@@ -223,6 +247,11 @@ class TestAgent(BaseAgent):
         test_code = await self._call_llm(prompt, system_override=self._get_system_prompt(lang))
         test_code = self._clean_code(test_code, profile)
         await self.repo.async_write_test_file(test_path, test_code)
+
+        # Cache the generated test scaffold for reuse by future test files
+        if feature("TEST_TEMPLATE_CACHE") and self._template_cache and test_code:
+            _fw = profile.test_command.split()[0] if profile.test_command else "default"
+            self._template_cache.store(lang, fb.layer or "unknown", _fw, test_code)
 
         # Run tests if terminal available (autonomous debug loop)
         if self.terminal:
@@ -372,6 +401,57 @@ class TestAgent(BaseAgent):
         lower = error_output.lower()
         return any(marker in lower for marker in self._BUILD_CONFIG_ERRORS)
 
+    @staticmethod
+    def _is_test_code_error(error_output: str, test_path: str, source_path: str) -> bool:
+        """Classify whether the error is in the test code rather than the source.
+
+        Returns True when the error is clearly a test-side issue (wrong import,
+        assertion mismatch on test expectations, method-not-found in test file)
+        that should be fixed by rewriting the test, not the source.
+
+        This avoids wasting an LLM call trying to fix correct source code when
+        only the test imports or assertions are wrong.
+        """
+        lower = error_output.lower()
+        test_name = test_path.rsplit("/", 1)[-1].lower() if test_path else ""
+
+        # Errors that reference the test file directly (import/compile errors in test)
+        if test_name and test_name in lower:
+            # Test file itself has compilation/import errors
+            _test_error_markers = (
+                "cannot find symbol",
+                "cannot resolve",
+                "import error",
+                "importerror",
+                "modulenotfounderror",
+                "no module named",
+                "does not exist",
+                "is not defined",
+                "undefined",
+            )
+            if any(m in lower for m in _test_error_markers):
+                return True
+
+        # Assertion failures are test-side by definition — the test's expected
+        # values may be wrong, not the source's actual values
+        _assertion_markers = (
+            "assertionerror",
+            "assert_equal",
+            "assertequals",
+            "expected:<",
+            "expected [",
+            "but was:<",
+            "but got:",
+            "expected:",
+            "to equal",
+            "to be",
+            "not equal to",
+        )
+        if any(m in lower for m in _assertion_markers):
+            return True
+
+        return False
+
     async def _run_and_fix(
         self, test_path: str, test_code: str, context: AgentContext,
         profile: LanguageProfile, max_attempts: int = 4,
@@ -479,7 +559,21 @@ class TestAgent(BaseAgent):
             # If the error is a build/config issue (no pom.xml etc.),
             # only fix tests — touching source code won't help.
             is_build_error = self._is_build_config_error(error_output)
-            fix_test = attempt % 2 == 0 or is_build_error
+
+            # Smart classification: detect whether the error is in test code
+            # (import errors, assertion mismatches, wrong method names in test)
+            # vs actual source bugs (NPE, wrong return value, logic error).
+            # This avoids wasting an LLM call fixing source when the test
+            # imports are just wrong.
+            is_test_code_error = self._is_test_code_error(error_output, test_path, source_path)
+            if is_build_error or is_test_code_error:
+                fix_test = True
+            elif attempt == 0:
+                # First attempt: always try fixing test first (most common)
+                fix_test = True
+            else:
+                # Subsequent attempts: alternate, but prefer test fixes
+                fix_test = attempt % 2 == 0
 
             if is_build_error and attempt == 0:
                 logger.warning(

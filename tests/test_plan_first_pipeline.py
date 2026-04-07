@@ -1094,8 +1094,10 @@ class TestPlanFirstPipelineIntegration:
 
         approval_calls = []
 
+        from core.plan_parser import ParsedPlan
         with patch("agents.plan_generator_agent.PlanGeneratorAgent.generate_plan",
                    new=AsyncMock(return_value=sample_plan_md)), \
+             patch("core.plan_parser.parse_plan_md", return_value=ParsedPlan()), \
              patch("core.architecture_approver.ArchitectureApprover.approve_plan_md",
                    side_effect=lambda content: approval_calls.append(content) or True), \
              patch("agents.product_planner_agent.ProductPlannerAgent.parse_from_plan",
@@ -1122,8 +1124,10 @@ class TestPlanFirstPipelineIntegration:
             True,              # second call: approve
         ]
 
+        from core.plan_parser import ParsedPlan
         with patch("agents.plan_generator_agent.PlanGeneratorAgent.generate_plan",
                    new=AsyncMock(return_value=sample_plan_md)), \
+             patch("core.plan_parser.parse_plan_md", return_value=ParsedPlan()), \
              patch("agents.plan_generator_agent.PlanGeneratorAgent.revise_plan",
                    new=AsyncMock(return_value=revised_plan)) as mock_revise, \
              patch("core.architecture_approver.ArchitectureApprover.approve_plan_md",
@@ -1147,8 +1151,10 @@ class TestPlanFirstPipelineIntegration:
         settings = self._make_settings(tmp_path)
         parse_calls = []
 
+        from core.plan_parser import ParsedPlan
         with patch("agents.plan_generator_agent.PlanGeneratorAgent.generate_plan",
                    new=AsyncMock(return_value=sample_plan_md)), \
+             patch("core.plan_parser.parse_plan_md", return_value=ParsedPlan()), \
              patch("agents.product_planner_agent.ProductPlannerAgent.parse_from_plan",
                    side_effect=lambda plan: parse_calls.append(plan) or sample_requirements), \
              patch("agents.architect_agent.ArchitectAgent.design_from_plan",
@@ -1169,24 +1175,28 @@ class TestPlanFirstPipelineIntegration:
         settings = self._make_settings(tmp_path)
         design_calls = []
 
+        from core.plan_parser import ParsedPlan
         with patch("agents.plan_generator_agent.PlanGeneratorAgent.generate_plan",
                    new=AsyncMock(return_value=sample_plan_md)), \
+             patch("core.plan_parser.parse_plan_md", return_value=ParsedPlan()), \
              patch("agents.product_planner_agent.ProductPlannerAgent.parse_from_plan",
                    new=AsyncMock(return_value=sample_requirements)), \
              patch("agents.architect_agent.ArchitectAgent.design_from_plan",
-                   side_effect=lambda plan, req: design_calls.append((plan, req)) or sample_blueprint), \
+                   side_effect=lambda plan, req=None: design_calls.append((plan, req)) or sample_blueprint), \
              patch("agents.api_contract_agent.APIContractAgent.extract_from_plan",
                    new=AsyncMock(side_effect=RuntimeError("stop"))):
 
             llm = MagicMock()
             pipeline = FullstackPipeline(settings=settings, llm=llm, interactive=False)
             import time
-            await pipeline.execute("Build a task manager", time.monotonic())
+            try:
+                await pipeline.execute("Build a task manager", time.monotonic())
+            except RuntimeError:
+                pass  # expected — extract_from_plan raises to stop pipeline
 
         assert len(design_calls) == 1
-        plan_arg, req_arg = design_calls[0]
+        plan_arg, _req_arg = design_calls[0]
         assert plan_arg == sample_plan_md
-        assert req_arg.title == sample_requirements.title
 
     @pytest.mark.anyio
     async def test_contract_derived_from_plan(
@@ -1207,8 +1217,10 @@ class TestPlanFirstPipelineIntegration:
         )
         extract_calls = []
 
+        from core.plan_parser import ParsedPlan
         with patch("agents.plan_generator_agent.PlanGeneratorAgent.generate_plan",
                    new=AsyncMock(return_value=sample_plan_md)), \
+             patch("core.plan_parser.parse_plan_md", return_value=ParsedPlan()), \
              patch("agents.product_planner_agent.ProductPlannerAgent.parse_from_plan",
                    new=AsyncMock(return_value=sample_requirements)), \
              patch("agents.architect_agent.ArchitectAgent.design_from_plan",

@@ -340,12 +340,22 @@ class CoderAgent(BaseAgent):
         # the model generates the exact request/response types required.
         api_contract_section = self._extract_api_contract_section(context)
 
+        # ── Version pinning context ──────────────────────────────────────
+        # When DEP_VERSION_PINNING is enabled, inject curated version info
+        # to prevent the LLM from hallucinating incompatible version combos.
+        version_context = ""
+        from core.feature_flags import feature
+        if feature("DEP_VERSION_PINNING"):
+            from core.dep_versions import inject_version_context
+            version_context = inject_version_context(context.blueprint.tech_stack)
+
         return (
             f"{self._format_context(context)}\n\n"
             f"Generate the complete {profile.display_name} file for: {fb.path}\n"
             f"Purpose: {fb.purpose}\n"
             f"Layer: {fb.layer}\n"
             f"Must export: {', '.join(fb.exports) if fb.exports else 'appropriate classes/functions'}\n\n"
+            f"{version_context}"
             f"{api_contract_section}"
             f"{dep_signatures}"
             f"INSTRUCTIONS:\n"
@@ -831,7 +841,99 @@ class CoderAgent(BaseAgent):
         # read dependency interfaces and write the file directly.
         lang = fb.language or context.blueprint.tech_stack.get("language", "python")
         self._current_language = lang  # used by system_prompt property during the loop
+
+        # ── Two-pass generation for complex files ───────────────────────
+        # Complex files (≥5 deps, complex purpose) benefit from generating
+        # a skeleton first (signatures only), then filling in implementations.
+        # This locks method signatures before implementation, reducing
+        # cross-method consistency bugs in large files.
+        from core.feature_flags import feature
+        if feature("TWO_PASS_GENERATION"):
+            from core.two_pass_generation import should_use_two_pass
+            if should_use_two_pass(fb):
+                logger.info(
+                    "[%s] Using two-pass generation (complex file, %d deps)",
+                    fb.path, len(fb.depends_on),
+                )
+                return await self._two_pass_generate(context, lang)
+
         return await self.execute_agentic(context)
+
+    async def _two_pass_generate(self, context: AgentContext, lang: str) -> TaskResult:
+        """Two-pass generation: skeleton → implementation for complex files.
+
+        Pass 1: Generate class structure with method stubs via single-shot
+                _call_llm() — no tool use needed since dependency signatures
+                are already extracted and embedded in the prompt.  This halves
+                the LLM round-trips compared to using execute_agentic().
+        Pass 2: Fill in method bodies using the skeleton as context via the
+                full agentic loop (may need to read deps for edge cases).
+        """
+        from core.two_pass_generation import build_skeleton_prompt, build_implementation_prompt
+
+        fb = context.file_blueprint
+        profile = get_language_profile(lang)
+
+        dep_signatures = self._extract_dep_signatures(context)
+        api_contract_section = self._extract_api_contract_section(context)
+
+        # ── Pass 1: Skeleton (single-shot — no tool use needed) ─────────
+        # Dep signatures are already in the prompt, so the LLM doesn't need
+        # read_file.  Single-shot saves ~5-10 LLM round-trips per complex file.
+        logger.info("[%s] Two-pass: generating skeleton (pass 1/2, single-shot)", fb.path)
+        skeleton_prompt = (
+            f"{self._format_context(context)}\n\n"
+            + build_skeleton_prompt(fb, lang, dep_signatures, api_contract_section)
+        )
+        try:
+            skeleton_code = await self._call_llm(
+                skeleton_prompt,
+                system_override=self._get_source_system_prompt(lang),
+            )
+            skeleton_code = self._clean_fences(skeleton_code, profile.code_fence_name)
+            if not skeleton_code or len(skeleton_code.strip()) < 20:
+                logger.warning("[%s] Two-pass skeleton produced empty output — falling back", fb.path)
+                return await self.execute_agentic(context)
+            await self.repo.async_write_file(fb.path, skeleton_code)
+        except Exception:
+            logger.warning("[%s] Two-pass skeleton failed — falling back to single-pass", fb.path, exc_info=True)
+            return await self.execute_agentic(context)
+
+        # Read the skeleton that was written
+        try:
+            skeleton_content = self.repo.read_file(fb.path)
+        except Exception:
+            logger.warning("[%s] Cannot read skeleton — falling back", fb.path)
+            return TaskResult(
+                success=True,
+                output=f"Generated skeleton for {fb.path} (pass 2 skipped)",
+                files_modified=[fb.path],
+                metrics=self.get_metrics(),
+            )
+
+        # ── Pass 2: Implementation (agentic — may need tool reads) ──────
+        logger.info("[%s] Two-pass: filling implementation (pass 2/2)", fb.path)
+        impl_prompt = (
+            f"{self._format_context(context)}\n\n"
+            + build_implementation_prompt(
+                fb, skeleton_content, lang, dep_signatures, api_contract_section,
+            )
+        )
+        pass2_result = await self.execute_agentic(
+            context,
+            prompt_override=impl_prompt,
+        )
+        if not pass2_result.success:
+            # Pass 2 failed — the skeleton might still be better than nothing
+            logger.warning("[%s] Two-pass implementation failed — keeping skeleton", fb.path)
+            return TaskResult(
+                success=True,
+                output=f"Generated skeleton for {fb.path} (implementation pass failed)",
+                files_modified=[fb.path],
+                metrics=self.get_metrics(),
+            )
+
+        return pass2_result
 
     async def _generate_source(self, context: AgentContext) -> TaskResult:
         """Generate source code for a programming language file."""
@@ -1009,6 +1111,17 @@ class CoderAgent(BaseAgent):
             f"Project: {context.blueprint.name}\n"
             f"Tech stack: {tech}\n"
             f"Architecture: {context.blueprint.architecture_style}\n\n"
+        )
+
+        # Inject pinned dependency versions for build config files
+        from core.feature_flags import feature as _feature
+        if _feature("DEP_VERSION_PINNING"):
+            from core.dep_versions import inject_version_context
+            _ver_ctx = inject_version_context(tech)
+            if _ver_ctx:
+                prompt += _ver_ctx + "\n"
+
+        prompt += (
             f"Generate the file: {fb.path}\n"
             f"Purpose: {fb.purpose}\n"
             f"Format: {fmt}\n"

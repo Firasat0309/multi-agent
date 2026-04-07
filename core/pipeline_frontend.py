@@ -187,13 +187,13 @@ class FrontendPipeline:
             except Exception as exc:
                 logger.exception("Component planning failed")
                 errors.append(f"Component planning failed: {exc}")
-            self._fail_phase("FE: Component Planning", str(exc))
-            return PipelineResult(
-                success=False,
-                workspace_path=workspace,
-                errors=errors,
-                elapsed_seconds=time.monotonic() - start_time,
-            )
+                self._fail_phase("FE: Component Planning", str(exc))
+                return PipelineResult(
+                    success=False,
+                    workspace_path=workspace,
+                    errors=errors,
+                    elapsed_seconds=time.monotonic() - start_time,
+                )
 
         # ── Approval Gate 3: Frontend Architecture ─────────────────────────────
         if self._settings.require_architecture_approval:

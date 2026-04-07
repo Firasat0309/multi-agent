@@ -198,6 +198,37 @@ class SimpleLoopExecutor:
         if self._compiled:
             global_build_ok = await self._global_build(engine)
 
+        # ── Runtime smoke test (optional, post-build) ───────────────────
+        # After the global build passes, start the application and verify
+        # it boots without crashing.  Catches runtime issues (missing beans,
+        # circular DI, invalid config) that the compiler won't catch.
+        smoke_test_result = None
+        if feature("RUNTIME_SMOKE_TEST") and global_build_ok:
+            try:
+                from core.runtime_smoke_test import RuntimeSmokeTest
+                blueprint = self._am.blueprint or getattr(self._am.repo, "blueprint", None)
+                if blueprint:
+                    smoke = RuntimeSmokeTest(
+                        workspace=self._am.repo.workspace,
+                        tech_stack=blueprint.tech_stack,
+                    )
+                    smoke_test_result = await smoke.run()
+                    if smoke_test_result.success:
+                        logger.info("Runtime smoke test PASSED: %s", smoke_test_result.summary())
+                    else:
+                        logger.warning("Runtime smoke test FAILED: %s", smoke_test_result.summary())
+                        if self._event_bus:
+                            self._event_bus.publish(AgentEvent(
+                                event_type=BusEventType.LIFECYCLE_TRANSITION,
+                                data={
+                                    "type": "smoke_test_failed",
+                                    "errors": smoke_test_result.errors,
+                                    "stdout_tail": smoke_test_result.stdout_tail[-500:],
+                                },
+                            ))
+            except Exception:
+                logger.debug("Runtime smoke test failed (non-critical)", exc_info=True)
+
         # ── Test generation (optional) ──────────────────────────────────
         if "tester" not in skip_agents:
             await self._run_test_phase(engine)
@@ -270,6 +301,12 @@ class SimpleLoopExecutor:
             "checkpoint_results": [],
             "security_checkpoint": security_result,
             "integration_checkpoint": integration_result,
+            "smoke_test": {
+                "passed": smoke_test_result.success if smoke_test_result else None,
+                "startup_time": smoke_test_result.startup_time_seconds if smoke_test_result else None,
+                "health_endpoint": smoke_test_result.health_endpoint if smoke_test_result else None,
+                "errors": smoke_test_result.errors if smoke_test_result else [],
+            } if smoke_test_result else {},
         }
 
     # ── Core per-file loop ──────────────────────────────────────────────
@@ -659,6 +696,42 @@ class SimpleLoopExecutor:
                     )
                     stats["failed"] += len(cascaded)
 
+            # ── Cross-file consistency check (post-tier) ────────────────
+            # After all files in the tier are generated, validate that
+            # cross-file method references are consistent. Issues are
+            # logged as warnings and injected into the event bus so
+            # downstream tiers can account for mismatches.
+            if feature("CROSS_FILE_VALIDATOR"):
+                try:
+                    from core.cross_file_validator import CrossFileValidator
+                    blueprint = self._am.blueprint or getattr(self._am.repo, "blueprint", None)
+                    if blueprint:
+                        validator = CrossFileValidator(self._am.repo.workspace, blueprint)
+                        passed_files = [
+                            f for f in tier.files if f not in tier_failed
+                        ]
+                        if passed_files:
+                            report = validator.validate(passed_files)
+                            if report.issues:
+                                logger.warning(
+                                    "Tier %d cross-file validation: %s",
+                                    tier.index, report.full_summary(),
+                                )
+                                if self._event_bus:
+                                    self._event_bus.publish(AgentEvent(
+                                        event_type=BusEventType.LIFECYCLE_TRANSITION,
+                                        data={
+                                            "type": "cross_file_validation",
+                                            "tier": tier.index,
+                                            "issues": [str(i) for i in report.issues],
+                                        },
+                                    ))
+                except Exception:
+                    logger.debug(
+                        "Cross-file validation failed (non-critical)",
+                        exc_info=True,
+                    )
+
             # Mark tier complete and persist session state
             if self._session and not tier_failed:
                 self._session.mark_tier_complete(tier.index)
@@ -710,6 +783,9 @@ class SimpleLoopExecutor:
                     system_prompt="Generate the requested source file based on the blueprint.",
                     prompt=prompt,
                 )
+                # Track speculative LLM calls so they appear in metrics
+                self._am._metrics.setdefault("speculative_llm_calls", 0)
+                self._am._metrics["speculative_llm_calls"] += 1
                 return resp.content if hasattr(resp, "content") else str(resp)
 
             def _write_file(fp: str, content: str) -> None:
@@ -840,6 +916,42 @@ class SimpleLoopExecutor:
             logger.exception("[%s] Generation phase failed", file_path)
             return False
 
+    def _is_simple_file(self, file_path: str) -> bool:
+        """Check if a file is simple enough to skip review (config, DTO, model).
+
+        Uses the same heuristics as ModelRouter: files in model/config layers
+        with ≤2 dependencies and no complex purpose signals are considered
+        simple and unlikely to benefit from an LLM review pass.
+        """
+        blueprint = self._am.blueprint or (
+            self._am.repo.blueprint if hasattr(self._am.repo, "blueprint") else None
+        )
+        if not blueprint:
+            return False
+
+        fb = None
+        for candidate in blueprint.file_blueprints:
+            if candidate.path == file_path:
+                fb = candidate
+                break
+        if fb is None:
+            return False
+
+        layer = fb.layer.lower() if fb.layer else ""
+        dep_count = len(fb.depends_on)
+        purpose = fb.purpose.lower() if fb.purpose else ""
+
+        # Simple layers that rarely have semantic bugs worth reviewing
+        _simple_layers = {"model", "config", "dto", "entity", "enum", "constant"}
+        _complex_signals = (
+            "algorithm", "transaction", "concurren", "stream",
+            "websocket", "caching", "pagination", "authentication",
+            "authorization", "middleware", "interceptor", "security",
+        )
+        has_complex_purpose = any(s in purpose for s in _complex_signals)
+
+        return layer in _simple_layers and dep_count <= 2 and not has_complex_purpose
+
     async def _quick_review(
         self,
         engine: LifecycleEngine,
@@ -851,8 +963,21 @@ class SimpleLoopExecutor:
         or if QUICK_REVIEW feature is disabled).  The findings are injected
         into the fix-loop error context so the coder agent can address
         semantic issues that the compiler wouldn't catch.
+
+        Simple files (config, model/DTO layers with few dependencies) are
+        automatically skipped to save an LLM call — the compiler will catch
+        any issues in those files.
         """
         if not feature("QUICK_REVIEW"):
+            return []
+
+        # Skip review for simple files — config, models, DTOs rarely have
+        # semantic bugs that the compiler won't catch anyway.
+        if feature("SKIP_SIMPLE_REVIEW") and self._is_simple_file(file_path):
+            logger.info(
+                "[%s] Skipping review (simple file — model/config/DTO layer)",
+                file_path,
+            )
             return []
 
         try:

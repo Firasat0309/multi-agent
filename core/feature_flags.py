@@ -115,6 +115,7 @@ SESSION_RESUME = "SESSION_RESUME"
 FILE_STATE_CACHE = "FILE_STATE_CACHE"
 PROMPT_CACHING = "PROMPT_CACHING"
 TOOL_REGISTRY = "TOOL_REGISTRY"
+SKIP_SIMPLE_REVIEW = "SKIP_SIMPLE_REVIEW"
 
 # ── All known flags with defaults (for documentation / validation) ───────────
 
@@ -128,6 +129,9 @@ _KNOWN_FLAGS: dict[str, bool] = {
     FILE_STATE_CACHE: False,
     PROMPT_CACHING: True,
     TOOL_REGISTRY: False,
+    # Phase 4: skip review for simple files by default — config, model,
+    # DTO layers with ≤2 deps rarely have semantic bugs worth an LLM call.
+    SKIP_SIMPLE_REVIEW: True,
 }
 
 
@@ -197,6 +201,33 @@ REVIEWER_TOOLS = "REVIEWER_TOOLS"
 # Prompt injection defense: sanitize user inputs and wrap user-provided
 # content in delimiters to prevent prompt injection attacks.
 PROMPT_GUARD = "PROMPT_GUARD"
+
+# ── Phase 4 optimization flags ──────────────────────────────────────────────
+
+# Skip code review for simple files (config, model, DTO layers with ≤2
+# dependencies). These files rarely have semantic bugs that the compiler
+# wouldn't catch, saving one LLM call per simple file.
+SKIP_SIMPLE_REVIEW = "SKIP_SIMPLE_REVIEW"
+
+# Cross-file consistency validation: after all files in a tier are generated,
+# verify that method signatures match across caller/callee boundaries.
+CROSS_FILE_VALIDATOR = "CROSS_FILE_VALIDATOR"
+
+# Test template caching: cache generated test scaffolds per framework+layer
+# combo to reduce LLM tokens for repetitive test generation.
+TEST_TEMPLATE_CACHE = "TEST_TEMPLATE_CACHE"
+
+# Two-pass generation: generate skeleton (signatures only) first for COMPLEX
+# tier files, then fill in implementations in a second pass.
+TWO_PASS_GENERATION = "TWO_PASS_GENERATION"
+
+# Runtime smoke test: after all files pass build, start the app and verify
+# health endpoint returns 200.
+RUNTIME_SMOKE_TEST = "RUNTIME_SMOKE_TEST"
+
+# Dependency version pinning: use a curated version database for common
+# frameworks to avoid version mismatch issues.
+DEP_VERSION_PINNING = "DEP_VERSION_PINNING"
 
 # Selective cascade: only cascade failures to direct dependents rather
 # than failing all downstream files.

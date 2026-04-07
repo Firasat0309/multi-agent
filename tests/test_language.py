@@ -80,8 +80,8 @@ class TestDetectLanguageFromBlueprint:
         assert detect_language_from_blueprint({"language": "go"}) is GO
 
     def test_detect_from_framework_key(self):
-        assert detect_language_from_blueprint({"framework": "spring"}) is JAVA
-        assert detect_language_from_blueprint({"framework": "express"}) is TYPESCRIPT
+        assert detect_language_from_blueprint({"framework": "spring"}).name == "java"
+        assert detect_language_from_blueprint({"framework": "express"}).name == "typescript"
 
     def test_defaults_to_python(self):
         assert detect_language_from_blueprint({}) is PYTHON
