@@ -260,7 +260,7 @@ class FrontendPipeline:
         metrics["components_planned"] = len(component_plan.components)
 
         # ── Write package.json and .env.local ─────────────────────────────────
-        self._write_config_files(workspace, component_plan, requirements)
+        deterministic_files = self._write_config_files(workspace, component_plan, requirements)
 
         # ── Sandbox + AgentManager setup ──────────────────────────────────────
         lang_profile = detect_language_from_blueprint(frontend_blueprint.tech_stack)
@@ -409,6 +409,20 @@ class FrontendPipeline:
                 ] if tier_map else (
                     ordered_components if tier_idx == 0 else []
                 )
+
+                # Skip components whose files were written deterministically
+                # by _write_config_files (e.g. router/index.ts, main.ts).
+                # LLM generation would overwrite them with hallucinated
+                # import paths, causing TS2307 errors.
+                if deterministic_files:
+                    skipped = [c for c in tier_components if c.file_path in deterministic_files]
+                    if skipped:
+                        for sc in skipped:
+                            logger.info(
+                                "[FE Phase 4] Skipping LLM generation for %s (deterministic)",
+                                sc.file_path,
+                            )
+                        tier_components = [c for c in tier_components if c.file_path not in deterministic_files]
 
                 # Collect already-generated dependency files from earlier tiers
                 # so components can see exact exports of their dependencies.
@@ -646,6 +660,7 @@ class FrontendPipeline:
                     # Group errors by file
                     errors_by_file: dict[str, list[str]] = defaultdict(list)
                     _missing_module_files: list[str] = []
+                    _missing_module_seen: set[str] = set()
                     for err in compile_result.errors:
                         errors_by_file[err.file].append(
                             f"{err.file}:{err.line}: [{err.code}] {err.message}"
@@ -657,7 +672,8 @@ class FrontendPipeline:
                             _mod_match = _re_mod.search(
                                 r"(?:module|from)\s+['\"]([^'\"]+)['\"]", err.message,
                             )
-                            if _mod_match:
+                            if _mod_match and _mod_match.group(1) not in _missing_module_seen:
+                                _missing_module_seen.add(_mod_match.group(1))
                                 _missing_module_files.append(_mod_match.group(1))
 
                     # Dispatch fix tasks for each affected file
@@ -805,6 +821,7 @@ class FrontendPipeline:
                                             _imp_related[importer_file] = (
                                                 _imp_abs.read_text(encoding="utf-8", errors="replace")[:3000]
                                             )
+                                        _stub_lang = "vue" if candidate.endswith(".vue") else "typescript"
                                         stub_ctx = AgentContext(
                                             task=Task(
                                                 task_id=20000 + len(fix_coros),
@@ -818,7 +835,7 @@ class FrontendPipeline:
                                                 path=candidate,
                                                 purpose=f"Missing module imported by {importer_file}",
                                                 depends_on=[],
-                                                language="typescript",
+                                                language=_stub_lang,
                                             ),
                                             related_files=_imp_related or None,
                                         )
@@ -2163,8 +2180,8 @@ class FrontendPipeline:
         workspace: Path,
         plan: ComponentPlan,
         requirements: "ProductRequirements",
-    ) -> None:
-        """Write package.json and .env.local to the workspace.
+    ) -> set[str]:
+        """Write package.json, .env.local, and deterministic scaffolding files.
 
         package.json is sourced from the LLM-generated ``plan.package_json``.
         If the LLM returned an empty dict, a sensible framework-specific
@@ -2172,7 +2189,11 @@ class FrontendPipeline:
 
         .env.local contains placeholder environment variables that the
         developer needs to fill in before running the app.
+
+        Returns the set of workspace-relative file paths that were written
+        deterministically and should NOT be overwritten by LLM generation.
         """
+        _deterministic: set[str] = set()
         # ── package.json ─────────────────────────────────────────────────────
         pkg = dict(plan.package_json) if plan.package_json else {}
         if not pkg.get("name"):
@@ -2574,6 +2595,7 @@ class FrontendPipeline:
                 "app.mount('#app');\n"
             )
             (src_dir / "main.ts").write_text(main_ts, encoding="utf-8")
+            _deterministic.add("src/main.ts")
             logger.info("Wrote src/main.ts")
 
             # vite-env.d.ts — declares import.meta.env types for vue-tsc
@@ -2662,6 +2684,7 @@ class FrontendPipeline:
                     "export default router;\n"
                 )
                 router_index_path.write_text(router_stub, encoding="utf-8")
+                _deterministic.add("src/router/index.ts")
                 logger.info("Wrote src/router/index.ts (stub with %d routes)", len(route_entries))
 
                 # Create empty .vue stubs for referenced page views so Vite
@@ -2731,6 +2754,8 @@ class FrontendPipeline:
             )
             (workspace / "postcss.config.js").write_text(postcss_config, encoding="utf-8")
             logger.info("Wrote postcss.config.js")
+
+        return _deterministic
 
     # ── Ghost dependency detection ─────────────────────────────────────────────
 
