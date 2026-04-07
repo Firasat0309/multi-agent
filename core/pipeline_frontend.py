@@ -619,6 +619,85 @@ class FrontendPipeline:
                 metrics["files_stubbed"] = len(still_missing)
                 self._complete_phase("FE: Missing File Recovery")
 
+            # ── Phase 4.4: Pre-compile store stub scan ───────────────────
+            # Phase 4 LLM-generated views often import Pinia stores that don't
+            # exist yet (Phase 6 creates them later).  Scan generated source
+            # files for store import patterns and create stub modules so that
+            # Phase 4.5 compilation doesn't waste fix-retry budget on phantom
+            # TS2307 / TS2305 errors.
+            _is_vue_fw = "vue" in (component_plan.framework or "").lower()
+            if _is_vue_fw:
+                import re as _re_stores
+                _store_import_re = _re_stores.compile(
+                    r"""(?:from\s+['"]([^'"]*stores?/[^'"]+)['"]|import\s*\(['"](.*?stores?/[^'"]+)['"]\))""",
+                )
+                _store_dir = workspace / "src" / "stores"
+                _store_dir.mkdir(parents=True, exist_ok=True)
+                _created_stubs: set[str] = set()
+                _src_root = workspace / "src"
+                _scan_files = list(_src_root.rglob("*.vue")) + list(_src_root.rglob("*.ts")) + list(_src_root.rglob("*.tsx"))
+                for _src_file in _scan_files:
+                    # Skip store files themselves to avoid circular stubs
+                    if "stores" in _src_file.relative_to(_src_root).parts[:1]:
+                        continue
+                    try:
+                        _src_text = _src_file.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+                    for _m in _store_import_re.finditer(_src_text):
+                        _imp = _m.group(1) or _m.group(2)
+                        if not _imp or not _imp.startswith("."):
+                            continue
+                        # Resolve relative to the importing file
+                        _imp_dir = _src_file.parent
+                        for _ext in ("", ".ts", ".tsx"):
+                            _resolved = (_imp_dir / (_imp + _ext)).resolve()
+                            try:
+                                _resolved.relative_to(workspace.resolve())
+                            except ValueError:
+                                continue
+                            if _resolved.exists():
+                                break
+                        else:
+                            # File doesn't exist — create a Pinia stub
+                            _target = (_imp_dir / (_imp + ".ts")).resolve()
+                            try:
+                                _target.relative_to(workspace.resolve())
+                            except ValueError:
+                                continue
+                            _target_str = str(_target)
+                            if _target_str in _created_stubs:
+                                continue
+                            _created_stubs.add(_target_str)
+                            _target.parent.mkdir(parents=True, exist_ok=True)
+                            _store_stem = _target.stem
+                            if not _store_stem:
+                                continue
+                            _hook = _store_stem if _store_stem.startswith("use") else f"use{_store_stem[0].upper()}{_store_stem[1:]}"
+                            _target.write_text(
+                                f"// Stub — Phase 6 will generate the real store\n"
+                                f"import {{ defineStore }} from 'pinia';\n\n"
+                                f"export const {_hook} = defineStore('{_store_stem}', {{\n"
+                                f"  state: () => ({{}}),\n"
+                                f"}});\n",
+                                encoding="utf-8",
+                            )
+                            logger.info("[FE Phase 4.4] Created store stub: %s", _target.relative_to(workspace))
+
+                # Re-generate the barrel to include all stubs (original + scan-created)
+                _barrel_path = _store_dir / "index.ts"
+                _barrel_exports: list[str] = [
+                    "// Auto-generated store barrel — Phase 6 will overwrite\n",
+                ]
+                for _ts_file in sorted(_store_dir.glob("*.ts")):
+                    if _ts_file.name == "index.ts":
+                        continue
+                    _barrel_exports.append(f"export * from './{_ts_file.stem}';\n")
+                if len(_barrel_exports) == 1:
+                    _barrel_exports.append("export {};\n")
+                _barrel_path.write_text("".join(_barrel_exports), encoding="utf-8")
+                logger.info("[FE Phase 4.4] Updated stores barrel (%d re-exports)", len(_barrel_exports) - 1)
+
             # ── Phase 4.5: TSX Compilation Check with Fix-Retry ───────────────────
             self._phase("FE: TypeScript Compilation", "running")
             logger.info("[FE Phase 4.5] Running TypeScript compilation check...")
@@ -2224,7 +2303,7 @@ class FrontendPipeline:
             dev_deps.setdefault("@types/react", "^18.0.0")
             dev_deps.setdefault("@types/react-dom", "^18.0.0")
             dev_deps.setdefault("typescript", "^5.0.0")
-            if requirements.tech_preferences.get("styling", "").lower() == "tailwind":
+            if "tailwind" in requirements.tech_preferences.get("styling", "tailwind").lower():
                 dev_deps.setdefault("tailwindcss", "^3.4.0")
                 dev_deps.setdefault("autoprefixer", "^10.0.0")
                 dev_deps.setdefault("postcss", "^8.0.0")
@@ -2245,7 +2324,7 @@ class FrontendPipeline:
             dev_deps.setdefault("@vitejs/plugin-vue", "^5.0.0")
             dev_deps.setdefault("vue-tsc", "^2.0.0")
             dev_deps.setdefault("typescript", "^5.0.0")
-            if requirements.tech_preferences.get("styling", "").lower() == "tailwind":
+            if "tailwind" in requirements.tech_preferences.get("styling", "tailwind").lower():
                 dev_deps.setdefault("tailwindcss", "^3.4.0")
                 dev_deps.setdefault("autoprefixer", "^10.0.0")
                 dev_deps.setdefault("postcss", "^8.0.0")

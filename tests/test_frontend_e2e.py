@@ -1081,6 +1081,33 @@ class TestFrontendE2EWriteConfigEdgeCases:
         pkg = json.loads((ws / "package.json").read_text())
         assert "zustand" in pkg.get("dependencies", {})
 
+    def test_vue_tailwind_deps_default_styling(self, tmp_path):
+        """When styling is unset, tailwindcss must still be in devDependencies."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        plan = ComponentPlan(
+            components=[],
+            framework="vue",
+            state_solution="pinia",
+            api_base_url="/api",
+        )
+        # No "styling" key at all — should default to tailwind
+        req = ProductRequirements(title="App", description="Test",
+                                  tech_preferences={})
+
+        FrontendPipeline._write_config_files(ws, plan, req)
+
+        pkg = json.loads((ws / "package.json").read_text())
+        dev_deps = pkg.get("devDependencies", {})
+        assert "tailwindcss" in dev_deps, "tailwindcss missing when styling unset"
+        assert "autoprefixer" in dev_deps
+        assert "postcss" in dev_deps
+        # postcss.config.js should also exist
+        assert (ws / "postcss.config.js").exists()
+        assert (ws / "tailwind.config.js").exists()
+
     def test_nextjs_segment_layouts_injected(self, tmp_path):
         """Nested page routes should get auto-injected segment layouts."""
         from core.pipeline_frontend import FrontendPipeline
