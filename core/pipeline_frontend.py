@@ -2707,6 +2707,55 @@ class FrontendPipeline:
                         )
                         logger.info("Wrote %s (view stub for router)", view_path.name)
 
+            # stores/ stubs — Phase 4 views may import stores before
+            # Phase 6 generates the real implementation.  Minimal stub
+            # files satisfy TypeScript during Phase 4.5 compilation so
+            # the fix cycle doesn't chase phantom TS2307 errors.
+            stores_dir = src_dir / "stores"
+            stores_dir.mkdir(parents=True, exist_ok=True)
+
+            # Collect unique store names from component state_needs
+            _store_names: set[str] = set()
+            for _comp in plan.components:
+                for _sn in getattr(_comp, "state_needs", None) or []:
+                    _store_names.add(str(_sn))
+
+            # Barrel re-export that imports every individual store stub
+            _barrel_lines = [
+                "// Auto-generated store barrel — Phase 6 will overwrite with real stores\n",
+            ]
+            for _sn in sorted(_store_names):
+                # Normalise: "taskStore" → "taskStore", "useAuthStore" → "authStore"
+                _file_stem = _sn
+                if _file_stem.startswith("use"):
+                    _file_stem = _file_stem[3:]
+                _file_stem = _file_stem[0].lower() + _file_stem[1:] if _file_stem else _file_stem
+                _store_path = stores_dir / f"{_file_stem}.ts"
+                if not _store_path.exists():
+                    # Pinia composable stub that exports the expected hook
+                    _hook_name = _sn if _sn.startswith("use") else f"use{_sn[0].upper()}{_sn[1:]}"
+                    _store_path.write_text(
+                        f"// Stub — Phase 6 will generate the real store\n"
+                        f"import {{ defineStore }} from 'pinia';\n\n"
+                        f"export const {_hook_name} = defineStore('{_file_stem}', {{\n"
+                        f"  state: () => ({{}}),\n"
+                        f"}});\n",
+                        encoding="utf-8",
+                    )
+                    logger.info("Wrote src/stores/%s.ts (stub)", _file_stem)
+                _barrel_lines.append(f"export * from './{_file_stem}';\n")
+
+            if not _store_names:
+                _barrel_lines.append("export {};\n")
+
+            store_barrel_path = stores_dir / "index.ts"
+            if not store_barrel_path.exists():
+                store_barrel_path.write_text(
+                    "".join(_barrel_lines), encoding="utf-8",
+                )
+                _deterministic.add("src/stores/index.ts")
+                logger.info("Wrote src/stores/index.ts (stub)")
+
             # assets/main.css — main.ts imports './assets/main.css'
             assets_dir = src_dir / "assets"
             assets_dir.mkdir(parents=True, exist_ok=True)

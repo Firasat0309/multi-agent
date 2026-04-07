@@ -1478,3 +1478,56 @@ class TestVueEntryStubGeneration:
 
         assert not (ws / "src" / "App.vue").exists()
         assert not (ws / "src" / "router" / "index.ts").exists()
+
+    def test_store_barrel_stub_created(self, tmp_path):
+        """src/stores/index.ts stub must be created for Vue/Pinia projects."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        FrontendPipeline._write_config_files(ws, self._make_vue_plan(), self._make_req())
+
+        barrel = ws / "src" / "stores" / "index.ts"
+        assert barrel.exists(), "stores/index.ts stub was not generated"
+
+    def test_individual_store_stubs_from_state_needs(self, tmp_path):
+        """Each unique state_needs entry should get a stub store file."""
+        from core.pipeline_frontend import FrontendPipeline
+
+        ws = tmp_path / "vue-app"
+        ws.mkdir()
+        plan = self._make_vue_plan([
+            UIComponent(
+                name="CatalogView",
+                file_path="src/views/CatalogView.vue",
+                component_type="page",
+                description="Book catalog",
+                state_needs=["bookStore"],
+            ),
+            UIComponent(
+                name="AuthorView",
+                file_path="src/views/AuthorView.vue",
+                component_type="page",
+                description="Author list",
+                state_needs=["authorStore", "bookStore"],
+            ),
+        ])
+        det = FrontendPipeline._write_config_files(ws, plan, self._make_req())
+
+        # Individual store stubs
+        book_store = ws / "src" / "stores" / "bookStore.ts"
+        author_store = ws / "src" / "stores" / "authorStore.ts"
+        assert book_store.exists(), "bookStore.ts stub was not generated"
+        assert author_store.exists(), "authorStore.ts stub was not generated"
+
+        # Both should have Pinia defineStore
+        assert "defineStore" in book_store.read_text()
+        assert "defineStore" in author_store.read_text()
+
+        # Barrel should re-export both
+        barrel = (ws / "src" / "stores" / "index.ts").read_text()
+        assert "authorStore" in barrel
+        assert "bookStore" in barrel
+
+        # stores/index.ts should be in deterministic set
+        assert "src/stores/index.ts" in det
