@@ -66,6 +66,12 @@ class FixMemoryStore:
     Cross-file learning: when a file is fixed successfully, the resolution
     pattern is stored globally so that OTHER files hitting the same error
     class can benefit from the solution without re-discovering it.
+
+    Writes are debounced: mutations mark the state dirty and schedule a
+    flush after ``flush_interval`` seconds.  This avoids blocking the
+    event loop with a disk write on every single ``record_attempt`` /
+    ``record_resolution`` call — a major bottleneck in projects with
+    many files and fix iterations.
     """
 
     def __init__(
@@ -75,12 +81,16 @@ class FixMemoryStore:
         max_errors_per_file: int = 5,
         max_resolutions_per_file: int = 3,
         max_global_patterns: int = 20,
+        flush_interval: float = 5.0,
     ) -> None:
         self._path = workspace / ".simple_loop_memory.json"
         self._max_errors = max_errors_per_file
         self._max_resolutions = max_resolutions_per_file
         self._max_global = max_global_patterns
+        self._flush_interval = flush_interval
         self._lock = asyncio.Lock()
+        self._dirty = False
+        self._flush_task: asyncio.Task[None] | None = None
         self._state = self._load_state()
 
     def _load_state(self) -> dict[str, Any]:
@@ -97,6 +107,37 @@ class FixMemoryStore:
     def _save_state(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._path.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
+
+    def _mark_dirty(self) -> None:
+        """Mark state as changed and schedule a debounced flush.
+
+        Instead of writing to disk on every mutation, we wait up to
+        ``_flush_interval`` seconds and coalesce multiple writes into one.
+        """
+        self._dirty = True
+        if self._flush_task is None or self._flush_task.done():
+            self._flush_task = asyncio.create_task(self._debounced_flush())
+
+    async def _debounced_flush(self) -> None:
+        """Wait for the flush interval, then persist if still dirty."""
+        await asyncio.sleep(self._flush_interval)
+        async with self._lock:
+            if self._dirty:
+                await asyncio.to_thread(self._save_state)
+                self._dirty = False
+
+    async def flush(self) -> None:
+        """Force an immediate flush — call at pipeline end to ensure durability."""
+        if self._flush_task is not None and not self._flush_task.done():
+            self._flush_task.cancel()
+            try:
+                await self._flush_task
+            except asyncio.CancelledError:
+                pass
+        async with self._lock:
+            if self._dirty:
+                await asyncio.to_thread(self._save_state)
+                self._dirty = False
 
     async def record_attempt(
         self,
@@ -120,7 +161,7 @@ class FixMemoryStore:
                 "categories": categories,
             })
             file_state["recent_errors"] = file_state["recent_errors"][-self._max_errors :]
-            await asyncio.to_thread(self._save_state)
+            self._mark_dirty()
 
     async def record_resolution(
         self, file_path: str, summary: str, *, error_hash: str = "",
@@ -153,7 +194,7 @@ class FixMemoryStore:
                 # Keep only recent patterns
                 self._state["global_patterns"] = global_patterns[-self._max_global :]
 
-            await asyncio.to_thread(self._save_state)
+            self._mark_dirty()
 
     async def get_cross_file_hints(self, error_hash: str) -> str:
         """Get resolution hints from OTHER files that fixed the same error class.

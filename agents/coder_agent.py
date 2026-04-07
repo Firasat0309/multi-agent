@@ -15,26 +15,9 @@ from core.language import get_language_profile, LanguageProfile
 from core.language_rules import get_rules as get_language_rules
 from core.models import AgentContext, AgentRole, TaskResult, TaskType
 
-# Defaults loaded from ExecutionConfig so they stay in sync with the
-# central configuration.  Module-level references are used by free
-# functions (_validate_rewrite, _has_duplicate_definitions) that don't
-# have access to a Settings instance.
+# Default ExecutionConfig instance — used ONLY for backwards compatibility
+# with call sites that haven't been updated to pass an explicit config.
 _EXEC_DEFAULTS = ExecutionConfig()
-
-# Files with more lines than this threshold are modified via unified diff instead
-# of a full-file rewrite.  Diffs are ~5–20× cheaper in tokens for large files.
-_LARGE_FILE_THRESHOLD = _EXEC_DEFAULTS.large_file_threshold
-
-# Max chars of build/compiler output to include in fix prompts.
-# Maven can dump 50K+ chars; the relevant error lines are always near the end.
-_MAX_ERROR_CHARS = _EXEC_DEFAULTS.max_error_chars
-# Max chars of a single related file included in fix context.
-_MAX_RELATED_FILE_CHARS = _EXEC_DEFAULTS.max_related_file_chars
-
-# Maximum allowed content growth factor for fix/modify rewrites.
-# If new content exceeds original_size * this factor, the rewrite is rejected
-# as it likely contains duplicated code from LLM hallucination.
-_MAX_CONTENT_GROWTH = _EXEC_DEFAULTS.max_content_growth
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +48,7 @@ def _validate_rewrite(
     profile: LanguageProfile,
     file_path: str,
     operation: str,
+    exec_config: ExecutionConfig | None = None,
 ) -> TaskResult | None:
     """Validate a code rewrite and return TaskResult if validation fails, None if valid.
 
@@ -81,14 +65,15 @@ def _validate_rewrite(
     For the checkpoint path (``_dispatch_fix``), the return value is
     discarded anyway — the build simply re-runs regardless.
     """
+    cfg = exec_config or _EXEC_DEFAULTS
     original_size = len(original_content)
 
     # ── Guard: reject rewrites that inflate the file (likely LLM duplication) ──
-    if original_size > 0 and len(new_content) > original_size * _MAX_CONTENT_GROWTH:
+    if original_size > 0 and len(new_content) > original_size * cfg.max_content_growth:
         logger.warning(
             "%s rewrite rejected for %s: new size (%d) exceeds %.0f%% of original (%d). "
             "Keeping original to prevent content duplication.",
-            operation, file_path, len(new_content), _MAX_CONTENT_GROWTH * 100, original_size,
+            operation, file_path, len(new_content), cfg.max_content_growth * 100, original_size,
         )
         return TaskResult(
             success=True,
@@ -1177,7 +1162,7 @@ class CoderAgent(BaseAgent):
         # (first file that broke) in favour of downstream cascading failures,
         # causing the fix agent to treat symptoms rather than the cause.
         if fix_trigger in ("build", "build_unattributed") and build_errors:
-            filtered = extract_error_lines(build_errors, max_chars=_MAX_ERROR_CHARS)
+            filtered = extract_error_lines(build_errors, max_chars=self._exec.max_error_chars)
             issues_text = (
                 "Compilation/build errors to fix:\n" + filtered + "\n\n"
                 "If the error is 'cannot find symbol' for a method call on a dependency, "
@@ -1187,7 +1172,7 @@ class CoderAgent(BaseAgent):
         elif fix_trigger == "security" and security_errors:
             # Security vulnerabilities — already formatted with severity,
             # type, description, and remediation guidance.
-            capped = security_errors[:_MAX_ERROR_CHARS]
+            capped = security_errors[:self._exec.max_error_chars]
             issues_text = (
                 "Security vulnerabilities to fix:\n" + capped + "\n\n"
                 "IMPORTANT: Apply the remediation for each vulnerability. "
@@ -1196,17 +1181,17 @@ class CoderAgent(BaseAgent):
                 "inputs, remove hardcoded secrets, add auth checks)."
             )
         elif fix_trigger == "security_rebuild" and build_errors:
-            filtered = extract_error_lines(build_errors, max_chars=_MAX_ERROR_CHARS)
+            filtered = extract_error_lines(build_errors, max_chars=self._exec.max_error_chars)
             issues_text = (
                 "Security fixes broke the build. Fix compilation errors:\n"
                 + filtered
             )
         elif fix_trigger in ("test", "integration_test") and test_errors:
-            filtered = extract_error_lines(test_errors, max_chars=_MAX_ERROR_CHARS)
+            filtered = extract_error_lines(test_errors, max_chars=self._exec.max_error_chars)
             issues_text = "Test failures to fix:\n" + filtered
         elif fix_trigger == "integration_test_code" and test_errors:
             # Fixing the test code itself, not the source
-            filtered = extract_error_lines(test_errors, max_chars=_MAX_ERROR_CHARS)
+            filtered = extract_error_lines(test_errors, max_chars=self._exec.max_error_chars)
             issues_text = (
                 "Integration test code has errors — fix the TEST code:\n"
                 + filtered + "\n\n"
@@ -1214,7 +1199,7 @@ class CoderAgent(BaseAgent):
                 "or test setup — do NOT change the source code being tested."
             )
         elif fix_trigger == "integration_rebuild" and build_errors:
-            filtered = extract_error_lines(build_errors, max_chars=_MAX_ERROR_CHARS)
+            filtered = extract_error_lines(build_errors, max_chars=self._exec.max_error_chars)
             issues_text = (
                 "Source fix for integration tests broke the build. "
                 "Fix compilation errors:\n" + filtered
@@ -1223,7 +1208,7 @@ class CoderAgent(BaseAgent):
             issues_text = "\n".join(f"- {e}" for e in review_errors)
         else:
             raw = review_output
-            issues_text = extract_error_lines(raw, max_chars=_MAX_ERROR_CHARS) if len(raw) > _MAX_ERROR_CHARS else raw
+            issues_text = extract_error_lines(raw, max_chars=self._exec.max_error_chars) if len(raw) > self._exec.max_error_chars else raw
 
         # For compiled languages add an explicit post-fix syntax checklist so the
         # model validates its own output before returning.
@@ -1243,7 +1228,7 @@ class CoderAgent(BaseAgent):
         line_count = len(current_content.splitlines())
 
         # ── Large files: use diff output to avoid token-doubling ──────────────
-        if line_count > _LARGE_FILE_THRESHOLD:
+        if line_count > self._exec.large_file_threshold:
             result = await self._try_diff_fix(
                 context, file_path, current_content, lang, profile,
                 fix_context_header, issues_text, fix_trigger,
@@ -1286,7 +1271,7 @@ class CoderAgent(BaseAgent):
         fixed_code = self._clean_fences(fixed_code, profile.code_fence_name)
 
         # ── Validate the rewrite ─────────────────────────────────────────────
-        validation_result = _validate_rewrite(fixed_code, current_content, profile, file_path, "Fix")
+        validation_result = _validate_rewrite(fixed_code, current_content, profile, file_path, "Fix", exec_config=self._exec)
         if validation_result is not None:
             return validation_result
 
@@ -1446,7 +1431,7 @@ class CoderAgent(BaseAgent):
     async def _modify_file(self, context: AgentContext) -> TaskResult:
         """Modify an existing file based on a change action.
 
-        For files above ``_LARGE_FILE_THRESHOLD`` lines, attempts a unified
+        For files above ``large_file_threshold`` lines, attempts a unified
         diff patch first (cheaper and more reliable for large files).  Falls
         back to full-file rewrite only when the diff fails or for small files.
         """
@@ -1480,7 +1465,7 @@ class CoderAgent(BaseAgent):
         logger.info("Modifying %s (%d lines): %s", file_path, line_count, change_desc[:80])
 
         # Large files: try a surgical diff first to save tokens.
-        if line_count > _LARGE_FILE_THRESHOLD:
+        if line_count > self._exec.large_file_threshold:
             result = await self._try_diff_modification(
                 context, file_path, current_content, lang, profile,
                 change_desc, change_type, target_hint,
@@ -1509,7 +1494,7 @@ class CoderAgent(BaseAgent):
         modified_code = self._clean_fences(modified_code, profile.code_fence_name)
 
         # ── Validate the rewrite ─────────────────────────────────────────────
-        validation_result = _validate_rewrite(modified_code, current_content, profile, file_path, "Modification")
+        validation_result = _validate_rewrite(modified_code, current_content, profile, file_path, "Modification", exec_config=self._exec)
         if validation_result is not None:
             return validation_result
 

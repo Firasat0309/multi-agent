@@ -18,10 +18,9 @@ from core.observability import get_tracer
 
 logger = logging.getLogger(__name__)
 
-# Default timeout sourced from ExecutionConfig (kept at module level for
-# _get_client which builds SDK clients before generate() is called).
-_EXEC_DEFAULTS = ExecutionConfig()
-_REQUEST_TIMEOUT = _EXEC_DEFAULTS.request_timeout
+# Default request timeout (seconds). Instances use self._exec.request_timeout
+# but module-level references still need a fallback for backwards compat.
+_REQUEST_TIMEOUT = ExecutionConfig().request_timeout
 
 
 def _blk(block: Any, key: str) -> Any:
@@ -133,14 +132,14 @@ class LLMRetryableError(Exception):
     pass
 
 
-def _classify_error(error_msg: str) -> tuple[bool, bool]:
+def _classify_error(error_msg: str, error: Exception | None = None) -> tuple[bool, bool]:
     """Classify an LLM error as (is_rate_limit, is_transient).
 
     Centralises the string-matching heuristics so ``generate()``,
     ``_gemini_generate()``, and ``_gemini_generate_with_tools()`` share a
     single source of truth.
     """
-    cat = classify_llm_error(error_msg)
+    cat = classify_llm_error(error_msg, error=error)
     is_rate_limit = cat == LLMErrorCategory.RATE_LIMITED
     is_transient = cat.is_retryable
     return is_rate_limit, is_transient
@@ -239,25 +238,48 @@ def _extract_retry_after(error: Exception) -> float | None:
     return None
 
 
-def classify_llm_error(error_msg: str) -> LLMErrorCategory:
-    """Map an error message string to a fine-grained :class:`LLMErrorCategory`."""
+def classify_llm_error(error_msg: str, error: Exception | None = None) -> LLMErrorCategory:
+    """Map an error to a fine-grained :class:`LLMErrorCategory`.
+
+    Prefers structured HTTP status codes from the exception object
+    (available on Anthropic/OpenAI SDK errors) over fragile string
+    matching which can produce false positives (e.g. "401.html" matched
+    as an auth failure).
+    """
+    # ── 1. Try structured status code from SDK exception objects ──────
+    if error is not None:
+        status: int | None = getattr(error, "status_code", None) or getattr(error, "status", None)
+        if status is not None:
+            if status == 401 or status == 403:
+                return LLMErrorCategory.AUTH_FAILED
+            if status == 404:
+                return LLMErrorCategory.MODEL_NOT_FOUND
+            if status == 429:
+                return LLMErrorCategory.RATE_LIMITED
+            if status == 400:
+                return LLMErrorCategory.INVALID_REQUEST
+            if status == 529:
+                return LLMErrorCategory.SERVER_OVERLOADED
+            if status in (500, 502, 503):
+                return LLMErrorCategory.TRANSIENT_SERVER
+
+    # ── 2. Fall back to keyword matching on the message ──────────────
     msg = error_msg.lower()
 
     # Auth / key errors (never retry)
-    if any(tok in error_msg for tok in ("401", "Unauthorized", "Unauthenticated")):
+    if "unauthorized" in msg or "unauthenticated" in msg:
         return LLMErrorCategory.AUTH_FAILED
 
     # Model not found (never retry)
-    if "404" in error_msg or "not found" in msg or "not_found" in msg:
+    if "not found" in msg or "not_found" in msg:
         return LLMErrorCategory.MODEL_NOT_FOUND
 
     # Rate limits
-    if "429" in error_msg or "rate_limit" in msg or "ratelimit" in msg or "too many requests" in msg:
+    if "rate_limit" in msg or "ratelimit" in msg or "too many requests" in msg:
         return LLMErrorCategory.RATE_LIMITED
 
-    # Server overloaded (check before quota — "RESOURCE_EXHAUSTED: quota exceeded"
-    # is a transient overload, not a permanent billing block)
-    if "overloaded" in msg or "resource_exhausted" in msg or "529" in error_msg:
+    # Server overloaded
+    if "overloaded" in msg or "resource_exhausted" in msg:
         return LLMErrorCategory.SERVER_OVERLOADED
 
     # Quota / billing
@@ -272,16 +294,12 @@ def classify_llm_error(error_msg: str) -> LLMErrorCategory:
     if "content_filter" in msg or "blocked" in msg or "safety" in msg or "harmful" in msg:
         return LLMErrorCategory.CONTENT_FILTERED
 
-    # Transient server errors
-    if any(tok in error_msg for tok in ("500", "502", "503")):
-        return LLMErrorCategory.TRANSIENT_SERVER
-
     # Timeout
     if "timeout" in msg or "timed out" in msg:
         return LLMErrorCategory.TIMEOUT
 
     # Invalid request (bad params — never retry)
-    if "400" in error_msg or "invalid" in msg or "is not supported" in msg:
+    if "invalid" in msg or "is not supported" in msg:
         return LLMErrorCategory.INVALID_REQUEST
 
     return LLMErrorCategory.UNKNOWN
@@ -534,7 +552,7 @@ class LLMClient:
                 raise LLMClientError(str(e)) from e
             except LLMRetryableError as e:
                 # Explicitly retryable (e.g. Gemini blocked/invalid function call)
-                cat = classify_llm_error(str(e))
+                cat = classify_llm_error(str(e), error=e)
                 strategy = RETRY_STRATEGIES.get(cat, RETRY_STRATEGIES[LLMErrorCategory.UNKNOWN])
                 if attempt < min(strategy.max_retries, _max_attempts) - 1:
                     delay = strategy.base_delay * (2 ** attempt)
@@ -551,7 +569,7 @@ class LLMClient:
             except Exception as e:
                 error_msg = str(e)
                 error_type = type(e).__name__
-                cat = classify_llm_error(error_msg)
+                cat = classify_llm_error(error_msg, error=e)
                 strategy = RETRY_STRATEGIES.get(cat, RETRY_STRATEGIES[LLMErrorCategory.UNKNOWN])
 
                 # Context-length errors should surface immediately so the
@@ -730,7 +748,7 @@ class LLMClient:
                     "Set: export GEMINI_API_KEY=\"your-api-key\"\n"
                     "Get key at: https://aistudio.google.com/app/apikey"
                 ) from e
-            elif _classify_error(str(e))[1]:
+            elif _classify_error(str(e), error=e)[1]:
                 # Transient server / rate-limit errors — re-raise the original
                 # exception so the caller's retry loop can handle it.
                 raise
@@ -1176,7 +1194,7 @@ class LLMClient:
         except CircuitOpenError as exc:
             raise LLMClientError(str(exc)) from exc
         except Exception as e:
-            cat = classify_llm_error(str(e))
+            cat = classify_llm_error(str(e), error=e)
             if cat == LLMErrorCategory.CONTEXT_LENGTH:
                 raise ContextOverflowError(
                     f"Context too long during streaming: {str(e)[:200]}",
@@ -1246,7 +1264,7 @@ class LLMClient:
         except CircuitOpenError as exc:
             raise LLMClientError(str(exc)) from exc
         except Exception as e:
-            cat = classify_llm_error(str(e))
+            cat = classify_llm_error(str(e), error=e)
             if cat == LLMErrorCategory.CONTEXT_LENGTH:
                 raise ContextOverflowError(
                     f"Context too long for Anthropic tool-use: {str(e)[:200]}",
@@ -1380,7 +1398,7 @@ class LLMClient:
         except CircuitOpenError as exc:
             raise LLMClientError(str(exc)) from exc
         except Exception as e:
-            cat = classify_llm_error(str(e))
+            cat = classify_llm_error(str(e), error=e)
             if cat == LLMErrorCategory.CONTEXT_LENGTH:
                 raise ContextOverflowError(
                     f"Context too long during OpenAI streaming: {str(e)[:200]}",
@@ -1474,7 +1492,7 @@ class LLMClient:
         except CircuitOpenError as exc:
             raise LLMClientError(str(exc)) from exc
         except Exception as e:
-            cat = classify_llm_error(str(e))
+            cat = classify_llm_error(str(e), error=e)
             if cat == LLMErrorCategory.CONTEXT_LENGTH:
                 raise ContextOverflowError(
                     f"Context too long for OpenAI tool-use: {str(e)[:200]}",
@@ -1586,7 +1604,7 @@ class LLMClient:
             except Exception as _exc:
                 last_exc = _exc
                 _msg = str(_exc)
-                _, _is_transient = _classify_error(_msg)
+                _, _is_transient = _classify_error(_msg, error=_exc)
                 if _is_transient and _attempt < _max_attempts - 1:
                     _delay = _base_delay * (2 ** _attempt)
                     logger.warning(

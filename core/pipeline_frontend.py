@@ -688,7 +688,12 @@ class FrontendPipeline:
                                         if len(parts) > 1:
                                             imp_path = parts[-1].strip().strip("'\"").strip(";")
                                             if imp_path.startswith("."):
-                                                for ext in (".ts", ".tsx", ".vue", "/index.ts", "/index.tsx"):
+                                                _imp_ext = _posixpath.splitext(imp_path)[1]
+                                                if _imp_ext in (".vue", ".ts", ".tsx", ".js", ".jsx", ".mjs"):
+                                                    _try_exts = ("",)
+                                                else:
+                                                    _try_exts = (".ts", ".tsx", ".vue", ".js", ".jsx", "/index.ts", "/index.tsx")
+                                                for ext in _try_exts:
                                                     candidate = _posixpath.normpath(
                                                         _posixpath.join(file_dir, imp_path + ext)
                                                     )
@@ -763,7 +768,15 @@ class FrontendPipeline:
                             # Resolve relative to first file that imports it
                             for importer_file in errors_by_file:
                                 file_dir = _posixpath.dirname(importer_file)
-                                for ext in (".ts", ".tsx"):
+                                # If the import already has a file extension
+                                # (e.g. '../views/BookCatalog.vue'), use it
+                                # as-is instead of appending .ts/.tsx.
+                                _mod_ext = _posixpath.splitext(missing_mod)[1]
+                                if _mod_ext in (".vue", ".ts", ".tsx", ".js", ".jsx", ".mjs"):
+                                    _extensions = ("",)
+                                else:
+                                    _extensions = (".ts", ".tsx")
+                                for ext in _extensions:
                                     candidate = _posixpath.normpath(
                                         _posixpath.join(file_dir, missing_mod + ext)
                                     )
@@ -1446,7 +1459,7 @@ class FrontendPipeline:
         validator = ImportValidator()
         # Build the set of all .ts/.tsx/.vue files that exist in the workspace
         known_files: set[str] = set()
-        for ext in ("*.ts", "*.tsx", "*.vue"):
+        for ext in ("*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.vue"):
             for p in workspace.rglob(ext):
                 known_files.add(p.relative_to(workspace).as_posix())
         errors: list[str] = []
@@ -1523,7 +1536,7 @@ class FrontendPipeline:
 
         # Pre-compute the set of all TS/TSX/Vue files once (avoid re-globbing per import)
         existing: set[str] = set()
-        for ext in ("*.ts", "*.tsx", "*.vue"):
+        for ext in ("*.ts", "*.tsx", "*.js", "*.jsx", "*.mjs", "*.cjs", "*.vue"):
             for p in workspace.rglob(ext):
                 existing.add(p.relative_to(workspace).as_posix())
 
@@ -1560,7 +1573,7 @@ class FrontendPipeline:
                     matches = _find_target(target_name)
                     if len(matches) == 1:
                         target_rel = matches[0]
-                        target_no_ext = re.sub(r"\.(tsx?|jsx?)$", "", target_rel)
+                        target_no_ext = re.sub(r"\.(tsx?|jsx?|vue|mjs|cjs|mts|cts)$", "", target_rel)
                         new_imp = posixpath.relpath(target_no_ext, file_dir)
                         if not new_imp.startswith("."):
                             new_imp = "./" + new_imp
@@ -1604,7 +1617,7 @@ class FrontendPipeline:
                     # Compute correct relative path
                     target_rel = matches[0]
                     # Remove extension for the import
-                    target_no_ext = re.sub(r"\.(tsx?|jsx?)$", "", target_rel)
+                    target_no_ext = re.sub(r"\.(tsx?|jsx?|vue|mjs|cjs|mts|cts)$", "", target_rel)
                     new_imp = posixpath.relpath(target_no_ext, file_dir)
                     if not new_imp.startswith("."):
                         new_imp = "./" + new_imp
@@ -1817,7 +1830,12 @@ class FrontendPipeline:
                                     imp_path = parts[-1].strip().strip("'\"").strip(";")
                                     if imp_path.startswith("."):
                                         file_dir = _posixpath.dirname(file_path)
-                                        for ext in (".ts", ".tsx", ".vue", "/index.ts", "/index.tsx"):
+                                        _imp_ext = _posixpath.splitext(imp_path)[1]
+                                        if _imp_ext in (".vue", ".ts", ".tsx", ".js", ".jsx", ".mjs"):
+                                            _try_exts = ("",)
+                                        else:
+                                            _try_exts = (".ts", ".tsx", ".vue", ".js", ".jsx", "/index.ts", "/index.tsx")
+                                        for ext in _try_exts:
                                             # Normalise the relative path (collapse ..)
                                             # using posixpath to stay platform-independent
                                             candidate = _posixpath.normpath(

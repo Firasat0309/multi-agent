@@ -115,12 +115,13 @@ class ExecutionConfig:
 class LLMConfig:
     provider: LLMProvider = LLMProvider.ANTHROPIC
     model: str = "claude-sonnet-4-20250514"
+    fallback_model: str = ""  # e.g. "claude-3-5-haiku-20241022" — used when primary model fails
     max_tokens: int = 16384
     temperature: float = 0.2
-    api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""))
-    openai_api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""))
+    api_key: str = field(default_factory=lambda: os.environ.get("ANTHROPIC_API_KEY", ""), repr=False)
+    openai_api_key: str = field(default_factory=lambda: os.environ.get("OPENAI_API_KEY", ""), repr=False)
     openai_base_url: str = field(default_factory=lambda: os.environ.get("OPENAI_BASE_URL", ""))
-    gemini_api_key: str = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY", ""))
+    gemini_api_key: str = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY", ""), repr=False)
 
 
 @dataclass(frozen=True)
@@ -187,6 +188,7 @@ class Settings:
             llm=LLMConfig(
                 provider=LLMProvider(os.environ.get("LLM_PROVIDER", "anthropic")),
                 model=os.environ.get("LLM_MODEL", "claude-sonnet-4-20250514"),
+                fallback_model=os.environ.get("LLM_FALLBACK_MODEL", ""),
                 api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
                 openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
                 openai_base_url=os.environ.get("OPENAI_BASE_URL", ""),

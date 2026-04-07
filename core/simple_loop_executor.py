@@ -280,6 +280,9 @@ class SimpleLoopExecutor:
             stats["total_fixes"],
         )
 
+        # ── Flush fix memory to disk ───────────────────────────────────
+        await self._fix_memory.flush()
+
         return {
             "stats": {
                 "passed": stats["passed"],

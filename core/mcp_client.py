@@ -129,3 +129,11 @@ class MCPClient:
             self._session = None
             self._stdio_ctx = None
             self._session_ctx = None
+
+    # ── Async context manager ────────────────────────────────────────────
+    async def __aenter__(self) -> "MCPClient":
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: Any) -> None:
+        await self.close()
