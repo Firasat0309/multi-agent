@@ -226,7 +226,8 @@ class FixLoop:
             ) + cross_file_hints
 
         metadata: dict[str, Any] = {
-            "build_errors": errors_text + ("\n\n" + history_summary if history_summary else ""),
+            "build_errors": errors_text,
+            "fix_history_summary": history_summary,
             "fix_trigger": "build",
             "fix_attempt": latest.attempt,
             "max_fix_attempts": self.max_attempts,
@@ -249,11 +250,6 @@ class FixLoop:
                         seen_sigs.add(s)
                         unique_sigs.append(s)
                 metadata["known_bad_patterns"] = unique_sigs[:5]
-                metadata["build_errors"] = (
-                    metadata["build_errors"]
-                    + "\n\n⚠️ KNOWN BAD PATTERNS (do NOT reproduce these in your fix):\n"
-                    + "\n".join(f"  • {s}" for s in unique_sigs[:5])
-                )
 
         return metadata
 

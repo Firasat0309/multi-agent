@@ -344,6 +344,11 @@ class SimpleLoopExecutor:
         fix_loop = FixLoop(file_path, max_attempts=self.MAX_ATTEMPTS, max_error_chars=self.MAX_ERROR_CHARS)
         _file_tokens = 0  # cumulative tokens spent on this file
         _file_token_budget = self._settings.execution.file_token_budget
+        # Snapshot of last-known-good file content.  If a fix makes the file
+        # worse (introduces MORE errors than before), we can roll back to this
+        # snapshot rather than accumulating damage across fix iterations.
+        _last_good_content: str | None = None
+        _last_error_count: int | None = None
 
         for attempt in range(self.MAX_ATTEMPTS):
             if shutdown_requested():
@@ -406,6 +411,16 @@ class SimpleLoopExecutor:
                     logger.warning("[%s] Rewrite rejected, retrying", file_path)
                     continue
             else:
+                # ── Snapshot before fix ──────────────────────────────────
+                # Save the current file content so we can roll back if the
+                # fix makes things worse (more errors than before).
+                try:
+                    _pre_fix_content = await asyncio.to_thread(
+                        self._am.repo.read_file, file_path,
+                    )
+                except Exception:
+                    _pre_fix_content = None
+
                 # Fix with accumulated context
                 fix_ok = await self._fix_file(engine, file_path, fix_loop.error_history_dicts)
                 fix_count += 1
@@ -534,6 +549,34 @@ class SimpleLoopExecutor:
                     "will escalate on next attempt",
                     file_path, error_hash,
                 )
+
+            # ── Step 4b: Rollback if fix made things worse ──────────────
+            # Count errors attributed to this file; if the fix introduced
+            # MORE errors than the previous iteration, restore the snapshot.
+            _current_error_count = len(
+                attribution.errors_by_file.get(file_path, [])
+            ) if attribution else file_errors_text.count("\n")
+            if (
+                _last_error_count is not None
+                and _current_error_count > _last_error_count
+                and _pre_fix_content is not None  # type: ignore[possibly-undefined]
+                and attempt > 1
+            ):
+                logger.warning(
+                    "[%s] Fix made things worse (%d→%d errors) — "
+                    "rolling back to pre-fix snapshot",
+                    file_path, _last_error_count, _current_error_count,
+                )
+                try:
+                    await self._am.repo.write_file(file_path, _pre_fix_content)
+                    # Restore the error count to the pre-fix level
+                    _current_error_count = _last_error_count
+                except Exception:
+                    logger.debug(
+                        "[%s] Rollback write failed (non-critical)",
+                        file_path, exc_info=True,
+                    )
+            _last_error_count = _current_error_count
 
             # Record via fix_loop and extract signatures
             sigs: list[str] = []
@@ -972,6 +1015,17 @@ class SimpleLoopExecutor:
         any issues in those files.
         """
         if not feature("QUICK_REVIEW"):
+            return []
+
+        # Skip review for compiled languages — the compiler catches type
+        # errors, missing imports, and undefined symbols more reliably and
+        # cheaply than an LLM review pass.  Reserve LLM review for
+        # interpreted languages (Python) where there's no compiler gate.
+        if self._compiled:
+            logger.debug(
+                "[%s] Skipping review (compiled language — compiler is the gate)",
+                file_path,
+            )
             return []
 
         # Skip review for simple files — config, models, DTOs rarely have

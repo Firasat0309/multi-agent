@@ -426,16 +426,20 @@ class AgentManager:
                         data={"findings": result.errors},
                     ))
             self._metrics["tasks_completed"] += 1
+        elif result.metrics and result.metrics.get("rewrite_rejected"):
+            # Soft rejection: coder agent rejected the rewrite (content growth,
+            # duplicate definitions) but this is NOT a hard failure.  Fire
+            # REWRITE_REJECTED so the file stays in its current phase without
+            # consuming a fix-budget slot.  Counted as "completed" since the
+            # agent did its job — the output just didn't pass validation.
+            self._metrics["tasks_completed"] += 1
+            event_data = self._extract_event_data(result, config["task_type"])
+            engine.process_event(file_path, EventType.REWRITE_REJECTED, event_data)
+            logger.info("[%s] %s rewrite rejected (retryable)", file_path, phase.value)
         elif result.success:
             self._metrics["tasks_completed"] += 1
             event_data = self._extract_event_data(result, config["task_type"])
-            # If the coder agent rejected the rewrite (e.g. content growth,
-            # duplicate definitions), fire REWRITE_REJECTED so the file stays
-            # in its current phase without consuming a fix-budget slot.
-            if result.metrics and result.metrics.get("rewrite_rejected"):
-                engine.process_event(file_path, EventType.REWRITE_REJECTED, event_data)
-            else:
-                engine.process_event(file_path, config["success_event"], event_data)
+            engine.process_event(file_path, config["success_event"], event_data)
             logger.info("[%s] %s succeeded", file_path, phase.value)
             # Incremental embedding update for lifecycle path
             if self._embedding_store and result.files_modified:

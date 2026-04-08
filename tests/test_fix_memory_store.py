@@ -19,6 +19,7 @@ async def test_fix_memory_persists_attempts_and_resolutions(tmp_path):
     )
 
     summary = await store.get_summary("src/users.py")
+    await store.flush()
     restored = FixMemoryStore(tmp_path)
     restored_summary = await restored.get_summary("src/users.py")
 

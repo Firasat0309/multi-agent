@@ -59,8 +59,8 @@ class ExecutionConfig:
     max_context_chars: int = 120_000
     max_semantic_hits: int = 3
     max_direct_deps: int = 10
-    dep_truncate_large: int = 4_000   # per-dep char budget for projects >50 files
-    dep_truncate_small: int = 8_000   # per-dep char budget for projects ≤50 files
+    dep_truncate_large: int = 6_000   # per-dep char budget for projects >50 files
+    dep_truncate_small: int = 12_000  # per-dep char budget for projects ≤50 files
     max_same_layer: int = 3
 
     # ── Coder agent thresholds ───────────────────────────────────────────
@@ -71,7 +71,11 @@ class ExecutionConfig:
     # Max chars of a single related file included in fix context.
     max_related_file_chars: int = 2_000
     # Max allowed content growth factor for fix/modify rewrites.
-    max_content_growth: float = 1.35
+    # 1.50 allows legitimate growth from adding error handling, validation,
+    # and null checks that were missing from the original.  The duplicate
+    # definition detector (_has_duplicate_definitions) catches actual LLM
+    # duplication more precisely than a blunt size check.
+    max_content_growth: float = 1.50
 
     # ── Base agent ───────────────────────────────────────────────────────
     # Timeout in seconds for individual tool handler calls.
@@ -84,8 +88,8 @@ class ExecutionConfig:
     request_timeout: int = 180
     # Max retry attempts for transient LLM errors.
     retry_count: int = 4
-    # Base delay in seconds for exponential backoff (doubles each attempt).
-    backoff_base: float = 2.0
+    # Base delay in seconds for exponential backoff (1.5x each attempt).
+    backoff_base: float = 1.0
 
     # ── Token budgets ────────────────────────────────────────────────────
     # Max tokens a single file may consume across all attempts (generate + fixes).
@@ -157,7 +161,7 @@ class Settings:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     observability: ObservabilityConfig = field(default_factory=ObservabilityConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
-    max_concurrent_agents: int = 4
+    max_concurrent_agents: int = 8
     max_debug_iterations: int = 5
     # Maximum wall-clock seconds allowed for a single lifecycle phase (generate,
     # fix, build, test). Phases that exceed this budget are cancelled
@@ -197,7 +201,7 @@ class Settings:
             sandbox=SandboxConfig(
                 sandbox_type=SandboxType(os.environ.get("SANDBOX_TYPE", "docker")),
             ),
-            max_concurrent_agents=int(os.environ.get("MAX_CONCURRENT_AGENTS", "4")),
+            max_concurrent_agents=int(os.environ.get("MAX_CONCURRENT_AGENTS", "8")),
             build_checkpoint_retries=int(os.environ.get("BUILD_CHECKPOINT_RETRIES", "3")),
             mcp_server_command=os.environ.get("MCP_SERVER_COMMAND", "").split() if os.environ.get("MCP_SERVER_COMMAND") else [],
             max_cost_usd=float(os.environ.get("MAX_COST_USD", "0")),

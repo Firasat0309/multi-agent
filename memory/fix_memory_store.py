@@ -93,6 +93,13 @@ class FixMemoryStore:
         self._flush_task: asyncio.Task[None] | None = None
         self._state = self._load_state()
 
+        # Safety net: synchronous flush on interpreter shutdown.  The normal
+        # path is ``await flush()`` in SimpleLoopExecutor, but if the pipeline
+        # is interrupted (SIGTERM, timeout, unhandled exception), this ensures
+        # accumulated fix memory is not silently lost.
+        import atexit
+        atexit.register(self._sync_flush_on_exit)
+
     def _load_state(self) -> dict[str, Any]:
         if not self._path.exists():
             return {"version": 1, "files": {}}
@@ -138,6 +145,19 @@ class FixMemoryStore:
             if self._dirty:
                 await asyncio.to_thread(self._save_state)
                 self._dirty = False
+
+    def _sync_flush_on_exit(self) -> None:
+        """Synchronous fallback flush for atexit / interpreter shutdown.
+
+        Only writes if there's actually dirty data — avoids unnecessary
+        disk I/O on clean shutdowns where ``await flush()`` already ran.
+        """
+        if self._dirty:
+            try:
+                self._save_state()
+                self._dirty = False
+            except Exception:
+                pass  # Best-effort; logging may not work during shutdown
 
     async def record_attempt(
         self,

@@ -1,0 +1,56 @@
+CRITICAL TypeScript rules:
+- Always use semicolons at the end of statements.
+- Specify return types on all exported functions and methods.
+- Use `readonly` for properties that should not be reassigned.
+- Decorators go ABOVE the class/method definition, not on the same line.
+- Use `import type { ... }` for type-only imports (isolatedModules compliance).
+- Prefer `interface` over `type` for object shapes (better error messages).
+- Use `strict: true` in tsconfig.json — never use `any` without explicit annotation.
+- Express route handlers must call `next()` or send a response — never leave hanging.
+- NestJS: @Injectable() decorators required on all service classes.
+- Use `enum` for string unions with more than 3 values.
+- Always declare explicit types for function parameters — never rely on implicit `any`.
+- When importing from relative paths, include the file extension only if the bundler requires it. For standard TS projects, omit `.ts` extensions in imports.
+- Arrow functions assigned to `const` must have explicit type annotations for parameters.
+- Use `Promise<T>` return types for async functions — never `Promise<any>`.
+- Index signatures: prefer `Record<string, T>` over `{ [key: string]: T }`.
+- Null checking: use optional chaining (`?.`) and nullish coalescing (`??`) consistently.
+- Do NOT mix CommonJS (`require`) and ES module (`import`) syntax in the same file.
+
+ANGULAR-SPECIFIC RULES (when framework is Angular):
+- Every component MUST have @Component decorator with selector, templateUrl or template, and styleUrls or styles.
+- Use standalone components (standalone: true) for Angular 15+. Do NOT create NgModule for standalone components.
+- Services MUST have @Injectable({ providedIn: 'root' }) — never forget providedIn.
+- Use constructor injection for services, not inject() function unless Angular 14+ signals approach.
+- Route guards: use functional guards (CanActivateFn) not class-based guards in Angular 15+.
+- Reactive forms: import ReactiveFormsModule. Template-driven: import FormsModule. Never mix without explicit imports.
+- HttpClient: import HttpClientModule in the root. Use typed responses: this.http.get<User[]>(url).
+- Component inputs: use @Input() decorator. For Angular 16+, can use input() signal function.
+- Component outputs: use @Output() with EventEmitter<T>. For Angular 16+, can use output() function.
+- Pipes: must be declared in a module or marked standalone: true.
+- OnInit, OnDestroy: implement the interface AND add the lifecycle method (ngOnInit, ngOnDestroy).
+- RxJS: always unsubscribe in ngOnDestroy or use takeUntilDestroyed() / async pipe.
+- Template syntax: use *ngIf, *ngFor (structural directives) or @if, @for (Angular 17+ control flow).
+- Two-way binding: [(ngModel)] requires FormsModule import.
+- Router: routerLink for navigation, ActivatedRoute for reading params.
+- HttpInterceptor: use functional interceptors (HttpInterceptorFn) for Angular 15+.
+- AOT compilation: no function calls in templates, no arrow functions in metadata.
+
+VUE-SPECIFIC RULES (when framework is Vue):
+- Vue 3 Composition API: use <script setup lang="ts"> for single-file components.
+- Define props with defineProps<{ propName: type }>() — always typed, never runtime-only.
+- Define emits with defineEmits<{ (e: 'eventName', payload: Type): void }>().
+- Use ref() for primitive reactive state, reactive() for objects.
+- Access ref values in script with .value — templates auto-unwrap.
+- Computed properties: use computed(() => ...) from 'vue'.
+- Watch: use watch(source, callback) or watchEffect(callback) from 'vue'.
+- Lifecycle hooks: onMounted, onUnmounted, etc. from 'vue' — no this.* in Composition API.
+- Provide/Inject: use provide(key, value) and inject(key) for dependency injection.
+- Router: useRouter() and useRoute() composables — not this.$router.
+- Pinia stores: defineStore('id', () => { ... }) with setup syntax for TypeScript.
+- Template refs: const el = ref<HTMLElement | null>(null) — use ref with template ref="el".
+- v-model on components: defineModel() in Vue 3.4+ or modelValue prop + update:modelValue emit.
+- Async components: defineAsyncComponent(() => import('./Component.vue')).
+- Vue Router: use createRouter with createWebHistory or createWebHashHistory.
+- Vite: import.meta.env for environment variables, not process.env.
+- CSS scoping: use <style scoped> to prevent style leaks between components.

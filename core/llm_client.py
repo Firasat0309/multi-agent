@@ -294,6 +294,10 @@ def classify_llm_error(error_msg: str, error: Exception | None = None) -> LLMErr
     if "content_filter" in msg or "blocked" in msg or "safety" in msg or "harmful" in msg:
         return LLMErrorCategory.CONTENT_FILTERED
 
+    # Transient server errors (5xx by keyword)
+    if "internal server error" in msg or "bad gateway" in msg or "service unavailable" in msg:
+        return LLMErrorCategory.TRANSIENT_SERVER
+
     # Timeout
     if "timeout" in msg or "timed out" in msg:
         return LLMErrorCategory.TIMEOUT

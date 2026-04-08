@@ -52,18 +52,19 @@ def _validate_rewrite(
 ) -> TaskResult | None:
     """Validate a code rewrite and return TaskResult if validation fails, None if valid.
 
-    Returns ``success=True`` with ``files_modified=[]`` and
-    ``metrics={"rewrite_rejected": True}`` when the rewrite is rejected.
+    Returns a ``TaskResult`` with ``success=False`` and
+    ``metrics={"rewrite_rejected": True}`` when the rewrite is rejected due
+    to quality guards (content inflation, duplicate definitions).  Callers
+    should check ``result.metrics.get("rewrite_rejected")`` to distinguish
+    a *soft rejection* (retryable, file not modified) from a hard failure.
+
     The pipeline executor checks for ``rewrite_rejected`` and fires
     ``REWRITE_REJECTED`` instead of ``FIX_APPLIED`` so the file stays in
-    its current phase without consuming a fix budget.
+    its current phase without consuming a fix budget.  This is safe because
+    ``REWRITE_REJECTED`` does NOT cascade — it simply allows the next
+    attempt in the fix loop.
 
-    ``success=False`` fires ``RETRIES_EXHAUSTED`` which **immediately kills
-    the file** — a single bad LLM output (probabilistic!) would permanently
-    block the file and cascade failures to all downstream dependents.
-
-    For the checkpoint path (``_dispatch_fix``), the return value is
-    discarded anyway — the build simply re-runs regardless.
+    Returns ``None`` when validation passes (caller should proceed to write).
     """
     cfg = exec_config or _EXEC_DEFAULTS
     original_size = len(original_content)
@@ -76,7 +77,7 @@ def _validate_rewrite(
             operation, file_path, len(new_content), cfg.max_content_growth * 100, original_size,
         )
         return TaskResult(
-            success=True,
+            success=False,
             output=f"{operation} for {file_path} skipped — rewrite was too large (likely duplicated content)",
             files_modified=[],
             metrics={"rewrite_rejected": True},
@@ -90,7 +91,7 @@ def _validate_rewrite(
             operation, file_path,
         )
         return TaskResult(
-            success=True,
+            success=False,
             output=f"{operation} for {file_path} skipped — duplicate definitions detected in LLM output",
             files_modified=[],
             metrics={"rewrite_rejected": True},
@@ -1136,6 +1137,8 @@ class CoderAgent(BaseAgent):
         test_errors: str = context.task.metadata.get("test_errors", "")
         security_errors: str = context.task.metadata.get("security_vulnerabilities", "")
         fix_trigger: str = context.task.metadata.get("fix_trigger", "review")
+        fix_history_summary: str = context.task.metadata.get("fix_history_summary", "")
+        known_bad_patterns: list[str] = context.task.metadata.get("known_bad_patterns", [])
 
         # Read current file content from the repo (non-blocking)
         current_content = await self.repo.async_read_file(file_path) or ""
@@ -1213,6 +1216,19 @@ class CoderAgent(BaseAgent):
         # For compiled languages add an explicit post-fix syntax checklist so the
         # model validates its own output before returning.
         syntax_checklist = get_language_rules(profile.name)
+
+        # ── Append fix context that must survive error filtering ─────────────
+        # These were previously stuffed into build_errors and lost when
+        # extract_error_lines() truncated.  Now they live in separate metadata
+        # keys and are appended directly after filtering.
+        if fix_history_summary:
+            issues_text += "\n\n" + fix_history_summary
+        if known_bad_patterns:
+            issues_text += (
+                "\n\n⚠️ KNOWN BAD PATTERNS (do NOT reproduce these in your fix):\n"
+                + "\n".join(f"  • {s}" for s in known_bad_patterns)
+            )
+
         if syntax_checklist:
             syntax_note = (
                 f"\n\nAfter writing the fixed code, verify:\n"

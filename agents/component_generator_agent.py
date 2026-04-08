@@ -115,6 +115,7 @@ class ComponentGeneratorAgent(BaseAgent):
 
     role = AgentRole.COMPONENT_GENERATOR
     max_iterations: int = 10
+    _current_fw: str = ""  # set per-execution from component plan
 
     @property
     def tools(self) -> list[ToolDefinition]:
@@ -122,9 +123,15 @@ class ComponentGeneratorAgent(BaseAgent):
 
     @property
     def system_prompt(self) -> str:
+        fw = self._current_fw.lower() if self._current_fw else ""
+        if "angular" in fw:
+            fw_text = "Angular and TypeScript"
+        elif "vue" in fw:
+            fw_text = "Vue 3 (Composition API) and TypeScript"
+        else:
+            fw_text = "React/Next.js, Vue 3 (Composition API), and TypeScript"
         return (
-            "You are a senior frontend engineer agent specialising in React/Next.js,\n"
-            "Vue 3 (Composition API), and TypeScript.\n\n"
+            f"You are a senior frontend engineer agent specialising in {fw_text}.\n\n"
             "Your task is to generate a single, production-quality UI component file.\n\n"
             "WORKFLOW — WRITE IMMEDIATELY:\n"
             "The prompt already contains ALL dependency signatures, store exports,\n"
@@ -179,11 +186,27 @@ class ComponentGeneratorAgent(BaseAgent):
             )
         if "angular" in fw:
             return (
-                "FRAMEWORK: Angular\n"
-                "- Use standalone components with @Component decorator.\n"
-                "- Use TypeScript strict mode throughout.\n"
-                "- Use Angular signals or RxJS for state management.\n"
-                "- File extension: .component.ts for components.\n\n"
+                "FRAMEWORK: Angular (standalone components)\n"
+                "- Use standalone components: @Component({ standalone: true, imports: [...] }).\n"
+                "- Every component MUST have a selector (e.g. selector: 'app-user-list').\n"
+                "- Use TypeScript strict mode throughout — no implicit any.\n"
+                "- Template: use templateUrl for separate HTML or inline template: `...` for small components.\n"
+                "- Styles: use styleUrls or styles array — always add encapsulation or scoped styles.\n"
+                "- Services: @Injectable({ providedIn: 'root' }) — inject via constructor.\n"
+                "- HttpClient: inject HttpClient, return typed observables: this.http.get<User[]>(url).\n"
+                "- RxJS: use pipe() with operators (map, switchMap, catchError). Unsubscribe in ngOnDestroy.\n"
+                "- Prefer AsyncPipe in templates to auto-unsubscribe: *ngIf=\"data$ | async as data\".\n"
+                "- Reactive forms: import ReactiveFormsModule in component imports array.\n"
+                "  Use FormBuilder with typed FormGroup: this.fb.group({ name: ['', Validators.required] }).\n"
+                "- Router: import RouterModule. Use routerLink for navigation, ActivatedRoute for params.\n"
+                "- Input/Output: use @Input() for data in, @Output() with EventEmitter<T> for events out.\n"
+                "- Lifecycle: implement OnInit (ngOnInit), OnDestroy (ngOnDestroy) interfaces explicitly.\n"
+                "- Angular 17+ control flow: prefer @if/@for/@switch over *ngIf/*ngFor in templates.\n"
+                "- Signals (Angular 16+): use signal(), computed(), effect() for reactive state.\n"
+                "- File naming: component.ts, component.html, component.scss (or inline).\n"
+                "- Module imports in standalone: import CommonModule, FormsModule, ReactiveFormsModule,\n"
+                "  RouterModule, HttpClientModule directly in the component's imports array.\n"
+                "- Error handling: use catchError in HTTP pipes, show user-facing error messages.\n\n"
             )
         # React / Next.js (default)
         rules = (
@@ -452,6 +475,13 @@ class ComponentGeneratorAgent(BaseAgent):
         # prompt, preventing it from guessing wrong file names or properties.
         context = await self._inject_store_context(context, component)
 
+        # Set framework so system_prompt property is framework-aware.
+        plan: ComponentPlan | None = context.task.metadata.get("component_plan")
+        self._current_fw = (
+            (plan.framework if plan else None)
+            or (context.blueprint.tech_stack.get("framework", "") if context.blueprint else "")
+        )
+
         try:
             result = await self.execute_agentic(context)
             if result.success:
@@ -477,6 +507,8 @@ class ComponentGeneratorAgent(BaseAgent):
         file_path = context.task.file
         build_errors: str = context.task.metadata.get("build_errors", "")
         fix_trigger: str = context.task.metadata.get("fix_trigger", "build")
+        fix_history_summary: str = context.task.metadata.get("fix_history_summary", "")
+        known_bad_patterns: list[str] = context.task.metadata.get("known_bad_patterns", [])
         component: UIComponent | None = context.task.metadata.get("component")
         retry_hint: str = context.task.metadata.get("retry_hint", "")
 
@@ -575,9 +607,34 @@ class ComponentGeneratorAgent(BaseAgent):
             "9. Output the COMPLETE corrected file — every line, no markdown fences.\n"
         )
 
+        # Append fix history and known bad patterns (survive error truncation)
+        if fix_history_summary:
+            prompt += "\n" + fix_history_summary + "\n"
+        if known_bad_patterns:
+            prompt += (
+                "\n\u26a0\ufe0f KNOWN BAD PATTERNS (do NOT reproduce these in your fix):\n"
+                + "\n".join(f"  \u2022 {s}" for s in known_bad_patterns)
+                + "\n"
+            )
+
         _fix_system = (
-            "You are a senior frontend engineer specialising in React/Next.js, "
-            "Vue 3 (Composition API), and TypeScript.\n\n"
+            "You are a senior frontend engineer specialising in "
+        )
+        fw_name = ""
+        if plan:
+            fw_name = (plan.framework or "").lower()
+        if not fw_name and file_path:
+            if file_path.endswith(".vue"):
+                fw_name = "vue"
+            elif ".component." in file_path:
+                fw_name = "angular"
+        if "angular" in fw_name:
+            _fix_system += "Angular and TypeScript.\n\n"
+        elif "vue" in fw_name:
+            _fix_system += "Vue 3 (Composition API) and TypeScript.\n\n"
+        else:
+            _fix_system += "React/Next.js, Vue 3, and TypeScript.\n\n"
+        _fix_system += (
             "Your task is to fix compilation errors in a source file.\n"
             "Return ONLY the complete corrected file content — no markdown fences, "
             "no explanations, no tool calls."
